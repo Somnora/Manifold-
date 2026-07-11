@@ -150,6 +150,30 @@ break every launch. Persisting the first-seen key per instance id (proper
 TOFU) is cheap hardening once instance identity matters — noted for Phase 3
 when cloud-init could report the key out-of-band.
 
+**Closed 2026-07-11:** see the TOFU host-key pinning entry below.
+
+## 2026-07-11 — TOFU host-key pinning (closes the `known_hosts=None` debt)
+
+**Decided:** `HostKeyStore` (`host_keys.json` next to the database, gitignored)
+pins the host key presented on the FIRST connect to each host; every
+reconnect must match the pin or the connect fails with an explicit
+"host key changed" error. The orchestrator forgets a host's pin whenever the
+instance is terminated (both Manifold-initiated and external terminations
+detected at reconcile).
+
+**Alternatives:** Fetching keys out-of-band via cloud-init (more moving
+parts, and the sidecar channel itself rides SSH — circular); pinning per
+instance id instead of per host (asyncssh validates by host, and the
+supervisor reconnect loop only knows the host).
+
+**Why:** First contact is unavoidably trust-on-first-use for a fresh cloud
+instance, but everything after it need not be — reconnects are where a
+long-lived supervisor would silently accept a swapped identity. Forgetting
+pins at termination matters because Lambda recycles public IPs: a stale pin
+would wrongly reject the next tenant of the address. Backend shutdown does
+NOT forget pins (the instances keep running), so a backend restart
+re-verifies against the original keys.
+
 ## 2026-07-10 — Billing timestamps: `launched_at` vs `active_at`
 
 **Decided:** The `launches` table records both when Lambda accepted the

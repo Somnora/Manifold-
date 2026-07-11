@@ -22,7 +22,9 @@ from __future__ import annotations
 import abc
 import asyncio
 import enum
+import json
 import os
+from pathlib import Path
 from typing import Awaitable, Callable
 
 import asyncssh
@@ -80,6 +82,47 @@ class TailscaleConnectionManager(ConnectionManager):
         return instance.name
 
 
+class HostKeyStore:
+    """Trust-on-first-use SSH host key pins: one JSON file, host -> key line.
+
+    A fresh cloud instance has a never-seen host key, so the first connect
+    accepts whatever key the server presents and records it (TOFU). Every
+    reconnect after that must present the same key or the connect fails —
+    that closes the window where a rebooted/hijacked host could silently
+    swap identities mid-lifecycle.
+
+    Pins are forgotten when the instance is terminated (the orchestrator
+    calls forget): Lambda recycles public IPs, so a stale pin would wrongly
+    reject the next instance that gets the same address.
+    """
+
+    def __init__(self, path: str):
+        self._path = Path(path)
+
+    def _load(self) -> dict[str, str]:
+        try:
+            return json.loads(self._path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save(self, pins: dict[str, str]) -> None:
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        tmp.write_text(json.dumps(pins, indent=2, sort_keys=True))
+        tmp.replace(self._path)
+
+    def get(self, host: str) -> str | None:
+        """The pinned public key line for a host, or None if never seen."""
+        return self._load().get(host)
+
+    def record(self, host: str, public_key: str) -> None:
+        self._save({**self._load(), host: public_key.strip()})
+
+    def forget(self, host: str) -> None:
+        pins = self._load()
+        if pins.pop(host, None) is not None:
+            self._save(pins)
+
+
 def backoff_delay(attempt: int, base: float, cap: float) -> float:
     """Exponential backoff: base * 2^attempt, capped. attempt is 0-indexed."""
     return min(base * (2 ** attempt), cap)
@@ -101,9 +144,11 @@ class ManagedConnection:
         *,
         connect_fn: Callable[[], Awaitable] | None = None,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
+        host_keys: HostKeyStore | None = None,
     ):
         self.host = host
         self._ssh = ssh
+        self._host_keys = host_keys
         self._connect_fn = connect_fn or self._default_connect
         self._sleep = sleep
         self.state = ConnectionState.CONNECTING
@@ -113,15 +158,33 @@ class ManagedConnection:
         self._closing = False
 
     async def _default_connect(self):
-        return await asyncssh.connect(
-            self.host,
-            username=self._ssh.username,
-            client_keys=[os.path.expanduser(self._ssh.private_key_path)],
-            # Fresh cloud instances have never-seen host keys; pinning is
-            # recorded as a future hardening step in DECISIONS.md.
-            known_hosts=None,
-            connect_timeout=self._ssh.connect_timeout_seconds,
-        )
+        # TOFU pinning: the first connect to a host trusts and records the
+        # key it presents; every later connect must match that pin.
+        pinned = self._host_keys.get(self.host) if self._host_keys else None
+        try:
+            conn = await asyncssh.connect(
+                self.host,
+                username=self._ssh.username,
+                client_keys=[os.path.expanduser(self._ssh.private_key_path)],
+                known_hosts=(
+                    asyncssh.import_known_hosts(f"{self.host} {pinned}\n")
+                    if pinned else None
+                ),
+                connect_timeout=self._ssh.connect_timeout_seconds,
+            )
+        except asyncssh.HostKeyNotVerifiable as exc:
+            raise ConnectionError(
+                f"host key for {self.host} does not match the key pinned on "
+                f"first connect — possible MITM, or a stale pin if this IP "
+                f"was recycled outside Manifold ({exc})"
+            ) from exc
+        if self._host_keys is not None and pinned is None:
+            key = conn.get_server_host_key()
+            if key is not None:
+                self._host_keys.record(
+                    self.host, key.export_public_key().decode()
+                )
+        return conn
 
     def start(self) -> None:
         self._supervisor = asyncio.create_task(self._supervise())
