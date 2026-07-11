@@ -37,6 +37,11 @@ class ModelClient(abc.ABC):
         """POST /v1/chat/completions with stream=true; yields raw SSE lines
         (each already newline-terminated) exactly as the server sent them."""
 
+    @abc.abstractmethod
+    async def chat_completion(self, port: int, payload: dict) -> dict:
+        """POST /v1/chat/completions with stream=false; returns the full
+        OpenAI response object (choices + usage) verbatim."""
+
 
 class RealModelClient(ModelClient):
     """Reaches the served model through an SSH local port forward.
@@ -101,6 +106,26 @@ class RealModelClient(ModelClient):
         finally:
             listener.close()
 
+    async def chat_completion(self, port: int, payload: dict) -> dict:
+        listener = await self._forward(port)
+        try:
+            local = listener.get_port()
+            timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as http:
+                resp = await http.post(
+                    f"http://127.0.0.1:{local}/v1/chat/completions",
+                    json={**payload, "stream": False},
+                )
+                if resp.status_code >= 400:
+                    raise ModelClientError(
+                        f"model returned {resp.status_code}: {resp.text[:300]}"
+                    )
+                return resp.json()
+        except httpx.HTTPError as exc:
+            raise ModelClientError(f"chat completion failed: {exc}") from exc
+        finally:
+            listener.close()
+
 
 class MockModelClient(ModelClient):
     """Canned OpenAI-compatible endpoint for tests and mock mode.
@@ -153,3 +178,23 @@ class MockModelClient(ModelClient):
             yield f"data: {json.dumps(chunk)}\n\n"
             await asyncio.sleep(0)   # yield control, like a real stream
         yield "data: [DONE]\n\n"
+
+    async def chat_completion(self, port: int, payload: dict) -> dict:
+        self.requests.append({"port": port, "payload": payload})
+        messages = payload.get("messages", [])
+        last = messages[-1]["content"] if messages else ""
+        content = f"Mock reply to: {last}"
+        tokens = len(content.split())
+        return {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": payload.get("model") or self.model_id,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": tokens,
+                      "total_tokens": tokens},
+        }

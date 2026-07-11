@@ -78,6 +78,9 @@ class Settings:
     s3_access_key_id: str = ""
     s3_secret_access_key: str = ""
     tailscale_authkey: str = ""
+    # Optional: if set, the OpenAI-compatible /v1 proxy requires this as a
+    # bearer token. Empty = open (fine for localhost-only single-user use).
+    proxy_api_key: str = ""
 
     guardrails: Guardrails = field(default_factory=Guardrails)
     launch: LaunchPolicy = field(default_factory=LaunchPolicy)
@@ -141,6 +144,7 @@ def load_settings(
         s3_access_key_id=os.environ.get("S3_ACCESS_KEY_ID", ""),
         s3_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY", ""),
         tailscale_authkey=os.environ.get("TAILSCALE_AUTHKEY", ""),
+        proxy_api_key=os.environ.get("MANIFOLD_PROXY_KEY", ""),
         guardrails=Guardrails(
             max_concurrent_instances=int(guard.get("max_concurrent_instances", 1)),
             max_hourly_spend_usd=float(guard.get("max_hourly_spend_usd", 4.00)),

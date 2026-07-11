@@ -708,3 +708,40 @@ script-in-container templates (nested quoting is where injection bugs
 breed). A 404 on download is detected by pulling the first SFTP chunk
 BEFORE the response starts, so missing files are a real 404 rather than a
 broken 200 stream.
+
+## Phase 13 — OpenAI-compatible /v1 proxy (2026-07-11)
+
+**What:** GET /v1/models and POST /v1/chat/completions (streaming +
+non-streaming) at localhost:8000. Any OpenAI client — the openai SDK,
+OpenClaw, IDE assistants — points its base_url at Manifold and talks to a
+model served on an instance. Routes by the request's `model` (instance id,
+then exact model id, then a lenient single-model fallback) to the serving
+instance; the completion rides the managed SSH connection. Verified live
+against the real `openai` Python SDK (models.list, chat, streaming).
+
+**Why non-streaming got its own ModelClient method:** for stream=false we
+POST to vLLM with stream=false and return its response object verbatim —
+real `choices` and `usage` — rather than reassembling from SSE chunks
+(which drops usage and risks a lossy reconstruction). stream=true relays
+vLLM's SSE bytes untouched. Passing every other OpenAI param straight
+through means temperature/top_p/stop/max_tokens all just work; the only
+field we rewrite is `model`, forced to the real served id so vLLM accepts
+it (this is what makes the lenient single-model route work for tools with a
+hardcoded model name).
+
+**Why the proxy launches nothing / has no budget guard of its own:** it
+only reaches models ALREADY running, whose vllm-serve launch already
+cleared the budget and concurrency guards. Cost is the instance's hourly
+rate, already governed; there is no per-token spend to guard. Proxy use
+touches idle-activity so a model in use isn't idle-terminated.
+
+**Auth:** optional bearer via MANIFOLD_PROXY_KEY (.env, secret). Empty =
+open, correct for the localhost-only default; set it before exposing the
+backend past localhost. Errors are OpenAI-shaped ({"error": {message,
+type, code}}) so real clients render them properly.
+
+**Alternatives:** a full pydantic model for the request (rejected — the
+OpenAI surface is wide and evolving; a permissive pass-through of the raw
+JSON is more compatible and less brittle); reassembling non-streaming
+responses from the stream (rejected — loses usage, more code, faithful
+pass-through is simpler and correct).

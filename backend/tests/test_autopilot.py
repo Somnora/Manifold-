@@ -30,6 +30,9 @@ class ScriptedBrain(ModelClient):
     async def model_info(self, port):
         return {"data": [{"id": "scripted"}]}
 
+    async def chat_completion(self, port, payload):
+        raise NotImplementedError("autopilot always streams")
+
     async def chat_stream(self, port, payload):
         # Snapshot: the loop keeps mutating its live messages list after
         # this call returns (real httpx serializes immediately, so only the

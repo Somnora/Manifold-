@@ -22,6 +22,7 @@ from fastapi import (
     FastAPI,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -268,6 +269,7 @@ def create_app(
                 settings.s3_access_key_id and settings.s3_secret_access_key
             ),
             "tailscale_available": bool(settings.tailscale_authkey),
+            "proxy_protected": bool(settings.proxy_api_key),
             "env_path": str(env_file),
         }
 
@@ -558,6 +560,147 @@ def create_app(
         return StreamingResponse(
             relay(),
             media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # -- OpenAI-compatible proxy (/v1) ---------------------------------------------
+    # Point any OpenAI client at http://localhost:8000/v1 and it talks to a
+    # model served on one of your instances (vllm-serve). Routes by the
+    # request's `model`; the completion rides the managed SSH connection.
+    # Adds NO new listener on the instance and launches nothing — it only
+    # reaches models already running, whose launch already cleared the
+    # budget/concurrency guards.
+
+    def _openai_error(status: int, message: str, code: str,
+                      kind: str = "invalid_request_error"):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=status,
+            content={"error": {"message": message, "type": kind, "code": code}},
+        )
+
+    def _proxy_auth_ok(request: Request) -> bool:
+        if not settings.proxy_api_key:
+            return True   # open: fine for localhost-only single-user use
+        header = request.headers.get("authorization", "")
+        token = header[7:] if header.lower().startswith("bearer ") else ""
+        return token == settings.proxy_api_key
+
+    def _serving_endpoints() -> list[dict]:
+        """Every running model server on a CONNECTED instance."""
+        eps = []
+        for task in queue.list():
+            if task["status"] != "running":
+                continue
+            template = templates.get(task["template"])
+            if template is None or not template.ports:
+                continue
+            conn = orchestrator.connections.get(task["instance_id"])
+            if conn is None or conn.ssh_connection() is None:
+                continue
+            eps.append({
+                "instance_id": task["instance_id"],
+                "model_id": task["parameters"].get("model_id") or task["template"],
+                "port": template.ports[0].host,
+            })
+        return eps
+
+    def _resolve_model(requested: str):
+        eps = _serving_endpoints()
+        if not eps:
+            return None, "no_models"
+        for e in eps:                      # pin by instance id
+            if e["instance_id"] == requested:
+                return e, None
+        for e in eps:                      # exact model match (first wins)
+            if e["model_id"] == requested:
+                return e, None
+        if len(eps) == 1:                  # lenient: only one model served
+            return eps[0], None
+        return None, "not_found"
+
+    @app.get("/v1/models")
+    async def openai_list_models(request: Request):
+        if not _proxy_auth_ok(request):
+            return _openai_error(401, "Invalid API key.", "invalid_api_key",
+                                 "authentication_error")
+        seen, data = set(), []
+        for e in _serving_endpoints():
+            if e["model_id"] in seen:
+                continue
+            seen.add(e["model_id"])
+            data.append({
+                "id": e["model_id"], "object": "model", "created": 0,
+                "owned_by": f"manifold:{e['instance_id'][:12]}",
+            })
+        return {"object": "list", "data": data}
+
+    @app.post("/v1/chat/completions")
+    async def openai_chat_completions(request: Request):
+        import json
+        from fastapi.responses import StreamingResponse
+        if not _proxy_auth_ok(request):
+            return _openai_error(401, "Invalid API key.", "invalid_api_key",
+                                 "authentication_error")
+        try:
+            body = await request.json()
+        except Exception:
+            return _openai_error(400, "Request body is not valid JSON.",
+                                 "invalid_json")
+        if not isinstance(body, dict) or not body.get("messages"):
+            return _openai_error(400, "`messages` is required.",
+                                 "missing_messages")
+
+        requested = str(body.get("model", ""))
+        endpoint, err = _resolve_model(requested)
+        if err == "no_models":
+            return _openai_error(
+                503, "No model is being served. Start a vllm-serve job on a "
+                "connected instance first.", "no_model_served")
+        if err == "not_found":
+            available = [e["model_id"] for e in _serving_endpoints()]
+            return _openai_error(
+                404, f"Model '{requested}' is not being served. Available: "
+                f"{', '.join(available)}.", "model_not_found")
+
+        instance_id = endpoint["instance_id"]
+        model_client = orchestrator.model_client_for(instance_id)
+        if model_client is None:
+            return _openai_error(503, f"Lost connection to {instance_id}.",
+                                 "connection_lost")
+
+        # Force the real served model id (makes the single-model lenient
+        # route work), pass every other OpenAI param straight through.
+        payload = {**body, "model": endpoint["model_id"]}
+        payload.pop("stream", None)
+        stream = bool(body.get("stream"))
+        dispatcher.touch_activity(instance_id)
+        db.record_audit("api", "openai_proxy",
+                        f"{instance_id}: {endpoint['model_id']} stream={stream}")
+
+        if not stream:
+            try:
+                return await model_client.chat_completion(
+                    endpoint["port"], payload)
+            except ModelClientError as exc:
+                return _openai_error(502, str(exc), "upstream_error",
+                                     "api_error")
+
+        async def relay():
+            try:
+                async for line in model_client.chat_stream(
+                    endpoint["port"], payload
+                ):
+                    yield line
+                    dispatcher.touch_activity(instance_id)
+            except ModelClientError as exc:
+                yield ('data: '
+                       + json.dumps({"error": {"message": str(exc),
+                                               "type": "api_error"}})
+                       + "\n\n")
+
+        return StreamingResponse(
+            relay(), media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
