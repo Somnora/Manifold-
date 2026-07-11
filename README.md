@@ -20,7 +20,9 @@ cp .env.example .env   # fill in keys
 cd backend
 uv sync
 uv run pytest          # all tests run against mocks; no live spend
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:create_default_app --factory --reload
+# or, with no credentials and zero spend:
+MANIFOLD_MOCK=1 uv run uvicorn app.main:create_default_app --factory --reload
 ```
 
 See `CLAUDE.md` for the full command reference.
