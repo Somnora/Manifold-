@@ -81,6 +81,27 @@ class Settings:
     db_path: str = str(REPO_ROOT / "manifold.db")
 
 
+def update_env_file(path: Path, updates: dict[str, str]) -> None:
+    """Set KEY=value lines in a .env file, preserving comments and order.
+
+    Existing keys are updated in place; missing keys are appended. Values
+    are written verbatim and never logged.
+    """
+    lines = path.read_text().splitlines() if path.exists() else []
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0] if "=" in stripped else None
+        if key and not stripped.startswith("#") and key in remaining:
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        out.append(f"{key}={value}")
+    path.write_text("\n".join(out) + "\n")
+
+
 def load_settings(
     config_path: Path | None = None, env_path: Path | None = None
 ) -> Settings:

@@ -529,3 +529,34 @@ to $22.32, over the $4.00 limit" can explain to its human exactly why it
 stopped, or pick a cheaper GPU. Error-as-data with the backend's own words
 keeps agents and humans looking at the same truth; the audit trail makes
 the agent's whole session reviewable after the fact.
+
+## 2026-07-11 — Phase 7: first-run setup through the dashboard
+
+**What happened:** James started real mode with no .env; the backend
+crashed at import of the real client and the dashboard showed blank
+dropdowns with no explanation. Root cause: credentials were file-only and
+the failure mode was silent.
+
+**Decided:** Three pieces. (1) Real mode without a key now boots into an
+`UnconfiguredLambdaClient` — every Lambda-backed endpoint returns 503 with
+"No Lambda API key configured. Open the dashboard's Settings page…", and
+the Instances page shows a banner linking to Settings. (2) A Settings page
+accepts the key once, the backend VALIDATES it against the live Lambda API
+before saving (an invalid key is rejected with Lambda's own message and
+never persisted), writes it to .env preserving comments, and (3) hot-swaps
+the running client through a `SwappableLambdaClient` wrapper — the launch
+form goes live without a restart.
+
+**Alternatives:** Keep .env-only setup with better docs (still fails the
+"someone without Lambda knowledge" test); store secrets in SQLite or
+browser localStorage (violates the secrets-live-in-.env rule and secret
+hygiene — the browser never holds the key, it passes through one POST and
+is never echoed back); require a restart after saving (simpler, but the
+first-run experience should end with a working launch form, not another
+terminal step).
+
+**Why:** The dashboard is the product's front door; the first five minutes
+should not require knowing what dotenv is. Validation-before-save turns
+"why are my dropdowns empty an hour later" into "Lambda rejected this key"
+at paste time. Secret hygiene held: booleans and counts in /settings/status,
+key never logged, never audited, never returned.

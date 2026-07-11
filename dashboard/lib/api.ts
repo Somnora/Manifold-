@@ -201,6 +201,30 @@ export const api = {
       `/tasks/${taskId}/logs${tail ? `?tail=${tail}` : ""}`,
     ).then((r) => r.lines),
 
+  settingsStatus: () =>
+    request<{
+      mock: boolean;
+      lambda_configured: boolean;
+      s3_configured: boolean;
+      tailscale_available: boolean;
+      env_path: string;
+    }>("/settings/status"),
+
+  setLambdaKey: (apiKey: string) =>
+    request<{ valid: boolean; instance_types_visible: number; applied_live: boolean }>(
+      "/settings/lambda-key",
+      { method: "POST", body: JSON.stringify({ api_key: apiKey }) },
+    ),
+
+  setS3Keys: (accessKeyId: string, secretAccessKey: string) =>
+    request<{ saved: boolean; validated: boolean }>("/settings/s3-keys", {
+      method: "POST",
+      body: JSON.stringify({
+        access_key_id: accessKeyId,
+        secret_access_key: secretAccessKey,
+      }),
+    }),
+
   audit: (actor?: string, limit = 200) =>
     request<{
       entries: {
