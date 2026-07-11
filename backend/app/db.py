@@ -164,6 +164,18 @@ class Database:
             (utcnow(), actor, action, detail),
         )
 
+    def list_audit(self, actor: str | None = None, limit: int = 200) -> list[dict]:
+        if actor:
+            rows = self._execute(
+                "SELECT * FROM audit_log WHERE actor = ? ORDER BY id DESC LIMIT ?",
+                (actor, limit),
+            ).fetchall()
+        else:
+            rows = self._execute(
+                "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # -- tasks -----------------------------------------------------------------
 
     def create_task(self, *, template: str, parameters: dict) -> str:

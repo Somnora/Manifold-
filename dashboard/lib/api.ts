@@ -201,6 +201,19 @@ export const api = {
       `/tasks/${taskId}/logs${tail ? `?tail=${tail}` : ""}`,
     ).then((r) => r.lines),
 
+  audit: (actor?: string, limit = 200) =>
+    request<{
+      entries: {
+        id: number;
+        at: string;
+        actor: string;
+        action: string;
+        detail: string;
+      }[];
+    }>(
+      `/audit?limit=${limit}${actor ? `&actor=${encodeURIComponent(actor)}` : ""}`,
+    ).then((r) => r.entries),
+
   recentFiles: (instanceId: string, hours = 24, limit = 50) =>
     request<{
       files: { root: string; path: string; size_bytes: number; modified: string }[];

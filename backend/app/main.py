@@ -64,6 +64,13 @@ class WatchRequest(BaseModel):
     auto_launch: bool = False
 
 
+class AgentAuditRequest(BaseModel):
+    tool: str
+    args: dict = Field(default_factory=dict)
+    note: str = ""                     # caller-supplied session note
+    result: str = ""                   # one-line result summary
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -423,6 +430,25 @@ def create_app(
             raise HTTPException(404, f"watch {watch_id} not found")
         db.update_watch(watch_id, status="cancelled")
         return {"watch": db.get_watch(watch_id)}
+
+    # -- audit (agent activity) -----------------------------------------------------
+
+    @app.post("/audit/agent", status_code=201)
+    async def record_agent_call(req: AgentAuditRequest):
+        """MCP tool-call audit: tool, args, session note, result. The MCP
+        server posts one entry per tool invocation."""
+        import json as json_module
+        db.record_audit(
+            "mcp", req.tool,
+            json_module.dumps(
+                {"args": req.args, "note": req.note, "result": req.result}
+            ),
+        )
+        return {"recorded": True}
+
+    @app.get("/audit")
+    async def list_audit(actor: str | None = None, limit: int = 200):
+        return {"entries": db.list_audit(actor=actor, limit=limit)}
 
     # -- launches (retry status + cost history) ------------------------------------
 

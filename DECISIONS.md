@@ -488,3 +488,44 @@ as dedicated backend/frontend code.
 zero code because templates are data. The same holds for the next toolkit
 James wants — the answer is a YAML file. If a workflow ever genuinely needs
 new capability (e.g. multi-node), that is when code gets written.
+
+## 2026-07-11 — MCP thinness is enforced by an import-allowlist test, not review
+
+**Decided:** `mcp_server.py` may import exactly `os`, `typing`, `httpx`,
+and the MCP SDK — a test parses the module's AST and fails on anything
+else. The module lives in the same package as the backend for packaging
+convenience (`manifold-mcp` console script), but structurally it can only
+speak HTTP to the backend.
+
+**Alternatives:** A separate package/venv for true physical isolation
+(more honest still, but adds a second lockfile and install step to a
+single-user local tool); code review as the enforcement mechanism (decays
+the first time someone adds "just one" convenience import).
+
+**Why:** "The MCP server is a thin client with no path around guards" is
+the spec's hard rule; a rule is only real if a machine checks it. The AST
+test turns an architectural intention into a failing build. Guard parity
+is additionally proven behaviorally: the same over-budget launch through
+the dashboard's HTTP path and the MCP tool returns byte-identical
+rejection text.
+
+## 2026-07-11 — MCP tools return errors as data, not protocol exceptions
+
+**Decided:** Backend rejections come back to the agent as
+`{"error": <the backend's exact detail>}` (plus `blocked` +
+`unpersisted_files` for the termination hook) rather than raised MCP
+errors. Every tool takes an optional `note`, and every call — success or
+rejection — is POSTed to `/audit/agent` and shown on the Agent Activity
+page. Audit posting is best-effort: an unreachable backend already failed
+the real call, so a failed audit write must not mask the real error.
+
+**Alternatives:** Raise protocol-level errors (clients render them
+inconsistently, and several truncate the message — the guard's dollar math
+is the most useful part); make audit writes mandatory (turns a logging
+hiccup into a tool failure the agent then retries, double-logging).
+
+**Why:** An agent that can read "Budget guard: … would bring hourly spend
+to $22.32, over the $4.00 limit" can explain to its human exactly why it
+stopped, or pick a cheaper GPU. Error-as-data with the backend's own words
+keeps agents and humans looking at the same truth; the audit trail makes
+the agent's whole session reviewable after the fact.
