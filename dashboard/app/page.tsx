@@ -16,7 +16,7 @@ const RECENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 export default function InstancesPage() {
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
-  const { data, error, refresh } = usePolling(async () => {
+  const { data, error, stale, lastSuccess, refresh } = usePolling(async () => {
     const [instances, launches] = await Promise.all([
       api.instances(),
       api.launches(),
@@ -94,6 +94,14 @@ export default function InstancesPage() {
       {error && (
         <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
           {error}
+          {stale && lastSuccess && (
+            <span className="mt-1 block font-medium">
+              Everything below is a snapshot from{" "}
+              {lastSuccess.toLocaleTimeString()} — NOT live. Instances may
+              have changed (or been terminated) since; check the Lambda
+              console for current billing truth until the backend is back.
+            </span>
+          )}
         </p>
       )}
 
@@ -124,9 +132,15 @@ export default function InstancesPage() {
             No instances running. Nothing is billing.
           </p>
         ) : (
-          instances.map((i) => (
-            <InstanceCard key={i.id} instance={i} onChanged={refresh} />
-          ))
+          // Stale = the backend stopped answering: grey the cards and block
+          // interaction so a snapshot can't be mistaken for live instances.
+          <div
+            className={`space-y-3 ${stale ? "pointer-events-none opacity-40" : ""}`}
+          >
+            {instances.map((i) => (
+              <InstanceCard key={i.id} instance={i} onChanged={refresh} />
+            ))}
+          </div>
         )}
       </section>
 

@@ -64,6 +64,31 @@ CREATE TABLE IF NOT EXISTS task_logs (
     PRIMARY KEY (task_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id                  TEXT PRIMARY KEY,
+    created_at          TEXT NOT NULL,
+    goal                TEXT NOT NULL,
+    brain_instance_id   TEXT NOT NULL,   -- instance serving the model
+    brain_model         TEXT,            -- model id driving the run
+    status              TEXT NOT NULL,   -- running|succeeded|failed|cancelled|exhausted
+    max_steps           INTEGER NOT NULL,
+    steps_taken         INTEGER NOT NULL DEFAULT 0,
+    summary             TEXT,            -- the agent's own closing summary
+    error               TEXT,
+    finished_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS agent_steps (
+    run_id      TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    at          TEXT NOT NULL,
+    thought     TEXT,
+    action      TEXT NOT NULL,
+    args        TEXT NOT NULL,           -- JSON
+    result      TEXT NOT NULL,           -- JSON observation fed back
+    PRIMARY KEY (run_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -261,6 +286,81 @@ class Database:
                 (task_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- autopilot runs ---------------------------------------------------------------
+
+    def create_agent_run(self, *, goal: str, brain_instance_id: str,
+                         brain_model: str, max_steps: int) -> str:
+        run_id = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO agent_runs
+               (id, created_at, goal, brain_instance_id, brain_model,
+                status, max_steps)
+               VALUES (?, ?, ?, ?, ?, 'running', ?)""",
+            (run_id, utcnow(), goal, brain_instance_id, brain_model, max_steps),
+        )
+        return run_id
+
+    def update_agent_run(self, run_id: str, **fields: Any) -> None:
+        allowed = {"status", "steps_taken", "summary", "error", "finished_at"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown agent_run fields: {unknown}")
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        self._execute(
+            f"UPDATE agent_runs SET {cols} WHERE id = ?",
+            (*fields.values(), run_id),
+        )
+
+    def get_agent_run(self, run_id: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM agent_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_agent_runs(self, limit: int = 50) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM agent_runs ORDER BY created_at DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_agent_step(self, run_id: str, seq: int, *, thought: str,
+                       action: str, args: dict, result: dict) -> None:
+        self._execute(
+            """INSERT INTO agent_steps (run_id, seq, at, thought, action,
+               args, result) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, seq, utcnow(), thought, action,
+             json.dumps(args), json.dumps(result)),
+        )
+
+    def get_agent_steps(self, run_id: str) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM agent_steps WHERE run_id = ? ORDER BY seq",
+            (run_id,),
+        ).fetchall()
+        steps = []
+        for r in rows:
+            step = dict(r)
+            step["args"] = json.loads(step["args"])
+            step["result"] = json.loads(step["result"])
+            steps.append(step)
+        return steps
+
+    def fail_orphaned_agent_runs(self) -> int:
+        """Mark runs left 'running' by a dead process as failed. Called at
+        startup: an in-memory agent loop cannot survive a restart, and a
+        row that claims to be running forever would be a lie."""
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE agent_runs
+                   SET status = 'failed', finished_at = ?,
+                       error = 'backend restarted mid-run'
+                   WHERE status = 'running'""",
+                (utcnow(),),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     # -- capacity watches -----------------------------------------------------------
 

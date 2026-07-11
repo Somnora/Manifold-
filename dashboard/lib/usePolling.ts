@@ -8,9 +8,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export function usePolling<T>(
   load: () => Promise<T>,
   intervalMs: number,
-): { data: T | null; error: string; refresh: () => void } {
+): {
+  data: T | null;
+  error: string;
+  /** true when data exists but the LATEST poll failed: what's on screen is
+      a snapshot from lastSuccess, not live state. Render it as such. */
+  stale: boolean;
+  lastSuccess: Date | null;
+  refresh: () => void;
+} {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState("");
+  const [lastSuccess, setLastSuccess] = useState<Date | null>(null);
   const loadRef = useRef(load);
   loadRef.current = load;
 
@@ -18,6 +27,7 @@ export function usePolling<T>(
     try {
       setData(await loadRef.current());
       setError("");
+      setLastSuccess(new Date());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -29,5 +39,5 @@ export function usePolling<T>(
     return () => clearInterval(id);
   }, [tick, intervalMs]);
 
-  return { data, error, refresh: tick };
+  return { data, error, stale: !!(error && data), lastSuccess, refresh: tick };
 }

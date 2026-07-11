@@ -46,6 +46,14 @@ idle:
   timeout_seconds: 300
   poll_seconds: 15
 
+autopilot:
+  # Agent runs: a model served on one instance drives Manifold's guarded
+  # operations. Every launch/terminate still passes the same guards.
+  max_steps_default: 20     # steps per run unless the request says otherwise
+  max_steps_cap: 50         # hard ceiling no request can exceed
+  wait_cap_seconds: 120     # longest single "wait" action the agent may take
+  chat_timeout_seconds: 300 # per-turn timeout talking to the brain model
+
 watches:
   # Capacity watches: poll the instance-types catalog on this interval.
   poll_seconds: 60

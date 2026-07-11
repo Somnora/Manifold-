@@ -64,6 +64,14 @@ class WatchSettings:
 
 
 @dataclass(frozen=True)
+class AutopilotSettings:
+    max_steps_default: int = 20
+    max_steps_cap: int = 50
+    wait_cap_seconds: float = 120.0
+    chat_timeout_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
 class Settings:
     # Secrets (from .env). Empty string means "not configured".
     lambda_api_key: str = ""
@@ -77,6 +85,7 @@ class Settings:
     tasks: TaskSettings = field(default_factory=TaskSettings)
     idle: IdleSettings = field(default_factory=IdleSettings)
     watches: WatchSettings = field(default_factory=WatchSettings)
+    autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
     default_connection_mode: str = "direct-ssh"
     db_path: str = str(REPO_ROOT / "manifold.db")
 
@@ -121,6 +130,7 @@ def load_settings(
     tasks = raw.get("tasks", {})
     idle = raw.get("idle", {})
     watches = raw.get("watches", {})
+    autopilot = raw.get("autopilot", {})
 
     db_path = database.get("path", "manifold.db")
     if not os.path.isabs(db_path):
@@ -153,6 +163,12 @@ def load_settings(
         watches=WatchSettings(
             poll_seconds=float(watches.get("poll_seconds", 60)),
             auto_launch_enabled=bool(watches.get("auto_launch_enabled", False)),
+        ),
+        autopilot=AutopilotSettings(
+            max_steps_default=int(autopilot.get("max_steps_default", 20)),
+            max_steps_cap=int(autopilot.get("max_steps_cap", 50)),
+            wait_cap_seconds=float(autopilot.get("wait_cap_seconds", 120)),
+            chat_timeout_seconds=float(autopilot.get("chat_timeout_seconds", 300)),
         ),
         ssh=SSHSettings(
             key_name=str(ssh.get("key_name", "")),
