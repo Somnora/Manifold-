@@ -72,6 +72,12 @@ class JobTemplate:
     ports: list[PortMapping] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     gpu: dict = field(default_factory=dict)   # min_vram_gib, recommended_types
+    # "" (default) = docker bridge. "host" = share the instance's network
+    # namespace — needed by jobs that CALL a server another job publishes on
+    # the host's loopback (e.g. llm-synthesize -> vllm-serve on 127.0.0.1).
+    # Safe under the hard rule: host networking lets a container dial
+    # loopback, it does not create any new listener.
+    network: str = ""
 
     def to_api(self) -> dict:
         return {
@@ -168,10 +174,22 @@ def parse_template(text: str, source: str = "<inline>") -> JobTemplate:
     env = {str(k): str(v) for k, v in (raw.get("env") or {}).items()}
     gpu = raw.get("gpu") or {}
 
+    network = str(raw.get("network") or "")
+    if network not in ("", "host"):
+        raise TemplateError(
+            f"template '{name}': network must be omitted or 'host', "
+            f"got '{network}'"
+        )
+    if network == "host" and ports:
+        raise TemplateError(
+            f"template '{name}': 'ports' and 'network: host' are mutually "
+            f"exclusive (host networking has no port mappings)"
+        )
+
     return JobTemplate(
         name=name, description=str(raw["description"]), image=str(raw["image"]),
         command=command, parameters=parameters, volumes=volumes, ports=ports,
-        env=env, gpu=gpu,
+        env=env, gpu=gpu, network=network,
     )
 
 

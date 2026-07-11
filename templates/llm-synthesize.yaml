@@ -1,0 +1,105 @@
+# Synthesize a dataset with the model served ON THIS INSTANCE: map an
+# instruction over every record of a JSONL/CSV file and write structured
+# results back to persistent storage.
+#
+#   scraped records --> [instruction + record -> served model] --> synthesized.jsonl
+#
+# Requires a running vllm-serve job on the same instance (the model server
+# on the host's loopback — that is why this template uses host networking).
+# The model id is auto-discovered from /v1/models. Output: one JSON line
+# per record: {"record": <input>, "synthesis": <model output>} under
+# <filesystem>/synthesized/. Stdlib-only (urllib), so the container starts
+# in seconds.
+name: llm-synthesize
+description: Map an instruction over a JSONL/CSV dataset using the model served on this instance
+image: python:3.11-slim
+network: host
+
+command: >
+  python -c "$PYCODE" {{input_path}} {{output_name}} {{instruction}} {{port}} {{limit}}
+
+parameters:
+  - name: input_path
+    type: string
+    description: Input file on the persistent filesystem (relative, .jsonl or .csv)
+  - name: instruction
+    type: string
+    description: What to extract/synthesize from each record (the system prompt)
+  - name: output_name
+    type: string
+    default: synthesized
+    description: Output name; results land at <filesystem>/synthesized/<name>.jsonl
+  - name: port
+    type: integer
+    default: 8080
+    description: Loopback port of the vllm-serve job on this instance
+  - name: limit
+    type: integer
+    default: 0
+    description: Max records to process (0 = all) — use a small number to test
+
+volumes:
+  - host: "{persistent}"
+    container: /data
+
+env:
+  PYCODE: |
+    import csv, json, sys, urllib.request
+    inp, out_name, instruction, port, limit = (
+        sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
+    base = f"http://127.0.0.1:{port}/v1"
+
+    def api(path, payload=None):
+        req = urllib.request.Request(
+            base + path,
+            data=json.dumps(payload).encode() if payload else None,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)
+
+    model = api("/models")["data"][0]["id"]
+    print(f"synthesizing with {model}", flush=True)
+
+    def records():
+        path = "/data/" + inp
+        if path.endswith(".csv"):
+            with open(path, newline="") as f:
+                yield from csv.DictReader(f)
+        else:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
+
+    out_path = f"/data/synthesized/{out_name}.jsonl"
+    import os; os.makedirs("/data/synthesized", exist_ok=True)
+    done = failed = 0
+    with open(out_path, "w") as out:
+        for record in records():
+            if limit and done + failed >= limit:
+                break
+            try:
+                reply = api("/chat/completions", {
+                    "model": model,
+                    "temperature": 0.1,
+                    "messages": [
+                        {"role": "system", "content": instruction},
+                        {"role": "user", "content": json.dumps(record)},
+                    ],
+                })
+                synthesis = reply["choices"][0]["message"]["content"]
+                out.write(json.dumps({"record": record,
+                                      "synthesis": synthesis}) + "\n")
+                out.flush()
+                done += 1
+            except Exception as exc:
+                failed += 1
+                print(f"record {done + failed} failed: {exc}", flush=True)
+            if (done + failed) % 25 == 0:
+                print(f"progress: {done} ok, {failed} failed", flush=True)
+    print(f"finished: {done} synthesized, {failed} failed -> {out_path}",
+          flush=True)
+
+gpu:
+  min_vram_gib: 0

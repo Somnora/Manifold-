@@ -1,0 +1,40 @@
+# Run YOUR Python script from persistent storage — the generic stage for
+# data pipelines (scrapers, converters, post-processing). Put the script
+# under <filesystem>/scripts/ (upload via the file navigator), and it runs
+# with the whole persistent filesystem mounted read-write at /data.
+#
+# Conventions inside the container:
+#   /data          = the persistent filesystem root (read-write)
+#   /data/scripts  = where your scripts live (this template runs one)
+#   argv[1]        = the `args` parameter, passed as ONE shell-quoted string
+#                    (use shlex.split(sys.argv[1]) in your script if you
+#                    want word splitting — quoting is the injection guard)
+#
+# If <filesystem>/scripts/requirements.txt exists it is pip-installed first.
+name: script-run
+description: Run a Python script from <filesystem>/scripts with the filesystem mounted at /data
+image: python:3.11-slim
+
+command: >
+  bash -c 'cd /data &&
+  if [ -f /data/scripts/requirements.txt ]; then
+  pip install -q -r /data/scripts/requirements.txt; fi &&
+  python /data/scripts/{{script}} {{args}}'
+
+parameters:
+  - name: script
+    type: string
+    description: Script filename under <filesystem>/scripts (e.g. scrape_candidates.py)
+  - name: args
+    type: string
+    default: ""
+    description: Arguments, passed to the script as a single string (argv[1])
+
+volumes:
+  - host: "{persistent}"
+    container: /data
+  - host: /workspace/ephemeral/script-tmp
+    container: /tmp/work
+
+gpu:
+  min_vram_gib: 0
