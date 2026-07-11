@@ -242,6 +242,99 @@ async def list_persistent_files(
     )
 
 
+async def _pick_instance(instance_id: str | None, tool: str, note: str,
+                         args: dict) -> str | dict:
+    """Use the given instance, or auto-select when exactly one is connected."""
+    if instance_id:
+        return instance_id
+    listing = await _call(tool, "GET", "/instances", note="", args={})
+    connected = [i["id"] for i in listing.get("instances", [])
+                 if i.get("connection_state") == "connected"]
+    if len(connected) != 1:
+        result = {"error": f"Specify `instance_id`; connected instances: "
+                           f"{', '.join(connected) or '(none)'}"}
+        await _audit(tool, args, note, result["error"])
+        return result
+    return connected[0]
+
+
+@mcp.tool()
+async def upload_file(local_path: str, remote_path: str = "inbox/",
+                      instance_id: str | None = None, note: str = "") -> dict:
+    """Upload a file from THIS machine to an instance over the managed SSH
+    connection. remote_path ending in '/' keeps the filename; relative
+    paths land on the persistent filesystem (surviving termination).
+    If instance_id is omitted and exactly one instance is connected, it is
+    used."""
+    args = {"local_path": local_path, "remote_path": remote_path,
+            "instance_id": instance_id}
+    if not os.path.isfile(local_path):
+        result = {"error": f"local file not found: {local_path}"}
+        await _audit("upload_file", args, note, result["error"])
+        return result
+    target = await _pick_instance(instance_id, "upload_file", note, args)
+    if isinstance(target, dict):
+        return target
+    try:
+        with open(local_path, "rb") as fh:
+            resp = await _http().post(
+                f"/instances/{target}/files/upload",
+                files={"file": (os.path.basename(local_path), fh)},
+                data={"dest": remote_path},
+            )
+        payload = resp.json()
+    except httpx.HTTPError as exc:
+        result = {"error": f"upload failed: {exc}"}
+        await _audit("upload_file", args, note, result["error"])
+        return result
+    if resp.status_code >= 400:
+        result = {"error": payload.get("detail", f"HTTP {resp.status_code}")}
+        await _audit("upload_file", args, note, f"rejected: {result['error']}")
+        return result
+    await _audit("upload_file", args, note,
+                 f"ok: {payload.get('bytes', 0)} bytes -> {payload.get('path')}")
+    return payload
+
+
+@mcp.tool()
+async def download_file(remote_path: str, local_path: str,
+                        instance_id: str | None = None, note: str = "") -> dict:
+    """Download a file from an instance to THIS machine over the managed
+    SSH connection. Relative remote paths read from the persistent
+    filesystem. If instance_id is omitted and exactly one instance is
+    connected, it is used."""
+    args = {"remote_path": remote_path, "local_path": local_path,
+            "instance_id": instance_id}
+    target = await _pick_instance(instance_id, "download_file", note, args)
+    if isinstance(target, dict):
+        return target
+    try:
+        async with _http().stream(
+            "GET", f"/instances/{target}/files/download",
+            params={"path": remote_path},
+        ) as resp:
+            if resp.status_code >= 400:
+                body = (await resp.aread()).decode(errors="replace")
+                result = {"error": body[:300] or f"HTTP {resp.status_code}"}
+                await _audit("download_file", args, note,
+                             f"rejected: {result['error'][:150]}")
+                return result
+            parent = os.path.dirname(os.path.abspath(local_path))
+            os.makedirs(parent, exist_ok=True)
+            written = 0
+            with open(local_path, "wb") as fh:
+                async for chunk in resp.aiter_bytes():
+                    fh.write(chunk)
+                    written += len(chunk)
+    except httpx.HTTPError as exc:
+        result = {"error": f"download failed: {exc}"}
+        await _audit("download_file", args, note, result["error"])
+        return result
+    await _audit("download_file", args, note,
+                 f"ok: {written} bytes -> {local_path}")
+    return {"local_path": local_path, "bytes": written}
+
+
 def main() -> None:
     mcp.run()   # stdio transport
 

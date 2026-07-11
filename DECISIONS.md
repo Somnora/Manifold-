@@ -681,3 +681,30 @@ marks stale data as stale when the backend stops answering (James hit both).
 is ~200 lines); letting the agent shell into instances (unbounded blast
 radius — refused); OpenAI-native tool calling (model-dependent, brittle on
 small models).
+
+## Phase 12 — File Bridge: SFTP over the managed connection, not S3 (2026-07-11)
+
+**What:** Upload/download between this machine and an instance, everywhere:
+POST /instances/{id}/files/upload (multipart) and GET .../files/download
+(streamed), riding SFTP on the managed SSH connection. Dashboard: Upload
+button + per-file Download links in the Files panel. MCP: upload_file /
+download_file tools (auto-select when exactly one instance is connected),
+so agents can round-trip artifacts. Paths are jailed to /lambda/nfs/ and
+/workspace/ephemeral/ (normpath, then prefix check — traversal rejected);
+relative paths land on the instance's persistent filesystem. Transfers are
+audited and count as activity for idle detection.
+
+**Why SFTP, not the S3 adapter:** the adapter exists only in a few regions
+(James's Virginia filesystem has none), needs separate keys, and the SSH
+connection is already supervised. SFTP works in every region with zero new
+credentials. The S3-based Storage page stays for browse/delete without an
+instance; the bridge requires a connected instance, which is honest — the
+persistent filesystem is only reachable through one.
+
+**Also:** sdxl-generate reference template. Its Python lives in a static
+PYCODE env var and parameters arrive as argv, keeping the dispatcher's
+shell-quoting at the top level of the command — the pattern for future
+script-in-container templates (nested quoting is where injection bugs
+breed). A 404 on download is detected by pulling the first SFTP chunk
+BEFORE the response starts, so missing files are a real 404 rather than a
+broken 200 stream.

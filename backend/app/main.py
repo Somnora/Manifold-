@@ -18,7 +18,14 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -552,6 +559,119 @@ def create_app(
             relay(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # -- file bridge (upload/download over the managed SSH connection) -------------
+
+    ALLOWED_FILE_ROOTS = ("/lambda/nfs/", "/workspace/ephemeral/")
+
+    def _resolve_remote_path(instance_id: str, path: str) -> str:
+        """Resolve a user/agent-supplied path to a safe absolute remote path.
+
+        Relative paths land on the instance's persistent filesystem. The
+        result must stay under the same sanctioned roots templates may
+        mount — no traversal out of them."""
+        import posixpath
+        if not path.startswith("/"):
+            launch = db.find_launch_by_instance(instance_id)
+            filesystem = (launch or {}).get("filesystem")
+            if not filesystem:
+                raise HTTPException(
+                    409,
+                    f"No filesystem recorded for {instance_id}; use an "
+                    f"absolute path under /lambda/nfs/ or /workspace/ephemeral/.",
+                )
+            path = f"/lambda/nfs/{filesystem}/{path}"
+        resolved = posixpath.normpath(path)
+        if not any(resolved.startswith(root) for root in ALLOWED_FILE_ROOTS):
+            raise HTTPException(
+                400,
+                f"Path must stay under {' or '.join(ALLOWED_FILE_ROOTS)} "
+                f"(got {resolved!r}).",
+            )
+        return resolved
+
+    def _connected(instance_id: str):
+        conn = orchestrator.connections.get(instance_id)
+        if conn is None or conn.ssh_connection() is None:
+            raise HTTPException(
+                409,
+                f"No connected instance {instance_id}. Files move over the "
+                f"managed SSH connection, so the instance must be running "
+                f"and connected.",
+            )
+        return conn
+
+    @app.post("/instances/{instance_id}/files/upload")
+    async def upload_file(instance_id: str, file: UploadFile,
+                          dest: str = Form("inbox/")):
+        """Upload a local file to the instance over SFTP. `dest` ending in
+        '/' is a directory (keeps the original filename); relative paths
+        land on the persistent filesystem."""
+        conn = _connected(instance_id)
+        target = dest + (file.filename or "upload.bin") if dest.endswith("/") \
+            else dest
+        remote = _resolve_remote_path(instance_id, target)
+
+        async def chunks():
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+        try:
+            written = await conn.sftp_write(remote, chunks())
+        except ConnectionError as exc:
+            raise HTTPException(409, str(exc))
+        except Exception as exc:
+            raise HTTPException(502, f"upload failed: {exc}")
+        dispatcher.touch_activity(instance_id)
+        db.record_audit(
+            "api", "file_upload",
+            f"{file.filename} -> {instance_id}:{remote} ({written} bytes)",
+        )
+        return {"path": remote, "bytes": written}
+
+    @app.get("/instances/{instance_id}/files/download")
+    async def download_file(instance_id: str, path: str):
+        """Stream a file down from the instance over SFTP."""
+        import posixpath
+        from fastapi.responses import StreamingResponse
+        conn = _connected(instance_id)
+        remote = _resolve_remote_path(instance_id, path)
+
+        # Pull the first chunk BEFORE responding, so missing files are a
+        # real 404 instead of a broken 200 stream.
+        gen = conn.sftp_read(remote)
+        first = b""
+        try:
+            first = await gen.__anext__()
+        except StopAsyncIteration:
+            pass                     # empty file: valid, zero-byte download
+        except FileNotFoundError:
+            raise HTTPException(404, f"{remote} not found on the instance")
+        except ConnectionError as exc:
+            raise HTTPException(409, str(exc))
+        except Exception as exc:
+            raise HTTPException(502, f"download failed: {exc}")
+
+        dispatcher.touch_activity(instance_id)
+        db.record_audit("api", "file_download", f"{instance_id}:{remote}")
+
+        async def stream():
+            if first:
+                yield first
+            async for chunk in gen:
+                yield chunk
+
+        filename = posixpath.basename(remote)
+        return StreamingResponse(
+            stream(),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            },
         )
 
     @app.get("/instances/{instance_id}/files/recent")

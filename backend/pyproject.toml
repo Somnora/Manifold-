@@ -12,6 +12,7 @@ dependencies = [
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
     "mcp>=1.2",
+    "python-multipart>=0.0.32",
 ]
 
 [project.scripts]

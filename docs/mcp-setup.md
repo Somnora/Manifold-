@@ -59,6 +59,8 @@ block: `"env": {"MANIFOLD_API_URL": "http://localhost:8000"}`.
 | `run_job(template, parameters)` | Enqueue a job; validated immediately |
 | `get_job_status(id)` / `get_job_logs(id, tail=100)` | Progress and live logs |
 | `list_filesystems()` / `list_persistent_files(prefix)` | Persistent storage, no instance needed |
+| `upload_file(local_path, remote_path)` | Push a file from this machine to the instance (SFTP) |
+| `download_file(remote_path, local_path)` | Pull results back to this machine (SFTP) |
 
 Every tool takes an optional `note` — one line of intent that lands in the
 audit log. Everything an agent does is visible on the dashboard's **Agent
