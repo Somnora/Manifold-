@@ -108,6 +108,11 @@ def render_docker_command(
         f"--name manifold-task-{task_id}",
         "--gpus all",
     ]
+    if template.network == "host":
+        # Loopback-consumer jobs (llm-synthesize) dial servers other jobs
+        # publish on the host's 127.0.0.1. Mutually exclusive with ports
+        # (enforced at template load).
+        parts.append("--network host")
     for volume in template.volumes:
         host = volume.host.replace(PERSISTENT_TOKEN, persistent_root)
         # Parameters may appear inside mount paths too (e.g. input_dir).

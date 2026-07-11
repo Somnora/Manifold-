@@ -805,3 +805,34 @@ and one click fetches a whole outputs directory instead of N file downloads.
 model defined INSIDE create_app silently becomes a query parameter (FastAPI
 resolves annotation strings via module globals) — request models in the
 sidecar must live at module level. Found by the 422 in tests.
+
+## Phase 15 — Data pipeline: script-run + llm-synthesize (2026-07-11)
+
+**What:** Two templates that compose into James's scrape->synthesize
+workflow. `script-run`: run any Python script from <filesystem>/scripts
+with the whole persistent filesystem mounted rw at /data (requirements.txt
+auto-installed; args passed as ONE shell-quoted string — argv[1] — keeping
+the dispatcher's injection guard intact). `llm-synthesize`: map an
+instruction over every JSONL/CSV record using the model served on the SAME
+instance, writing {"record", "synthesis"} lines to synthesized/<name>.jsonl,
+with a `limit` param for cheap quality checks before full runs. Plus
+docs/data-pipeline.md (the candidate-research worked example).
+
+**The enabling change — `network: host` for templates:** a synthesize
+container must call vLLM, which another job publishes on the HOST's
+127.0.0.1 — unreachable from Docker's default bridge (host-gateway only
+reaches 0.0.0.0 binds). Templates may now declare `network: host`,
+validated at load (only "" or "host"; mutually exclusive with `ports`,
+since host networking has no mappings). Consistent with the hard rule:
+host networking lets a container DIAL loopback; it creates no listener.
+The synthesize->vLLM hop never leaves the box.
+
+**Why stdlib-only PYCODE:** the synthesize script uses urllib/csv/json, so
+python:3.11-slim starts in seconds with no pip step, and the model id is
+auto-discovered from /v1/models rather than asked of the user twice.
+
+**Never-run-template guard:** test_llm_synthesize_pycode_actually_runs
+executes the template's embedded Python for real against a stub OpenAI
+server (JSONL in, structured JSONL out, progress lines checked). The
+sdxl-generate lesson: a template whose script has never executed is a bug
+that ships silently.

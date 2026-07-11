@@ -42,8 +42,8 @@ npm run dev     # then open http://localhost:3000
   - `mcp_server.py` — MCP stdio bridge; HTTP-only thin client (AST-enforced), run via `uv run manifold-mcp`
 - `backend/tests/` — pytest; everything runs against mocks
 - `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init (metrics, unpersisted/recent files, fs browse/usage/delete)
-- `templates/*.yaml` — job templates (vllm-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, gpu-smoke)
-- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md)
+- `templates/*.yaml` — job templates (vllm-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, script-run, llm-synthesize, gpu-smoke)
+- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md)
 - `config.yaml` — guardrails, retry policy, SSH settings
 - `.env` — secrets only (gitignored; template in `.env.example`)
 - `DECISIONS.md` — every non-obvious choice gets an entry (what/alternatives/why)
