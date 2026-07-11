@@ -502,12 +502,21 @@ def create_app(
 
     @app.get("/instances/{instance_id}/model")
     async def instance_model(instance_id: str):
-        """Is a model being served on this instance, and which one?"""
+        """Is a model being served here, which one, and is it answering yet?
+
+        `serving` means the vllm-serve container is running; `ready` means
+        its API actually responds (vLLM finished loading). The chat panel
+        shows a loading state while serving-but-not-ready."""
         task = _serving_task(instance_id)
         if task is None:
-            return {"serving": False}
+            return {"serving": False, "ready": False}
+        readiness = await dispatcher.model_ready(
+            instance_id, task["id"], task["port"]
+        )
         return {
             "serving": True,
+            "ready": readiness["ready"],
+            "status_detail": readiness["error"],
             "task_id": task["id"],
             "template": task["template"],
             "model_id": task["model_id"],
@@ -531,6 +540,16 @@ def create_app(
         model_client = orchestrator.model_client_for(instance_id)
         if model_client is None:
             raise HTTPException(409, f"no managed connection to {instance_id}")
+        readiness = await dispatcher.model_ready(
+            instance_id, task["id"], task["port"]
+        )
+        if not readiness["ready"]:
+            raise HTTPException(
+                503,
+                f"{task['model_id']} is still loading on this instance "
+                f"({readiness['error']}). Large models take a few minutes to "
+                f"download and load — try again shortly.",
+            )
 
         payload = {
             "model": task["model_id"],
@@ -600,6 +619,7 @@ def create_app(
                 continue
             eps.append({
                 "instance_id": task["instance_id"],
+                "task_id": task["id"],
                 "model_id": task["parameters"].get("model_id") or task["template"],
                 "port": template.ports[0].host,
             })
@@ -624,9 +644,17 @@ def create_app(
         if not _proxy_auth_ok(request):
             return _openai_error(401, "Invalid API key.", "invalid_api_key",
                                  "authentication_error")
+        # Only advertise models that actually answer — a client picking from
+        # this list expects to be able to use it. Still-loading models are
+        # simply not listed yet.
         seen, data = set(), []
         for e in _serving_endpoints():
             if e["model_id"] in seen:
+                continue
+            readiness = await dispatcher.model_ready(
+                e["instance_id"], e["task_id"], e["port"]
+            )
+            if not readiness["ready"]:
                 continue
             seen.add(e["model_id"])
             data.append({
@@ -668,6 +696,14 @@ def create_app(
         if model_client is None:
             return _openai_error(503, f"Lost connection to {instance_id}.",
                                  "connection_lost")
+        readiness = await dispatcher.model_ready(
+            instance_id, endpoint["task_id"], endpoint["port"]
+        )
+        if not readiness["ready"]:
+            return _openai_error(
+                503, f"Model '{endpoint['model_id']}' is still loading "
+                f"({readiness['error']}). Try again shortly.",
+                "model_loading", "api_error")
 
         # Force the real served model id (makes the single-model lenient
         # route work), pass every other OpenAI param straight through.
@@ -960,6 +996,16 @@ def create_app(
                 f"No model is being served on {req.brain_instance_id}. "
                 "Queue a vllm-serve job there first; the running model "
                 "becomes the run's brain.",
+            )
+        readiness = await dispatcher.model_ready(
+            req.brain_instance_id, serving["id"], serving["port"]
+        )
+        if not readiness["ready"]:
+            raise HTTPException(
+                409,
+                f"The brain model {serving['model_id']} is still loading "
+                f"({readiness['error']}). Wait until it is ready, then start "
+                f"the run.",
             )
         if orchestrator.model_client_for(req.brain_instance_id) is None:
             raise HTTPException(

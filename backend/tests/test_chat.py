@@ -20,7 +20,7 @@ def make_serving_task(client, instance_id):
 
 
 def test_model_endpoint_reports_not_serving(client):
-    assert client.get("/instances/whatever/model").json() == {"serving": False}
+    assert client.get("/instances/whatever/model").json() == {"serving": False, "ready": False}
 
 
 def test_model_endpoint_reports_served_model(client):
@@ -31,7 +31,7 @@ def test_model_endpoint_reports_served_model(client):
     assert body["port"] == 8080          # host side of the template mapping
     assert body["template"] == "vllm-serve"
     # A different instance is not serving.
-    assert client.get("/instances/i-other/model").json() == {"serving": False}
+    assert client.get("/instances/i-other/model").json() == {"serving": False, "ready": False}
 
 
 def test_non_serving_running_task_is_not_a_model(client):
@@ -39,7 +39,7 @@ def test_non_serving_running_task_is_not_a_model(client):
     resp = client.post("/tasks", json={"template": "whisper-batch",
                                        "parameters": {}})
     client.app.state.queue.mark_running(resp.json()["task"]["id"], "i-whisper")
-    assert client.get("/instances/i-whisper/model").json() == {"serving": False}
+    assert client.get("/instances/i-whisper/model").json() == {"serving": False, "ready": False}
 
 
 def test_chat_409_when_nothing_served(client):
