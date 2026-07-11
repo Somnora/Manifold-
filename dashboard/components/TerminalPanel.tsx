@@ -35,22 +35,40 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
         fontFamily:
           "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
         theme: { background: "#09090b", foreground: "#e4e4e7" },
+        scrollback: 5000,
       });
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(el);
-      fit.fit();
+
+      // Fit to the host element's real box, then keep the prompt in view.
+      // The host has NO padding of its own (padding lives on the wrapper),
+      // so FitAddon's row math is exact and the last row never clips.
+      const doFit = () => {
+        try {
+          fit.fit();
+        } catch {
+          return;
+        }
+        term.scrollToBottom();
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }),
+          );
+        }
+      };
 
       const ws = new WebSocket(`${WS_BASE}/instances/${instanceId}/terminal`);
 
       ws.onopen = () => {
         setStatus("open");
-        ws.send(
-          JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }),
-        );
+        // Fit once the socket is up so the initial resize reaches the PTY.
+        requestAnimationFrame(doFit);
         term.focus();
       };
-      ws.onmessage = (event) => term.write(event.data as string);
+      ws.onmessage = (event) => {
+        term.write(event.data as string, () => term.scrollToBottom());
+      };
       ws.onclose = () => setStatus("closed");
       ws.onerror = () => setStatus("closed");
 
@@ -60,25 +78,16 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
         }
       });
 
-      const onResize = () => {
-        fit.fit();
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "resize",
-              cols: term.cols,
-              rows: term.rows,
-            }),
-          );
-        }
-      };
-      window.addEventListener("resize", onResize);
-      // Refit once the panel has its final size.
-      const refit = setTimeout(onResize, 50);
+      // Refit whenever the panel actually changes size (open animation,
+      // window resize, sidebar toggles) — more reliable than a one-shot timer.
+      const observer = new ResizeObserver(() => doFit());
+      observer.observe(el);
+      window.addEventListener("resize", doFit);
+      requestAnimationFrame(doFit);
 
       cleanup = () => {
-        clearTimeout(refit);
-        window.removeEventListener("resize", onResize);
+        observer.disconnect();
+        window.removeEventListener("resize", doFit);
         dataSub.dispose();
         ws.close();
         term.dispose();
@@ -109,7 +118,11 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
           {status}
         </span>
       </div>
-      <div ref={containerRef} className="h-80 p-2" />
+      {/* Padding is on THIS wrapper; the xterm host below fills it exactly
+          so FitAddon measures a clean, padding-free box. */}
+      <div className="h-80 p-2">
+        <div ref={containerRef} className="h-full w-full" />
+      </div>
     </div>
   );
 }
