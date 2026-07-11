@@ -36,6 +36,10 @@ class SidecarClient(abc.ABC):
         """The sidecar's /storage/unpersisted payload."""
 
     @abc.abstractmethod
+    async def recent_files(self, *, hours: float = 24, limit: int = 50) -> dict:
+        """Recently modified files across ephemeral + persistent mounts."""
+
+    @abc.abstractmethod
     async def metrics(self) -> dict: ...
 
     @abc.abstractmethod
@@ -84,6 +88,9 @@ class RealSidecarClient(SidecarClient):
     async def unpersisted_files(self) -> dict:
         return await self._get("/storage/unpersisted")
 
+    async def recent_files(self, *, hours: float = 24, limit: int = 50) -> dict:
+        return await self._get(f"/storage/recent?hours={hours}&limit={limit}")
+
     async def metrics(self) -> dict:
         return await self._get("/metrics")
 
@@ -116,6 +123,20 @@ class MockSidecarClient(SidecarClient):
 
     def clear_unpersisted(self) -> None:
         self.unpersisted = []
+
+    async def recent_files(self, *, hours: float = 24, limit: int = 50) -> dict:
+        files = [
+            {"root": "ephemeral", "path": f["path"],
+             "size_bytes": f["size_bytes"], "modified": f["modified"]}
+            for f in self.unpersisted
+        ] + [
+            {"root": "persistent", "path": "transcripts/day1.srt",
+             "size_bytes": 48_211, "modified": "2026-07-11T05:58:00+00:00"},
+            {"root": "persistent", "path": "cache/huggingface/blobs/a1b2c3",
+             "size_bytes": 2_147_483_648, "modified": "2026-07-11T05:41:00+00:00"},
+        ]
+        files.sort(key=lambda f: f["modified"], reverse=True)
+        return {"files": files[:limit], "truncated": False, "hours": hours}
 
     async def unpersisted_files(self) -> dict:
         return {

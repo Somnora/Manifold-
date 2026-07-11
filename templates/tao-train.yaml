@@ -1,0 +1,44 @@
+# Train a model with NVIDIA TAO Toolkit. TAO is spec-file driven: put your
+# experiment spec on the persistent filesystem under specs/, name the TAO
+# task entrypoint (e.g. classification_tf2, detectnet_v2, yolo_v4), and
+# results land in persistent outputs/. Datasets belong under datasets/ on
+# the persistent filesystem, referenced by the spec as /data/datasets/...
+name: tao-train
+description: Train with NVIDIA TAO Toolkit from a spec file on persistent storage
+image: nvcr.io/nvidia/tao/tao-toolkit:5.5.0-tf2.11.0
+
+command: >
+  {{task}} train
+  -e /data/specs/{{spec_file}}
+  -r /data/output/{{results_dir}}
+
+parameters:
+  - name: task
+    type: string
+    description: TAO task entrypoint (classification_tf2, detectnet_v2, yolo_v4, ...)
+  - name: spec_file
+    type: string
+    description: Experiment spec path, relative to <filesystem>/specs
+  - name: results_dir
+    type: string
+    default: tao-results
+    description: Results directory name, created under <filesystem>/output
+
+volumes:
+  - host: "{persistent}/specs"
+    container: /data/specs
+    read_only: true
+  - host: "{persistent}/datasets"
+    container: /data/datasets
+    read_only: true
+  - host: "{persistent}/output"
+    container: /data/output
+  - host: /workspace/ephemeral/tao-tmp
+    container: /tmp/tao
+
+gpu:
+  min_vram_gib: 16
+  recommended_types:
+    - gpu_1x_a10
+    - gpu_1x_a100_sxm4
+    - gpu_1x_h100_pcie

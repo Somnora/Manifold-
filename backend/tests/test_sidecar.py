@@ -63,7 +63,9 @@ class FakeNvml:
 
 def make_client(tmp_path, nvml=None):
     app = sidecar.create_app(
-        nvml=nvml or FakeNvml(), ephemeral_root=tmp_path / "ephemeral"
+        nvml=nvml or FakeNvml(),
+        ephemeral_root=tmp_path / "ephemeral",
+        persistent_root=tmp_path / "nfs",
     )
     return TestClient(app)
 
@@ -125,3 +127,31 @@ def test_unpersisted_empty_when_no_root(tmp_path):
     client = make_client(tmp_path)          # ephemeral dir never created
     body = client.get("/storage/unpersisted").json()
     assert body["files"] == []
+
+
+def test_recent_walks_both_roots_newest_first(tmp_path):
+    import os
+    import time as time_module
+
+    eph = tmp_path / "ephemeral" / "run"
+    nfs = tmp_path / "nfs" / "manifold-data" / "outputs"
+    eph.mkdir(parents=True)
+    nfs.mkdir(parents=True)
+    old = nfs / "old.bin"
+    old.write_bytes(b"x")
+    os.utime(old, (time_module.time() - 90000,) * 2)   # >24h old
+    (eph / "scratch.pt").write_bytes(b"y" * 10)
+    (nfs / "result.srt").write_bytes(b"z" * 20)
+
+    client = make_client(tmp_path)
+    body = client.get("/storage/recent").json()
+    paths = {(f["root"], f["path"]) for f in body["files"]}
+    assert ("ephemeral", "run/scratch.pt") in paths
+    assert ("persistent", "manifold-data/outputs/result.srt") in paths
+    # The >24h-old file is excluded by the default window.
+    assert not any(f["path"].endswith("old.bin") for f in body["files"])
+    assert body["truncated"] is False
+
+    # A wider window includes it.
+    body = client.get("/storage/recent", params={"hours": 48}).json()
+    assert any(f["path"].endswith("old.bin") for f in body["files"])

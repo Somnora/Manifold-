@@ -268,6 +268,20 @@ def _mock_type(name: str, description: str, cents: int, vcpus: int,
     )
 
 
+# North American Lambda regions (from the console, July 2026). Real mode
+# gets regions live from the API; the mock spreads capacity across these.
+NA_REGIONS = [
+    "us-east-1",     # Virginia
+    "us-east-2",     # Washington DC
+    "us-midwest-1",  # Illinois
+    "us-south-1",    # Texas
+    "us-south-2",    # North Texas
+    "us-south-3",    # Central Texas
+    "us-west-1",     # California
+    "us-west-2",     # Arizona
+    "us-west-3",     # Utah
+]
+
 # Mirrors the real Lambda catalog (prices/specs from the console, July 2026)
 # so mock mode looks and costs like production. Types with an empty region
 # list model "out of capacity". Real mode ignores all of this and pulls the
@@ -275,12 +289,12 @@ def _mock_type(name: str, description: str, cents: int, vcpus: int,
 DEFAULT_MOCK_TYPES = {
     t.name: t for t in [
         # With capacity in mock mode:
-        _mock_type("gpu_8x_h100_sxm5", "8x H100 (80 GB SXM5)", 3192, 208, 1800, 22528, 8, ["us-east-3"]),
-        _mock_type("gpu_1x_h100_sxm5", "1x H100 (80 GB SXM5)", 429, 26, 225, 2867, 1, ["us-east-1", "us-east-3"]),
-        _mock_type("gpu_1x_h100_pcie", "1x H100 (80 GB PCIe)", 329, 26, 200, 1024, 1, ["us-west-1", "us-east-3"]),
-        _mock_type("gpu_8x_a100_80gb_sxm4", "8x A100 (80 GB SXM4)", 2232, 240, 1800, 20480, 8, ["us-east-1"]),
+        _mock_type("gpu_8x_h100_sxm5", "8x H100 (80 GB SXM5)", 3192, 208, 1800, 22528, 8, ["us-east-2", "us-south-1"]),
+        _mock_type("gpu_1x_h100_sxm5", "1x H100 (80 GB SXM5)", 429, 26, 225, 2867, 1, ["us-east-1", "us-east-2", "us-south-1"]),
+        _mock_type("gpu_1x_h100_pcie", "1x H100 (80 GB PCIe)", 329, 26, 200, 1024, 1, ["us-west-1", "us-west-2"]),
+        _mock_type("gpu_8x_a100_80gb_sxm4", "8x A100 (80 GB SXM4)", 2232, 240, 1800, 20480, 8, ["us-east-1", "us-midwest-1"]),
         _mock_type("gpu_1x_a10", "1x A10 (24 GB PCIe)", 129, 30, 200, 1434, 1, ["us-east-1", "us-west-1"]),
-        _mock_type("gpu_1x_a100_sxm4", "1x A100 (40 GB SXM4)", 199, 30, 200, 512, 1, ["us-east-1"]),
+        _mock_type("gpu_1x_a100_sxm4", "1x A100 (40 GB SXM4)", 199, 30, 200, 512, 1, ["us-east-1", "us-west-3"]),
         # Out of capacity (empty regions), matching the console screenshots:
         _mock_type("gpu_1x_gh200", "1x GH200 (96 GB)", 229, 64, 432, 4096, 1, []),
         _mock_type("gpu_8x_b200_sxm6", "8x B200 (180 GB SXM6)", 5352, 208, 2900, 22528, 8, []),
