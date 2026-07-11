@@ -457,7 +457,13 @@ class Orchestrator:
     async def _establish_connection(
         self, plan: LaunchPlan, instance: InstanceInfo
     ) -> None:
-        manager = self.managers[plan.connection_mode]
+        self._open_connection(plan.connection_mode, instance)
+        self.db.update_launch(plan.launch_id, status="active", active_at=utcnow())
+
+    def _open_connection(self, connection_mode: str, instance: InstanceInfo) -> None:
+        """Build and start a ManagedConnection for a live instance. Shared by
+        the launch pipeline and reconnect-on-startup."""
+        manager = self.managers[connection_mode]
         host = manager.dial_target(instance)   # the only mode-specific step
         conn = ManagedConnection(
             host,
@@ -466,7 +472,55 @@ class Orchestrator:
         )
         conn.start()
         self.connections[instance.id] = conn
-        self.db.update_launch(plan.launch_id, status="active", active_at=utcnow())
+
+    async def adopt_running_instances(self) -> int:
+        """Re-establish managed connections to instances still running on
+        Lambda but not tracked in memory. Called once at startup so a backend
+        restart re-attaches to live instances instead of orphaning them.
+
+        Best-effort: an unconfigured/unreachable Lambda client, or a single
+        instance we can't classify, must not stop the backend from starting.
+        Returns the number of instances adopted.
+        """
+        try:
+            instances = await self.client.list_instances()
+        except LambdaAPIError as exc:
+            logger.info("skip reconnect-on-startup: %s", exc.message)
+            return 0
+        except Exception:
+            logger.exception("skip reconnect-on-startup: could not list instances")
+            return 0
+
+        adopted = 0
+        for inst in instances:
+            if inst.status != "active" or not inst.ip:
+                continue
+            if inst.id in self.connections:
+                continue
+            launch = self.db.find_launch_by_instance(inst.id)
+            # Fall back to the default mode for instances launched outside
+            # Manifold (or before launch history existed).
+            mode = (launch or {}).get("connection_mode") \
+                or self.settings.default_connection_mode
+            if mode not in self.managers:
+                logger.warning(
+                    "cannot reconnect to %s: unknown connection mode %r",
+                    inst.id, mode,
+                )
+                continue
+            try:
+                self._open_connection(mode, inst)
+                adopted += 1
+                logger.info("reconnecting to running instance %s (%s)",
+                            inst.id, inst.name)
+            except Exception:
+                logger.exception("failed to reconnect to instance %s", inst.id)
+        if adopted:
+            self.db.record_audit(
+                "backend", "reconnect_on_startup",
+                f"re-established connections to {adopted} running instance(s)",
+            )
+        return adopted
 
     # -- test/introspection helpers ----------------------------------------------
 
