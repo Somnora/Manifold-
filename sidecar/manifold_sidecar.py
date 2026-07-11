@@ -11,6 +11,10 @@ Endpoints:
     GET /storage/unpersisted   files under /workspace/ephemeral matching
                                "valuable" patterns — the termination safety
                                hook's evidence list
+    GET /storage/recent        recently modified files on both volumes
+    GET /fs/list               one directory level (the file navigator)
+    GET /fs/usage              recursive sizes of a directory's children
+    POST /fs/delete            delete a file or directory (jailed to roots)
 
 Single file, minimal dependencies (fastapi, uvicorn, pynvml), installed by
 cloud-init. Run: python3 manifold_sidecar.py
@@ -24,7 +28,8 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 
 try:
     import pynvml
@@ -52,6 +57,15 @@ def valuable_patterns() -> list[str]:
 PERSISTENT_ROOT = Path(os.environ.get("MANIFOLD_PERSISTENT_ROOT", "/lambda/nfs"))
 # Bound the recent-files walk so a huge model cache cannot stall the sidecar.
 MAX_SCAN_ENTRIES = 20_000
+
+
+class DeleteRequest(BaseModel):
+    # Module level (not inside create_app): with `from __future__ import
+    # annotations`, FastAPI resolves annotation strings via module globals,
+    # so a factory-local model would silently become a query parameter.
+    root_name: str
+    path: str
+    recursive: bool = False
 
 
 def create_app(nvml=None, ephemeral_root: Path | None = None,
@@ -170,6 +184,124 @@ def create_app(nvml=None, ephemeral_root: Path | None = None,
         results.sort(key=lambda f: f["modified"], reverse=True)
         return {"files": results[:limit], "truncated": truncated,
                 "hours": hours}
+
+    # -- file navigator ------------------------------------------------------------
+
+    roots = {"ephemeral": root, "persistent": p_root}
+
+    def resolve_jailed(root_name: str, rel_path: str) -> Path:
+        """Resolve root+relative path; refuse anything escaping the root."""
+        base = roots.get(root_name)
+        if base is None:
+            raise HTTPException(400, f"unknown root '{root_name}'; "
+                                     f"use ephemeral or persistent")
+        target = (base / rel_path.lstrip("/")).resolve()
+        if target != base.resolve() and base.resolve() not in target.parents:
+            raise HTTPException(400, f"path escapes the {root_name} root")
+        return target
+
+    @app.get("/fs/list")
+    async def fs_list(root_name: str = "persistent", path: str = ""):
+        """One directory level: entries with type, size, mtime. Directories
+        first, then files, both alphabetical. Fast — a single scandir, no
+        recursion (sizes of directories come from /fs/usage)."""
+        target = resolve_jailed(root_name, path)
+        if not target.exists():
+            raise HTTPException(404, f"{root_name}:{path or '/'} not found")
+        if not target.is_dir():
+            raise HTTPException(400, f"{root_name}:{path} is a file, not a "
+                                     f"directory")
+        entries = []
+        with os.scandir(target) as it:
+            for entry in it:
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append({
+                    "name": entry.name,
+                    "is_dir": entry.is_dir(follow_symlinks=False),
+                    "size_bytes": 0 if entry.is_dir(follow_symlinks=False)
+                    else stat.st_size,
+                    "modified": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(timespec="seconds"),
+                })
+        entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+        return {"root": root_name, "path": path, "entries": entries}
+
+    @app.get("/fs/usage")
+    async def fs_usage(root_name: str = "persistent", path: str = ""):
+        """Recursive total size of each child of a directory — the
+        'what is eating my filesystem' view, heaviest first. Bounded walk
+        (MAX_SCAN_ENTRIES) with an honest truncated flag."""
+        target = resolve_jailed(root_name, path)
+        if not target.is_dir():
+            raise HTTPException(404, f"{root_name}:{path or '/'} is not a "
+                                     f"directory")
+        scanned = 0
+        truncated = False
+
+        def tree_size(p: Path) -> tuple[int, int]:
+            nonlocal scanned, truncated
+            total, files = 0, 0
+            stack = [p]
+            while stack:
+                current = stack.pop()
+                scanned += 1
+                if scanned > MAX_SCAN_ENTRIES:
+                    truncated = True
+                    break
+                try:
+                    if current.is_symlink():
+                        continue
+                    if current.is_file():
+                        total += current.stat().st_size
+                        files += 1
+                    elif current.is_dir():
+                        stack.extend(current.iterdir())
+                except OSError:
+                    continue
+            return total, files
+
+        children = []
+        with os.scandir(target) as it:
+            for entry in it:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                if is_dir:
+                    size, count = tree_size(Path(entry.path))
+                else:
+                    try:
+                        size, count = entry.stat().st_size, 1
+                    except OSError:
+                        continue
+                children.append({
+                    "name": entry.name, "is_dir": is_dir,
+                    "total_bytes": size, "file_count": count,
+                })
+        children.sort(key=lambda c: c["total_bytes"], reverse=True)
+        return {"root": root_name, "path": path, "children": children,
+                "truncated": truncated}
+
+    @app.post("/fs/delete")
+    async def fs_delete(req: DeleteRequest):
+        """Delete a file or (recursive=true) a directory. The roots
+        themselves are never deletable."""
+        target = resolve_jailed(req.root_name, req.path)
+        if target == roots[req.root_name].resolve() or not req.path.strip("/ "):
+            raise HTTPException(400, "refusing to delete a filesystem root")
+        if not target.exists():
+            raise HTTPException(404, f"{req.root_name}:{req.path} not found")
+        if target.is_dir():
+            if not req.recursive:
+                raise HTTPException(
+                    409, f"{req.path} is a directory; pass recursive=true "
+                         f"to delete it and everything inside")
+            import shutil
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return {"deleted": f"{req.root_name}:{req.path}"}
 
     return app
 

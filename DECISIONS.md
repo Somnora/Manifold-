@@ -774,3 +774,34 @@ so doing it on every request (the chat panel polls every 5s) would be
 wasteful; a background loop would probe instances nobody is looking at. On-
 demand with a TTL probes only what's actually being used, at most once per
 window. Keyed by task_id so a fresh serve gets a fresh verdict.
+
+## Phase 14 — File Navigator: browse/sizes/delete on the sidecar, archive over SFTP (2026-07-11)
+
+**What:** A real file browser on the instance card (Browse button): breadcrumb
+navigation over both volumes, a Sizes lens (recursive per-child totals,
+heaviest first — the "what is eating my filesystem" cleanup view James asked
+for), delete with a type-of-guard (directories require recursive=true and a
+UI confirmation; roots are never deletable), upload-into-this-folder, per-file
+download, and whole-directory download as one .tar.gz.
+
+**Where the logic lives, and why:** listing/usage/delete are SIDECAR endpoints
+(/fs/list, /fs/usage, /fs/delete) rather than SFTP walks from the backend. The
+sidecar runs on the box: os.scandir against local disk/NFS is orders of
+magnitude faster than per-entry SFTP round trips from a laptop, the recursive
+usage walk is bounded (MAX_SCAN_ENTRIES + truncated flag, same pattern as
+/storage/recent), and the real implementation gets unit-tested against a temp
+directory instead of a dict pretending to be a filesystem. Path jailing is
+enforced INSIDE the sidecar (resolve + parent check against its roots), so the
+backend relay cannot be tricked into escaping even if its own checks regressed.
+Trade-off: new sidecar endpoints only exist on instances launched after this
+commit — acceptable because instances are ephemeral by design.
+
+**Archive:** tar.gz runs ON the instance (tar czf to a hashed temp under
+/workspace/ephemeral/.manifold-archives), streams down over the existing SFTP
+read path, temp removed after — compression happens where bandwidth is cheap,
+and one click fetches a whole outputs directory instead of N file downloads.
+
+**Gotcha recorded:** with `from __future__ import annotations`, a pydantic
+model defined INSIDE create_app silently becomes a query parameter (FastAPI
+resolves annotation strings via module globals) — request models in the
+sidecar must live at module level. Found by the 422 in tests.

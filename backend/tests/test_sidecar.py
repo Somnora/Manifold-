@@ -129,6 +129,112 @@ def test_unpersisted_empty_when_no_root(tmp_path):
     assert body["files"] == []
 
 
+def test_fs_list_one_level_dirs_first(tmp_path):
+    nfs = tmp_path / "nfs" / "manifold-data"
+    (nfs / "datasets" / "raw").mkdir(parents=True)
+    (nfs / "outputs").mkdir()
+    (nfs / "zebra.txt").write_bytes(b"z" * 42)
+    (nfs / "datasets" / "raw" / "day1.wav").write_bytes(b"w" * 100)
+
+    client = make_client(tmp_path)
+    body = client.get("/fs/list", params={
+        "root_name": "persistent", "path": "manifold-data",
+    }).json()
+    names = [(e["name"], e["is_dir"]) for e in body["entries"]]
+    # Directories first, alphabetical; files after.
+    assert names == [("datasets", True), ("outputs", True), ("zebra.txt", False)]
+    zebra = body["entries"][2]
+    assert zebra["size_bytes"] == 42
+    # Descend one level.
+    body = client.get("/fs/list", params={
+        "root_name": "persistent", "path": "manifold-data/datasets",
+    }).json()
+    assert [e["name"] for e in body["entries"]] == ["raw"]
+
+
+def test_fs_list_errors(tmp_path):
+    (tmp_path / "nfs").mkdir()
+    client = make_client(tmp_path)
+    assert client.get("/fs/list", params={
+        "root_name": "persistent", "path": "nope",
+    }).status_code == 404
+    assert client.get("/fs/list", params={
+        "root_name": "bogus", "path": "",
+    }).status_code == 400
+    # Traversal out of the root is refused.
+    assert client.get("/fs/list", params={
+        "root_name": "persistent", "path": "../../etc",
+    }).status_code == 400
+
+
+def test_fs_usage_recursive_sizes_heaviest_first(tmp_path):
+    nfs = tmp_path / "nfs" / "fs"
+    (nfs / "research" / "scrapes").mkdir(parents=True)
+    (nfs / "small").mkdir()
+    (nfs / "research" / "scrapes" / "dump1.jsonl").write_bytes(b"x" * 5000)
+    (nfs / "research" / "notes.txt").write_bytes(b"n" * 100)
+    (nfs / "small" / "tiny.txt").write_bytes(b"t" * 10)
+    (nfs / "loose.bin").write_bytes(b"l" * 300)
+
+    client = make_client(tmp_path)
+    body = client.get("/fs/usage", params={
+        "root_name": "persistent", "path": "fs",
+    }).json()
+    by_name = {c["name"]: c for c in body["children"]}
+    assert by_name["research"]["total_bytes"] == 5100    # recursive
+    assert by_name["research"]["file_count"] == 2
+    assert by_name["loose.bin"]["total_bytes"] == 300
+    assert by_name["small"]["total_bytes"] == 10
+    # Heaviest first — the cleanup view.
+    assert [c["name"] for c in body["children"]] == [
+        "research", "loose.bin", "small",
+    ]
+    assert body["truncated"] is False
+
+
+def test_fs_delete_file_and_dir(tmp_path):
+    nfs = tmp_path / "nfs" / "fs"
+    (nfs / "old-scrapes").mkdir(parents=True)
+    (nfs / "old-scrapes" / "dump.jsonl").write_bytes(b"x" * 10)
+    (nfs / "keep.txt").write_bytes(b"k")
+
+    client = make_client(tmp_path)
+    # Directory without recursive: refused with guidance.
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "fs/old-scrapes",
+    })
+    assert resp.status_code == 409
+    assert "recursive" in resp.json()["detail"]
+    # With recursive: gone.
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "fs/old-scrapes", "recursive": True,
+    })
+    assert resp.status_code == 200
+    assert not (nfs / "old-scrapes").exists()
+    assert (nfs / "keep.txt").exists()          # neighbors untouched
+    # Plain file delete.
+    client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "fs/keep.txt",
+    })
+    assert not (nfs / "keep.txt").exists()
+
+
+def test_fs_delete_refuses_roots_and_escapes(tmp_path):
+    (tmp_path / "nfs").mkdir()
+    (tmp_path / "ephemeral").mkdir()
+    client = make_client(tmp_path)
+    for path in ("", "/", "."):
+        resp = client.post("/fs/delete", json={
+            "root_name": "persistent", "path": path, "recursive": True,
+        })
+        assert resp.status_code == 400, f"root delete allowed via {path!r}"
+    resp = client.post("/fs/delete", json={
+        "root_name": "ephemeral", "path": "../nfs", "recursive": True,
+    })
+    assert resp.status_code == 400
+    assert (tmp_path / "nfs").exists()
+
+
 def test_recent_walks_both_roots_newest_first(tmp_path):
     import os
     import time as time_module

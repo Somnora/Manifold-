@@ -298,6 +298,47 @@ export const api = {
       port?: number;
     }>(`/instances/${instanceId}/model`),
 
+  listDir: (instanceId: string, rootName: string, path: string) =>
+    request<{
+      root: string;
+      path: string;
+      entries: {
+        name: string;
+        is_dir: boolean;
+        size_bytes: number;
+        modified: string;
+      }[];
+    }>(
+      `/instances/${instanceId}/files/list?root_name=${rootName}&path=${encodeURIComponent(path)}`,
+    ),
+
+  dirUsage: (instanceId: string, rootName: string, path: string) =>
+    request<{
+      children: {
+        name: string;
+        is_dir: boolean;
+        total_bytes: number;
+        file_count: number;
+      }[];
+      truncated: boolean;
+    }>(
+      `/instances/${instanceId}/files/usage?root_name=${rootName}&path=${encodeURIComponent(path)}`,
+    ),
+
+  deletePath: (
+    instanceId: string,
+    rootName: string,
+    path: string,
+    recursive: boolean,
+  ) =>
+    request<{ deleted: string }>(
+      `/instances/${instanceId}/files?root_name=${rootName}&path=${encodeURIComponent(path)}&recursive=${recursive}`,
+      { method: "DELETE" },
+    ),
+
+  archiveUrl: (instanceId: string, absolutePath: string) =>
+    `${API_BASE}/instances/${instanceId}/files/archive?path=${encodeURIComponent(absolutePath)}`,
+
   uploadFile: async (instanceId: string, file: File, dest = "inbox/") => {
     const form = new FormData();
     form.append("file", file);
