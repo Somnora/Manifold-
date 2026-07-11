@@ -24,8 +24,8 @@ launch:
 ssh:
   # Name of the SSH key as registered with Lambda (GET /ssh-keys),
   # and the matching private key on this machine.
-  key_name: ""
-  private_key_path: ~/.ssh/id_ed25519
+  key_name: "lambda-burst-ed25519"
+  private_key_path: ~/.ssh/lambda_burst_ed25519
   username: ubuntu
   connect_timeout_seconds: 15
   # Managed-connection reconnect backoff (base * 2^n, capped).

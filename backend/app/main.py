@@ -13,6 +13,7 @@ Run modes:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -44,6 +45,8 @@ from .sidecar_client import MockSidecarClient
 from .storage import MockStorage, S3AdapterStorage, StorageClient
 from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
+
+logger = logging.getLogger("manifold.main")
 
 
 class LaunchRequest(BaseModel):
@@ -155,6 +158,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Re-attach to instances still running on Lambda (e.g. after a
+        # backend restart) before starting the loops, so the dispatcher and
+        # idle watcher see them immediately. Best-effort; never blocks boot.
+        adopted = await orchestrator.adopt_running_instances()
+        if adopted:
+            logger.info("reconnect-on-startup: adopted %d instance(s)", adopted)
         dispatcher.start()
         yield
         await dispatcher.stop()

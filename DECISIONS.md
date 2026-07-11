@@ -560,3 +560,28 @@ should not require knowing what dotenv is. Validation-before-save turns
 "why are my dropdowns empty an hour later" into "Lambda rejected this key"
 at paste time. Secret hygiene held: booleans and counts in /settings/status,
 key never logged, never audited, never returned.
+
+## Phase 8 — reconnect-on-startup (2026-07-11)
+
+**What:** On startup the backend calls `orchestrator.adopt_running_instances()`,
+which lists live Lambda instances and re-establishes a `ManagedConnection` to
+any that are `active` with an IP and not already tracked. Connection mode comes
+from the launch history row, falling back to `default_connection_mode` for
+instances launched outside Manifold.
+
+**Why:** Before this, restarting the backend orphaned every running instance —
+it kept billing on Lambda but the dashboard showed it `disconnected` with no way
+to reconnect, forcing a terminate-and-relaunch. Surfaced live when a wrong SSH
+key (config pointed at `id_ed25519` instead of the launch key) left an instance
+stuck `reconnecting`; the only recovery was a restart, which then orphaned it.
+
+**Design:** Best-effort — an unconfigured or unreachable Lambda client logs and
+returns 0 rather than blocking boot (a startup hook must never crash the app).
+Reuses the exact launch-path connection code via a shared `_open_connection`
+helper, so an adopted connection is byte-identical to a freshly launched one
+(same terminal, telemetry, idle detection). Adoptions are audited.
+
+**Alternatives considered:** Persisting connection objects across restarts
+(impossible — SSH sockets don't survive a process). Storing "last known
+instances" in SQLite and trusting it (rejected: Lambda is the source of truth;
+an instance may have been terminated out-of-band, so we must re-list live).
