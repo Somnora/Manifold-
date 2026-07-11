@@ -201,6 +201,13 @@ export const api = {
       `/tasks/${taskId}/logs${tail ? `?tail=${tail}` : ""}`,
     ).then((r) => r.lines),
 
+  recentFiles: (instanceId: string, hours = 24, limit = 50) =>
+    request<{
+      files: { root: string; path: string; size_bytes: number; modified: string }[];
+      truncated: boolean;
+      hours: number;
+    }>(`/instances/${instanceId}/files/recent?hours=${hours}&limit=${limit}`),
+
   watches: () =>
     request<{ watches: Watch[]; auto_launch_enabled: boolean }>("/watches"),
 

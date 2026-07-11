@@ -12,6 +12,7 @@ Run modes:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -235,6 +236,71 @@ def create_app(
         if sidecar is None:
             raise HTTPException(409, f"no managed connection to {instance_id}")
         return await sidecar.metrics()
+
+    @app.websocket("/instances/{instance_id}/terminal")
+    async def instance_terminal(ws: WebSocket, instance_id: str):
+        """Browser terminal: xterm.js <-> this WS <-> SSH shell session.
+
+        Rides the managed connection — no ttyd, nothing new listening on
+        the instance. Protocol: client sends JSON {type: "input"|"resize"},
+        server sends raw text frames of terminal output. All traffic counts
+        as activity for idle detection.
+        """
+        await ws.accept()
+        conn = orchestrator.connections.get(instance_id)
+        ssh = conn.ssh_connection() if conn else None
+        if ssh is None:
+            await ws.send_text(
+                f"\r\n[manifold] no SSH connection to {instance_id} "
+                f"(state: {conn.state.value if conn else 'unknown'})\r\n"
+            )
+            await ws.close()
+            return
+
+        process = await ssh.create_process(
+            term_type="xterm-256color", term_size=(80, 24)
+        )
+        dispatcher.touch_activity(instance_id)
+
+        async def pump_output():
+            try:
+                while True:
+                    data = await process.stdout.read(4096)
+                    if not data:
+                        break
+                    dispatcher.touch_activity(instance_id)
+                    await ws.send_text(data)
+                await ws.send_text("\r\n[manifold] shell exited\r\n")
+                await ws.close()
+            except (WebSocketDisconnect, RuntimeError):
+                pass
+
+        output_task = asyncio.create_task(pump_output())
+        try:
+            while True:
+                msg = await ws.receive_json()
+                dispatcher.touch_activity(instance_id)
+                if msg.get("type") == "input":
+                    process.stdin.write(msg.get("data", ""))
+                elif msg.get("type") == "resize":
+                    process.change_terminal_size(
+                        int(msg.get("cols", 80)), int(msg.get("rows", 24))
+                    )
+        except (WebSocketDisconnect, KeyError, ValueError):
+            pass
+        finally:
+            output_task.cancel()
+            process.close()
+
+    @app.get("/instances/{instance_id}/files/recent")
+    async def instance_recent_files(instance_id: str, hours: float = 24,
+                                    limit: int = 50):
+        """Recently changed files on the instance (ephemeral + persistent),
+        relayed from the sidecar — the 'what is my job producing?' view."""
+        sidecar = orchestrator.sidecar_for(instance_id)
+        if sidecar is None:
+            raise HTTPException(409, f"no managed connection to {instance_id}")
+        return await sidecar.recent_files(hours=hours, limit=limit)
 
     @app.websocket("/instances/{instance_id}/metrics/stream")
     async def instance_metrics_stream(ws: WebSocket, instance_id: str):

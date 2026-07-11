@@ -68,6 +68,11 @@ async def test_user_data_installs_sidecar_not_tailscale(orchestrator, mock_clien
     assert "manifold_sidecar" in user_data
     assert 'host="127.0.0.1"' in user_data          # loopback-only sidecar
     assert "tailscale" not in user_data.lower()     # direct-ssh: no tailscale
+    # Claude Code CLI is installed for agent-on-box (Phase 5); auth stays
+    # manual/interactive — no credentials in user-data.
+    assert "claude.ai/install.sh" in user_data
+    # Security posture: no web terminal service is ever provisioned.
+    assert "ttyd" not in user_data and "gotty" not in user_data
 
 
 async def test_tailscale_launch_gets_key_in_user_data_and_dials_hostname(tmp_path, db):

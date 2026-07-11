@@ -194,7 +194,149 @@ class ManagedConnection:
         self.state = ConnectionState.DISCONNECTED
 
 
-# -- Test double ---------------------------------------------------------------
+# -- Test doubles ----------------------------------------------------------------
+
+
+class _MockStream:
+    """Reader side of a MockSSHProcess: read(n) and line iteration."""
+
+    def __init__(self):
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._buffer = ""
+        self._eof = False
+
+    def _feed(self, data: str) -> None:
+        self._queue.put_nowait(data)
+
+    def _feed_eof(self) -> None:
+        self._queue.put_nowait(None)
+
+    async def read(self, n: int = -1) -> str:
+        if self._buffer:
+            data, self._buffer = self._buffer[:n], self._buffer[n:]
+            return data
+        if self._eof:
+            return ""
+        chunk = await self._queue.get()
+        if chunk is None:
+            self._eof = True
+            return ""
+        if n == -1 or len(chunk) <= n:
+            return chunk
+        self._buffer = chunk[n:]
+        return chunk[:n]
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        # Line iteration, used by the dispatcher's log streaming.
+        while "\n" not in self._buffer:
+            if self._eof:
+                if self._buffer:
+                    line, self._buffer = self._buffer, ""
+                    return line
+                raise StopAsyncIteration
+            chunk = await self._queue.get()
+            if chunk is None:
+                self._eof = True
+                continue
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split("\n", 1)
+        return line + "\n"
+
+
+class MockSSHProcess:
+    """Duck-types asyncssh's SSHClientProcess for two uses:
+
+    - command mode (dispatcher): emits "mock output of: <command>", exits 0.
+    - shell mode (terminal): a tiny fake shell with a prompt, echo, and
+      canned responses for the commands the docs/demo exercise.
+    """
+
+    PROMPT = "ubuntu@mock-gpu:~$ "
+
+    CANNED = {
+        "nvidia-smi": (
+            "+-----------------------------------------------------------+\n"
+            "| NVIDIA-SMI 550.90       Driver: 550.90    CUDA: 12.4      |\n"
+            "|  0  Mock A10   24564MiB / 24564MiB   34%   41C   P0  57W  |\n"
+            "+-----------------------------------------------------------+"
+        ),
+        "nvcc --version": "Cuda compilation tools, release 12.4, V12.4.131 (mock)",
+        "claude --version": "claude-code (mock install, launch with: claude)",
+        "ls": "manifold-data  workspace",
+        "pwd": "/home/ubuntu",
+    }
+
+    def __init__(self, command: str | None = None, term_size=(80, 24)):
+        self.command = command
+        self.term_size = term_size
+        self.resizes: list[tuple[int, int]] = []
+        self.stdin = self
+        self.stdout = _MockStream()
+        self.stderr = _MockStream()
+        self.exit_status: int | None = None
+        self._line = ""
+        if command is not None:
+            self.stdout._feed(f"mock output of: {command}\n")
+            self.stdout._feed_eof()
+            self.stderr._feed_eof()
+            self.exit_status = 0
+        else:
+            self.stdout._feed(
+                "Welcome to the Manifold mock shell (no GPU was billed).\r\n"
+                + self.PROMPT
+            )
+
+    # stdin interface -----------------------------------------------------------
+    def write(self, data: str) -> None:
+        if self.command is not None:
+            return
+        # A real PTY echoes typed characters; do the same.
+        for ch in data:
+            if ch in ("\r", "\n"):
+                self.stdout._feed("\r\n")
+                self._run_line(self._line.strip())
+                self._line = ""
+            elif ch == "\x7f":  # backspace
+                if self._line:
+                    self._line = self._line[:-1]
+                    self.stdout._feed("\b \b")
+            else:
+                self._line += ch
+                self.stdout._feed(ch)
+
+    def write_eof(self) -> None:
+        pass
+
+    def _run_line(self, line: str) -> None:
+        if line:
+            if line == "exit":
+                self.stdout._feed("logout\r\n")
+                self.exit_status = 0
+                self.stdout._feed_eof()
+                return
+            output = self.CANNED.get(line, f"mock-shell: ran '{line}'")
+            self.stdout._feed(output.replace("\n", "\r\n") + "\r\n")
+        self.stdout._feed(self.PROMPT)
+
+    # process interface -----------------------------------------------------------
+    def change_terminal_size(self, cols: int, rows: int) -> None:
+        self.resizes.append((cols, rows))
+        self.term_size = (cols, rows)
+
+    async def wait(self):
+        # Command mode finishes instantly; shell mode waits for exit.
+        while self.exit_status is None:
+            await asyncio.sleep(0.01)
+        return self
+
+    def close(self) -> None:
+        if self.exit_status is None:
+            self.exit_status = -1
+        self.stdout._feed_eof()
+        self.stderr._feed_eof()
 
 
 class MockSSHConnection:
@@ -203,6 +345,7 @@ class MockSSHConnection:
     def __init__(self):
         self._closed = asyncio.Event()
         self.commands: list[str] = []
+        self.processes: list[MockSSHProcess] = []
 
     async def run(self, command: str):
         self.commands.append(command)
@@ -213,6 +356,15 @@ class MockSSHConnection:
             stderr = ""
 
         return _Result()
+
+    async def create_process(self, command: str | None = None, *,
+                             term_type: str | None = None,
+                             term_size=(80, 24), **kwargs):
+        if command is not None:
+            self.commands.append(command)
+        process = MockSSHProcess(command, term_size=term_size)
+        self.processes.append(process)
+        return process
 
     def close(self) -> None:
         self._closed.set()

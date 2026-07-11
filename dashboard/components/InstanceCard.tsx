@@ -4,6 +4,8 @@ import { useState } from "react";
 import { api, ApiError, type Instance, type UnpersistedFile } from "@/lib/api";
 import { StatusBadge } from "@/components/Badge";
 import { TelemetryChart } from "@/components/TelemetryChart";
+import { TerminalPanel } from "@/components/TerminalPanel";
+import { RecentFiles } from "@/components/RecentFiles";
 import { formatBytes, formatMoney } from "@/lib/format";
 
 export function InstanceCard({
@@ -14,6 +16,8 @@ export function InstanceCard({
   onChanged: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [showFiles, setShowFiles] = useState(false);
   const [busy, setBusy] = useState<"" | "terminating" | "syncing">("");
   const [blockedFiles, setBlockedFiles] = useState<UnpersistedFile[] | null>(
     null,
@@ -70,7 +74,31 @@ export function InstanceCard({
             {instance.region} at {formatMoney(instance.hourly_rate_usd)}/hr
           </p>
         </div>
-        <div className="text-right">
+        <div className="flex items-center gap-2 text-right">
+          {instance.connection_state === "connected" && (
+            <>
+              <button
+                onClick={() => setShowTerminal((s) => !s)}
+                className={`rounded border px-3 py-1 text-xs font-medium ${
+                  showTerminal
+                    ? "border-zinc-900 bg-zinc-900 text-white"
+                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
+                }`}
+              >
+                {showTerminal ? "Close Terminal" : "Open Terminal"}
+              </button>
+              <button
+                onClick={() => setShowFiles((s) => !s)}
+                className={`rounded border px-3 py-1 text-xs font-medium ${
+                  showFiles
+                    ? "border-zinc-900 bg-zinc-900 text-white"
+                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
+                }`}
+              >
+                Files
+              </button>
+            </>
+          )}
           {confirming ? (
             <div className="flex items-center gap-2">
               <span className="text-xs text-zinc-500">Terminate?</span>
@@ -129,6 +157,13 @@ export function InstanceCard({
 
       {instance.connection_state === "connected" && (
         <TelemetryChart instanceId={instance.id} />
+      )}
+
+      {showTerminal && instance.connection_state === "connected" && (
+        <TerminalPanel instanceId={instance.id} />
+      )}
+      {showFiles && instance.connection_state === "connected" && (
+        <RecentFiles instanceId={instance.id} />
       )}
 
       {blockedFiles && (

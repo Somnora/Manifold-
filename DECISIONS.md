@@ -425,3 +425,66 @@ deliberate switches, not one checkbox).
 permit" (global config), so an experimenting user cannot accidentally
 arm unattended spending. Routing through the normal launch pipeline means a
 watch can never become a guard bypass.
+
+## 2026-07-11 — Terminal protocol: JSON control frames in, raw text out
+
+**Decided:** The browser terminal WS sends JSON messages
+(`{type: "input"|"resize", ...}`) and receives raw text frames of terminal
+output. The backend bridges to an asyncssh PTY session
+(`create_process(term_type=..., term_size=...)`) on the managed connection.
+
+**Alternatives:** Binary frames both ways with a framing byte (what ttyd
+does — more efficient, more code); running ttyd/gotty on the instance
+(banned: nothing may listen publicly except sshd, and a web terminal
+service is exactly the kind of thing that gets left running).
+
+**Why:** Two message kinds do not justify a binary protocol on a localhost
+link. Raw-text-out means the server needs no envelope parsing on the hot
+path, and xterm.js consumes it directly. The mock shell sits behind the
+identical bridge code — only the dialed connection object differs — so the
+gate demo exercises the real WS handler, not a lookalike.
+
+## 2026-07-11 — Mock shell instead of a local Docker container for the gate demo
+
+**Decided:** `MockSSHConnection.create_process()` returns a tiny scripted
+shell (prompt, echo, canned nvidia-smi/claude outputs). The Gate 5 demo and
+tests drive the real WS bridge against it.
+
+**Alternatives:** Run a local sshd container and have the backend really
+SSH into it (closer to production, but adds a Docker dependency to the test
+suite and still would not have a GPU, so nvidia-smi would fail anyway).
+
+**Why:** The thing worth testing is Manifold's bridge: WS handling, PTY
+plumbing, resize propagation, activity touching, teardown. That code is
+byte-identical in mock and real mode. What a real sshd would additionally
+prove (asyncssh's own PTY support) is upstream-tested. Real-instance
+verification happens at the manual phase gate like every other phase.
+
+## 2026-07-11 — Recent-files view: bounded sidecar walk, not inotify
+
+**Decided:** (For James's "see files being added/moved/produced" ask.) The
+sidecar's GET /storage/recent walks ephemeral + persistent roots, returns
+files modified in the last N hours (default 24), newest first, hard-capped
+at 20k entries scanned / 50 returned, with a `truncated` flag. Dashboard
+polls it every 5s while the Files panel is open.
+
+**Alternatives:** inotify/watchdog for true event streaming (persistent
+storage is NFS, where inotify does not see remote writes — it would
+silently miss exactly the files jobs produce); rsync --list-only diffing
+(stateful, more moving parts).
+
+**Why:** A bounded mtime walk is stateless, works identically on NFS, and
+5-second freshness is plenty for "is my job producing outputs?". The scan
+cap keeps a million-file HF cache from wedging the sidecar; the truncated
+flag keeps the cap honest instead of silent.
+
+## 2026-07-11 — TAO support is a template, not a feature
+
+**Decided:** NVIDIA TAO Toolkit support ships as `templates/tao-train.yaml`
+(task entrypoint + spec file + results dir, all on persistent storage), not
+as dedicated backend/frontend code.
+
+**Why:** This is the Gate 4 design paying rent: "TAO made easy" required
+zero code because templates are data. The same holds for the next toolkit
+James wants — the answer is a YAML file. If a workflow ever genuinely needs
+new capability (e.g. multi-node), that is when code gets written.

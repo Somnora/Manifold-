@@ -49,10 +49,17 @@ def valuable_patterns() -> list[str]:
     return DEFAULT_VALUABLE_PATTERNS
 
 
-def create_app(nvml=None, ephemeral_root: Path | None = None) -> FastAPI:
-    """App factory; tests pass a fake nvml module and a temp ephemeral root."""
+PERSISTENT_ROOT = Path(os.environ.get("MANIFOLD_PERSISTENT_ROOT", "/lambda/nfs"))
+# Bound the recent-files walk so a huge model cache cannot stall the sidecar.
+MAX_SCAN_ENTRIES = 20_000
+
+
+def create_app(nvml=None, ephemeral_root: Path | None = None,
+               persistent_root: Path | None = None) -> FastAPI:
+    """App factory; tests pass a fake nvml module and temp roots."""
     nvml = nvml if nvml is not None else pynvml
     root = ephemeral_root if ephemeral_root is not None else EPHEMERAL_ROOT
+    p_root = persistent_root if persistent_root is not None else PERSISTENT_ROOT
     app = FastAPI(title="manifold-sidecar")
     state = {"nvml_ready": False}
 
@@ -127,6 +134,42 @@ def create_app(nvml=None, ephemeral_root: Path | None = None) -> FastAPI:
                     })
         files.sort(key=lambda f: f["size_bytes"], reverse=True)
         return {"root": str(root), "patterns": patterns, "files": files}
+
+    @app.get("/storage/recent")
+    async def recent(hours: float = 24, limit: int = 50):
+        """Files changed in the last N hours across ephemeral scratch and
+        the persistent mounts — a live view of what jobs are producing."""
+        cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+        results = []
+        scanned = 0
+        truncated = False
+        for base, kind in ((root, "ephemeral"), (p_root, "persistent")):
+            if not base.exists():
+                continue
+            for path in base.rglob("*"):
+                scanned += 1
+                if scanned > MAX_SCAN_ENTRIES:
+                    truncated = True
+                    break
+                try:
+                    if not path.is_file():
+                        continue
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime < cutoff:
+                    continue
+                results.append({
+                    "root": kind,
+                    "path": str(path.relative_to(base)),
+                    "size_bytes": stat.st_size,
+                    "modified": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(timespec="seconds"),
+                })
+        results.sort(key=lambda f: f["modified"], reverse=True)
+        return {"files": results[:limit], "truncated": truncated,
+                "hours": hours}
 
     return app
 
