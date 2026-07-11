@@ -6,14 +6,22 @@ import {
   ApiError,
   type Filesystem,
   type InstanceTypeInfo,
+  type Region,
 } from "@/lib/api";
 import { formatMoney } from "@/lib/format";
 
+// Guided order of operations, mirroring Lambda's own console:
+//   1. Pick a GPU — available types first, cheapest to priciest; the ones
+//      that are out of capacity are greyed out and unselectable.
+//   2. Pick a region — only the regions where that GPU is available are
+//      selectable; the rest are greyed with "not available for this type".
+//   3. Filesystem narrows to the chosen region (they are region-locked).
 // The form only collects input; every rule (region match, budget,
-// concurrency) is enforced by the backend, and its rejection message is
-// shown verbatim so the user sees the same truth every client sees.
+// concurrency) is still enforced by the backend and its rejection shown
+// verbatim.
 export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
+  const [regions, setRegions] = useState<Region[]>([]);
   const [filesystems, setFilesystems] = useState<Filesystem[]>([]);
   const [sshKeys, setSshKeys] = useState<string[]>([]);
   const [instanceType, setInstanceType] = useState("");
@@ -26,39 +34,100 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
-    Promise.all([api.instanceTypes(), api.filesystems(), api.sshKeys()])
-      .then(([t, fs, keys]) => {
+    Promise.all([
+      api.instanceTypes(),
+      api.regions(),
+      api.filesystems(),
+      api.sshKeys(),
+    ])
+      .then(([t, r, fs, keys]) => {
         setTypes(t);
+        setRegions(r);
         setFilesystems(fs);
         setSshKeys(keys.ssh_keys);
-        // Prefer the key configured in config.yaml, else the first registered.
         const defaultKey =
           keys.default && keys.ssh_keys.includes(keys.default)
             ? keys.default
             : (keys.ssh_keys[0] ?? "");
         setSshKey((v) => v || defaultKey);
-        const firstType = Object.keys(t)[0] ?? "";
-        setInstanceType((v) => v || firstType);
-        if (fs.length > 0) {
-          setFilesystem((v) => v || fs[0].name);
-          // Filesystems are region-locked, so the filesystem's region is
-          // the sensible default. The select stays editable; a mismatch is
-          // the backend's job to reject.
-          setRegion((v) => v || fs[0].region);
-        } else {
-          setRegion((v) => v || t[firstType]?.regions_with_capacity[0] || "");
-        }
+        // Default to the cheapest GPU that actually has capacity.
+        const firstAvailable = Object.entries(t)
+          .filter(([, info]) => info.regions_with_capacity.length > 0)
+          .sort((a, b) => a[1].price_usd_per_hour - b[1].price_usd_per_hour)[0];
+        setInstanceType((v) => v || firstAvailable?.[0] || Object.keys(t)[0] || "");
       })
       .catch((e) => setLoadError(e.message));
   }, []);
 
-  const regionOptions = useMemo(() => {
-    const fromType = types[instanceType]?.regions_with_capacity ?? [];
-    const fromFilesystems = filesystems.map((f) => f.region);
-    return [...new Set([...fromType, ...fromFilesystems])].sort();
-  }, [types, instanceType, filesystems]);
-
   const selectedType = types[instanceType];
+  const fsRegions = useMemo(
+    () => new Set(filesystems.map((f) => f.region)),
+    [filesystems],
+  );
+
+  // GPUs: available first (cheapest -> priciest), then the rest by price.
+  const typeOptions = useMemo(() => {
+    return Object.entries(types)
+      .map(([name, t]) => ({
+        name,
+        t,
+        available: t.regions_with_capacity.length > 0,
+      }))
+      .sort((a, b) => {
+        if (a.available !== b.available) return a.available ? -1 : 1;
+        return a.t.price_usd_per_hour - b.t.price_usd_per_hour;
+      });
+  }, [types]);
+
+  // Regions: those with capacity for the chosen GPU first (a region where
+  // you already have a filesystem wins ties), then the unavailable rest.
+  const availableForType = useMemo(
+    () => new Set(selectedType?.regions_with_capacity ?? []),
+    [selectedType],
+  );
+  const regionOptions = useMemo(() => {
+    return regions
+      .map((r) => ({
+        ...r,
+        available: availableForType.has(r.code),
+        hasFs: fsRegions.has(r.code),
+      }))
+      .sort((a, b) => {
+        if (a.available !== b.available) return a.available ? -1 : 1;
+        if (a.available && a.hasFs !== b.hasFs) return a.hasFs ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+  }, [regions, availableForType, fsRegions]);
+
+  // When the GPU changes, keep the region valid for it — preferring a region
+  // where a filesystem already lives.
+  useEffect(() => {
+    const avail = selectedType?.regions_with_capacity ?? [];
+    if (avail.length === 0) return; // out of capacity: Launch stays disabled
+    if (!avail.includes(region)) {
+      setRegion(avail.find((r) => fsRegions.has(r)) ?? avail[0]);
+    }
+  }, [instanceType, selectedType, fsRegions]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Filesystems are region-locked: keep the choice inside the chosen region.
+  const filesystemsInRegion = useMemo(
+    () => filesystems.filter((f) => f.region === region),
+    [filesystems, region],
+  );
+  useEffect(() => {
+    if (
+      filesystemsInRegion.length > 0 &&
+      !filesystemsInRegion.some((f) => f.name === filesystem)
+    ) {
+      setFilesystem(filesystemsInRegion[0].name);
+    }
+  }, [region, filesystemsInRegion]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const outOfCapacity =
+    !!selectedType && selectedType.regions_with_capacity.length === 0;
+  const noFsInRegion = region !== "" && filesystemsInRegion.length === 0;
+  const canLaunch =
+    !!instanceType && !!region && !!filesystem && !outOfCapacity && !noFsInRegion;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -98,49 +167,53 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     >
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <label className="block text-xs font-medium text-zinc-600">
-          GPU
+          1. GPU
           <select
             className={`${field} mt-1`}
             value={instanceType}
             onChange={(e) => setInstanceType(e.target.value)}
           >
-            {Object.entries(types).map(([name, t]) => (
-              <option key={name} value={name}>
+            {typeOptions.map(({ name, t, available }) => (
+              <option key={name} value={name} disabled={!available}>
                 {t.description} ({formatMoney(t.price_usd_per_hour)}/hr)
-                {t.regions_with_capacity.length === 0 ? " - out of capacity" : ""}
+                {available ? "" : " — out of capacity"}
               </option>
             ))}
           </select>
         </label>
         <label className="block text-xs font-medium text-zinc-600">
-          Region
+          2. Region
           <select
             className={`${field} mt-1`}
             value={region}
             onChange={(e) => setRegion(e.target.value)}
           >
             {regionOptions.map((r) => (
-              <option key={r} value={r}>
-                {r}
+              <option key={r.code} value={r.code} disabled={!r.available}>
+                {r.name} ({r.code})
+                {r.available
+                  ? r.hasFs
+                    ? " · has filesystem"
+                    : ""
+                  : " — not available for this type"}
               </option>
             ))}
           </select>
         </label>
         <label className="block text-xs font-medium text-zinc-600">
-          Filesystem
+          3. Filesystem
           <select
             className={`${field} mt-1`}
             value={filesystem}
-            onChange={(e) => {
-              const name = e.target.value;
-              setFilesystem(name);
-              const fs = filesystems.find((f) => f.name === name);
-              if (fs) setRegion(fs.region);
-            }}
+            onChange={(e) => setFilesystem(e.target.value)}
+            disabled={filesystemsInRegion.length === 0}
           >
-            {filesystems.map((f) => (
+            {filesystemsInRegion.length === 0 && (
+              <option value="">none in this region</option>
+            )}
+            {filesystemsInRegion.map((f) => (
               <option key={f.name} value={f.name}>
-                {f.name} ({f.region})
+                {f.name}
               </option>
             ))}
           </select>
@@ -177,14 +250,26 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
 
       <div className="mt-3 flex items-center justify-between gap-4">
         <p className="text-xs text-zinc-500">
-          {selectedType
-            ? `${selectedType.description}: ${selectedType.specs.gpus} GPU, ` +
-              `${selectedType.specs.vcpus} vCPU, ${selectedType.specs.memory_gib} GiB RAM`
-            : ""}
+          {outOfCapacity ? (
+            <span className="text-amber-700">
+              {selectedType.description} is out of capacity everywhere right
+              now. Pick another GPU, or set a capacity watch below.
+            </span>
+          ) : noFsInRegion ? (
+            <span className="text-amber-700">
+              No filesystem in this region. Create one in the Lambda console,
+              or pick a region where you already have one.
+            </span>
+          ) : selectedType ? (
+            `${selectedType.description}: ${selectedType.specs.gpus} GPU, ` +
+            `${selectedType.specs.vcpus} vCPU, ${selectedType.specs.memory_gib} GiB RAM`
+          ) : (
+            ""
+          )}
         </p>
         <button
           type="submit"
-          disabled={submitting || !instanceType || !filesystem}
+          disabled={submitting || !canLaunch}
           className="rounded bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
         >
           {submitting ? "Launching..." : "Launch"}

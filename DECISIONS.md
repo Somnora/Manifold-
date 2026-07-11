@@ -585,3 +585,28 @@ helper, so an adopted connection is byte-identical to a freshly launched one
 (impossible — SSH sockets don't survive a process). Storing "last known
 instances" in SQLite and trusting it (rejected: Lambda is the source of truth;
 an instance may have been terminated out-of-band, so we must re-list live).
+
+## Phase 9 — guided launch form + full region catalog (2026-07-11)
+
+**What:** The launch form now walks GPU -> region -> filesystem. GPUs list
+available types first (cheapest to priciest), out-of-capacity ones greyed and
+unselectable. Region options are driven by the chosen GPU: regions with
+capacity for it are selectable (a region where you already have a filesystem
+wins ties), the rest are greyed with "not available for this type". Filesystem
+narrows to the selected region. Added the full 12-region NA catalog with human
+names (Virginia, Arizona, ...) and a `GET /regions` endpoint serving the whole
+region universe so the form can grey out what a GPU can't use.
+
+**Why:** James kept building invalid combinations (a us-east-1 filesystem with a
+region the GPU wasn't in, or picking a region blindly) and hitting backend
+rejections after the fact. Mirroring Lambda's own console flow — pick the GPU,
+then see only the regions that GPU can actually run in — makes the invalid
+combination unrepresentable in the UI. The backend guards stay the final
+authority; this just stops the user reaching them by accident.
+
+**Design:** `/instance-types` shape is unchanged (WatchPanel still consumes it);
+region names live in a separate `/regions` endpoint so nothing breaks. Native
+`<select>` with `disabled` options does the greying — no custom dropdown,
+matches the console, stays readable. Auto-selection fills sensible defaults
+(cheapest available GPU; a region where a filesystem exists) but never fights
+an explicit choice.
