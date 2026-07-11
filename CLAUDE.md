@@ -13,7 +13,14 @@ uv run uvicorn app.main:create_default_app --factory --reload            # real 
 MANIFOLD_MOCK=1 uv run uvicorn app.main:create_default_app --factory     # mock mode, zero spend
 ```
 
-Backend runs on :8000; dashboard (Phase 2, from `dashboard/`): `npm run dev` on :3000.
+Backend runs on :8000; dashboard (from `dashboard/`): `npm run dev` on :3000,
+`npm run build` to typecheck/compile.
+
+```bash
+# Full mock demo (no credentials, no spend): from backend/ and dashboard/
+MANIFOLD_MOCK=1 MANIFOLD_MOCK_CAPACITY_FAILURES=2 uv run uvicorn app.main:create_default_app --factory
+npm run dev     # then open http://localhost:3000
+```
 
 ## Layout
 

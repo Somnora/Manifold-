@@ -188,3 +188,50 @@ get wrong: the bucket is NOT the filesystem's human name, and without the
 checksum settings newer boto3 versions send checksum headers the adapter
 answers with `NotImplemented`. Recording them here saves the next debugging
 session.
+
+## 2026-07-10 — Dashboard polls the backend; no websockets, no data library
+
+**Decided:** Client components fetch from the backend on a 2-5s interval via
+one small `usePolling` hook. No SWR, no react-query, no websocket layer for
+page state. Plain `fetch` with typed wrappers in `lib/api.ts`.
+
+**Alternatives:** SWR/react-query (dependency for caching we don't need on a
+localhost API with tiny payloads); server-sent events or websockets (real
+push, but a second transport to build and debug before Phase 3 actually
+needs one for telemetry streaming).
+
+**Why:** The backend already persists every state transition, so polling
+`GET /instances` + `GET /launches` renders the truth within two seconds —
+good enough for a human watching a launch. Fewer moving parts now; the
+websocket work arrives in Phase 3 where it pays for itself (live GPU
+telemetry). Rule applied: add realtime transport when the data is realtime,
+not for status badges.
+
+## 2026-07-10 — The launch form contains zero rules
+
+**Decided:** The form does not pre-validate region matches or budgets. It
+auto-fills the region when a filesystem is picked (pure convenience, still
+editable) and submits whatever the user chose; backend rejection messages
+are displayed verbatim.
+
+**Alternatives:** Duplicate the guard logic client-side for instant feedback.
+
+**Why:** Project rule — guards live beneath all clients, and clients contain
+no business logic. Duplicated validation drifts: the day the backend guard
+changes, a client-side copy would lie. Showing the backend's own message
+also proves at demo time that the dashboard and any future MCP agent hit the
+identical wall.
+
+## 2026-07-10 — Capacity-retry demo via env var, not a demo endpoint
+
+**Decided:** `MANIFOLD_MOCK_CAPACITY_FAILURES=N` (mock mode only) scripts N
+insufficient-capacity errors into the mock client at startup.
+
+**Alternatives:** A `/debug/fail-next-launch` endpoint; a magic instance
+name that always fails.
+
+**Why:** Failure injection stays in process wiring, not in the API surface —
+a debug endpoint would be one more thing clients could hit and one more
+branch in production code. The env var reuses the same `scripted_launch_errors`
+mechanism the tests use, so the demo exercises the exact code path the test
+suite covers.
