@@ -296,6 +296,25 @@ export const api = {
       port?: number;
     }>(`/instances/${instanceId}/model`),
 
+  uploadFile: async (instanceId: string, file: File, dest = "inbox/") => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("dest", dest);
+    // No content-type header: the browser sets the multipart boundary.
+    const resp = await fetch(
+      `${API_BASE}/instances/${instanceId}/files/upload`,
+      { method: "POST", body: form },
+    );
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new ApiError(resp.status, body.detail ?? `HTTP ${resp.status}`);
+    }
+    return body as { path: string; bytes: number };
+  },
+
+  downloadUrl: (instanceId: string, absolutePath: string) =>
+    `${API_BASE}/instances/${instanceId}/files/download?path=${encodeURIComponent(absolutePath)}`,
+
   recentFiles: (instanceId: string, hours = 24, limit = 50) =>
     request<{
       files: { root: string; path: string; size_bytes: number; modified: string }[];

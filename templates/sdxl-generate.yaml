@@ -1,0 +1,60 @@
+# Text-to-image with SDXL via HuggingFace diffusers. Reference template:
+# uses the official HF PyTorch GPU image and installs diffusers at start
+# (~1 min) — pin a custom image later if this becomes a hot path.
+#
+# Wiring note: the Python lives in the PYCODE env var (static, no
+# placeholders) and parameters arrive as argv, so the dispatcher's
+# shell-quoting of {{placeholders}} stays at the top level of the command.
+# Outputs land in <filesystem>/outputs/images; watch them appear in the
+# Files panel and download from there.
+name: sdxl-generate
+description: Generate images from a prompt with SDXL (diffusers)
+image: huggingface/transformers-pytorch-gpu:latest
+
+command: >
+  bash -c 'pip install -q diffusers accelerate safetensors &&
+  exec python -c "$PYCODE" {{prompt}} {{count}} {{steps}} {{run_name}}'
+
+parameters:
+  - name: prompt
+    type: string
+    description: The image prompt
+  - name: count
+    type: integer
+    default: 4
+    description: Number of images to generate
+  - name: steps
+    type: integer
+    default: 30
+    description: Inference steps (quality vs speed)
+  - name: run_name
+    type: string
+    default: sdxl
+    description: Filename prefix for the outputs
+
+volumes:
+  - host: "{persistent}/outputs/images"
+    container: /data/output
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+
+env:
+  HF_HOME: /root/.cache/huggingface
+  PYCODE: |
+    import sys, torch
+    from diffusers import StableDiffusionXLPipeline
+    prompt, count, steps, name = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+    pipe = StableDiffusionXLPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
+    ).to("cuda")
+    for i in range(count):
+        image = pipe(prompt=prompt, num_inference_steps=steps).images[0]
+        path = f"/data/output/{name}-{i}.png"
+        image.save(path)
+        print("saved", path, flush=True)
+
+gpu:
+  min_vram_gib: 16
+  recommended_types:
+    - gpu_1x_a10
+    - gpu_1x_a100_sxm4

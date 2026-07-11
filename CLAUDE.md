@@ -42,7 +42,7 @@ npm run dev     # then open http://localhost:3000
   - `mcp_server.py` — MCP stdio bridge; HTTP-only thin client (AST-enforced), run via `uv run manifold-mcp`
 - `backend/tests/` — pytest; everything runs against mocks
 - `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init
-- `templates/*.yaml` — job templates (vllm-serve, whisper-batch, axolotl-finetune, tao-train, gpu-smoke)
+- `templates/*.yaml` — job templates (vllm-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, gpu-smoke)
 - `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md)
 - `config.yaml` — guardrails, retry policy, SSH settings
 - `.env` — secrets only (gitignored; template in `.env.example`)

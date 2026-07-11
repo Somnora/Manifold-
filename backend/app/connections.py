@@ -181,6 +181,51 @@ class ManagedConnection:
         result = await self._conn.run(command)
         return result.exit_status, result.stdout or "", result.stderr or ""
 
+    async def sftp_write(self, remote_path: str, chunks) -> int:
+        """Stream chunks (an async iterator of bytes) to a remote file over
+        SFTP, creating parent directories. Returns bytes written."""
+        if self.state != ConnectionState.CONNECTED or self._conn is None:
+            raise ConnectionError(
+                f"no SSH connection to {self.host} (state: {self.state.value})"
+            )
+        import posixpath
+        sftp = await self._conn.start_sftp_client()
+        try:
+            parent = posixpath.dirname(remote_path)
+            if parent:
+                await sftp.makedirs(parent, exist_ok=True)
+            written = 0
+            f = await sftp.open(remote_path, "wb")
+            try:
+                async for chunk in chunks:
+                    await f.write(chunk)
+                    written += len(chunk)
+            finally:
+                await f.close()
+            return written
+        finally:
+            sftp.exit()
+
+    async def sftp_read(self, remote_path: str, chunk_size: int = 65536):
+        """Async iterator over a remote file's bytes."""
+        if self.state != ConnectionState.CONNECTED or self._conn is None:
+            raise ConnectionError(
+                f"no SSH connection to {self.host} (state: {self.state.value})"
+            )
+        sftp = await self._conn.start_sftp_client()
+        try:
+            f = await sftp.open(remote_path, "rb")
+            try:
+                while True:
+                    chunk = await f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                await f.close()
+        finally:
+            sftp.exit()
+
     async def close(self) -> None:
         self._closing = True
         if self._supervisor:
@@ -339,6 +384,52 @@ class MockSSHProcess:
         self.stderr._feed_eof()
 
 
+class _MockSFTPFile:
+    """One open file against the MockSFTP in-memory store."""
+
+    def __init__(self, store: dict, path: str, mode: str):
+        self._store = store
+        self._path = path
+        self._mode = mode
+        self._pos = 0
+        if "w" in mode:
+            store[path] = b""
+        elif path not in store:
+            raise FileNotFoundError(f"[mock sftp] no such file: {path}")
+
+    async def write(self, data: bytes) -> None:
+        self._store[self._path] += data
+
+    async def read(self, n: int = -1) -> bytes:
+        data = self._store[self._path]
+        if n == -1:
+            chunk, self._pos = data[self._pos:], len(data)
+        else:
+            chunk = data[self._pos:self._pos + n]
+            self._pos += len(chunk)
+        return chunk
+
+    async def close(self) -> None:
+        pass
+
+
+class MockSFTP:
+    """Duck-types the slice of asyncssh's SFTPClient that Manifold uses."""
+
+    def __init__(self, store: dict):
+        self.store = store
+        self.makedirs_calls: list[str] = []
+
+    async def makedirs(self, path: str, exist_ok: bool = False) -> None:
+        self.makedirs_calls.append(path)
+
+    async def open(self, path: str, mode: str) -> _MockSFTPFile:
+        return _MockSFTPFile(self.store, path, mode)
+
+    def exit(self) -> None:
+        pass
+
+
 class MockSSHConnection:
     """Stands in for an asyncssh connection in tests and mock mode."""
 
@@ -346,6 +437,12 @@ class MockSSHConnection:
         self._closed = asyncio.Event()
         self.commands: list[str] = []
         self.processes: list[MockSSHProcess] = []
+        # In-memory remote filesystem shared by all SFTP sessions on this
+        # connection: absolute remote path -> bytes.
+        self.sftp_files: dict[str, bytes] = {}
+
+    async def start_sftp_client(self) -> MockSFTP:
+        return MockSFTP(self.sftp_files)
 
     async def run(self, command: str):
         self.commands.append(command)
