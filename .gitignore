@@ -13,6 +13,9 @@ __pycache__/
 *.db-wal
 *.db-shm
 
+# SSH host-key pins (local state, machine-specific)
+host_keys.json
+
 # Node / Next.js (Phase 2+)
 node_modules/
 .next/

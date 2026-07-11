@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from .cloud_init import build_user_data
@@ -39,6 +40,7 @@ from .connections import (
     ConnectionManager,
     ConnectionState,
     DirectSSHConnectionManager,
+    HostKeyStore,
     ManagedConnection,
     TailscaleConnectionManager,
     backoff_delay,
@@ -117,6 +119,10 @@ class Orchestrator:
         }
         self.connections: dict[str, ManagedConnection] = {}   # lambda instance id -> conn
         self._launch_tasks: dict[str, asyncio.Task] = {}
+        # TOFU host-key pins live next to the database (both are local state).
+        self.host_keys = HostKeyStore(
+            str(Path(settings.db_path).with_name("host_keys.json"))
+        )
 
     # -- public API ------------------------------------------------------------
 
@@ -275,6 +281,9 @@ class Orchestrator:
         conn = self.connections.pop(instance_id, None)
         if conn is not None:
             await conn.close()
+            # The IP may be recycled to a future instance with a new host
+            # key; keeping the pin would wrongly reject that instance.
+            self.host_keys.forget(conn.host)
         await self.client.terminate_instance(instance_id)
         launch = self.db.find_launch_by_instance(instance_id)
         if launch:
@@ -327,6 +336,7 @@ class Orchestrator:
                 continue
             conn = self.connections.pop(instance_id)
             await conn.close()
+            self.host_keys.forget(conn.host)   # IP may be recycled
             launch = self.db.find_launch_by_instance(instance_id)
             if launch and launch["status"] not in ("terminated", "failed"):
                 self.db.update_launch(
@@ -528,6 +538,7 @@ class Orchestrator:
             host,
             self.settings.ssh,
             connect_fn=self._connect_fn(host) if self._connect_fn else None,
+            host_keys=self.host_keys,
         )
         conn.start()
         self.connections[instance.id] = conn
