@@ -188,3 +188,93 @@ get wrong: the bucket is NOT the filesystem's human name, and without the
 checksum settings newer boto3 versions send checksum headers the adapter
 answers with `NotImplemented`. Recording them here saves the next debugging
 session.
+
+## 2026-07-10 — Dashboard polls the backend; no websockets, no data library
+
+**Decided:** Client components fetch from the backend on a 2-5s interval via
+one small `usePolling` hook. No SWR, no react-query, no websocket layer for
+page state. Plain `fetch` with typed wrappers in `lib/api.ts`.
+
+**Alternatives:** SWR/react-query (dependency for caching we don't need on a
+localhost API with tiny payloads); server-sent events or websockets (real
+push, but a second transport to build and debug before Phase 3 actually
+needs one for telemetry streaming).
+
+**Why:** The backend already persists every state transition, so polling
+`GET /instances` + `GET /launches` renders the truth within two seconds —
+good enough for a human watching a launch. Fewer moving parts now; the
+websocket work arrives in Phase 3 where it pays for itself (live GPU
+telemetry). Rule applied: add realtime transport when the data is realtime,
+not for status badges.
+
+## 2026-07-10 — The launch form contains zero rules
+
+**Decided:** The form does not pre-validate region matches or budgets. It
+auto-fills the region when a filesystem is picked (pure convenience, still
+editable) and submits whatever the user chose; backend rejection messages
+are displayed verbatim.
+
+**Alternatives:** Duplicate the guard logic client-side for instant feedback.
+
+**Why:** Project rule — guards live beneath all clients, and clients contain
+no business logic. Duplicated validation drifts: the day the backend guard
+changes, a client-side copy would lie. Showing the backend's own message
+also proves at demo time that the dashboard and any future MCP agent hit the
+identical wall.
+
+## 2026-07-10 — Capacity-retry demo via env var, not a demo endpoint
+
+**Decided:** `MANIFOLD_MOCK_CAPACITY_FAILURES=N` (mock mode only) scripts N
+insufficient-capacity errors into the mock client at startup.
+
+**Alternatives:** A `/debug/fail-next-launch` endpoint; a magic instance
+name that always fails.
+
+**Why:** Failure injection stays in process wiring, not in the API surface —
+a debug endpoint would be one more thing clients could hit and one more
+branch in production code. The env var reuses the same `scripted_launch_errors`
+mechanism the tests use, so the demo exercises the exact code path the test
+suite covers.
+
+## 2026-07-10 — SSH key is chosen per launch, validated against Lambda's registry
+
+**Decided:** `GET /ssh-keys` lists the account's registered key names; the
+launch form offers them in a dropdown, `POST /instances` takes an optional
+`ssh_key_name`, and `config.yaml`'s `ssh.key_name` is only the fallback
+default. The orchestrator rejects (400) any key name not registered with
+Lambda before calling the launch API.
+
+**Alternatives:** Config-file-only (original Phase 1 design — user feedback:
+"nowhere to enter the SSH information"); free-text input (invites typos that
+would surface minutes later as a launch failure).
+
+**Why:** The key must exist in Lambda's registry for the launch call to
+succeed, so the honest UI is a dropdown of exactly those names. Validating
+membership at admission keeps failures at the cheap end of the pipeline.
+Note the private key path for the backend's own SSH client remains in
+config.yaml; only the key NAME travels with a launch.
+
+## 2026-07-10 — No prices on the Instances page (user decision)
+
+**Decided:** The launch form and instance cards show GPU identity
+(description like "1x A10 (24 GB PCIe)") and no hourly prices. The budget
+guard still runs on live API prices; the History page keeps its cost column
+(a spec deliverable) computed from Lambda-reported rates.
+
+**Why:** Owner feedback at Gate 2: the mock-mode canned prices read as wrong
+data, and the cards' job is tracking which GPU is which, not accounting.
+Prices remain in the API responses so guards and history stay honest; the
+dashboard just stops advertising them where they add noise.
+
+## 2026-07-10 — Post-mortem: orphaned dev servers and a stale .next cache
+
+**What happened:** Demo servers started in the background were never
+actually killed (shell job tables do not survive between tool invocations),
+so port 8000 was still taken when the owner ran the backend ("address
+already in use"), and a `next build` ran while the orphaned dev server had
+`.next` open — the mixed cache produced "module not found in the React
+Client Manifest" errors on every page.
+
+**Rule going forward:** kill dev processes by port (`lsof -ti :8000 :3000 |
+xargs kill`), never by job id; and if dev-server behavior looks impossible,
+`rm -rf .next` before deeper debugging.

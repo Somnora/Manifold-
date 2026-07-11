@@ -48,6 +48,17 @@ async def test_successful_launch(orchestrator, mock_client):
     assert conn.state == ConnectionState.CONNECTED
 
 
+async def test_launch_with_explicit_ssh_key(orchestrator, mock_client):
+    launch = await orchestrator.request_launch(
+        instance_type="gpu_1x_a10",
+        region="us-east-1",
+        filesystem="manifold-data",
+        ssh_key_name="mock-key",          # overrides config.yaml's test-ssh-key
+    )
+    await orchestrator.wait_for_launch(launch["id"])
+    assert mock_client.launch_calls[0]["ssh_key_names"] == ["mock-key"]
+
+
 async def test_capacity_failures_then_success(settings, db):
     mock = MockLambdaClient(
         scripted_launch_errors=[capacity_error(), capacity_error()]

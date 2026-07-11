@@ -30,6 +30,7 @@ from .lambda_api import (
     LambdaClient,
     MockLambdaClient,
     RealLambdaClient,
+    capacity_error,
 )
 from .orchestrator import LaunchRejected, Orchestrator
 from .storage import MockStorage, S3AdapterStorage, StorageClient
@@ -40,6 +41,7 @@ class LaunchRequest(BaseModel):
     region: str
     filesystem: str
     connection_mode: str | None = None
+    ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
 
 
@@ -147,9 +149,18 @@ def create_app(
             region=req.region,
             filesystem=req.filesystem,
             connection_mode=req.connection_mode,
+            ssh_key_name=req.ssh_key_name,
             name=req.name,
         )
         return {"launch": launch}
+
+    @app.get("/ssh-keys")
+    async def list_ssh_keys():
+        keys = await lambda_client.list_ssh_keys()
+        return {
+            "ssh_keys": [k.name for k in keys],
+            "default": settings.ssh.key_name,
+        }
 
     @app.get("/instances")
     async def list_instances():
@@ -229,5 +240,18 @@ def create_app(
 
 def create_default_app() -> FastAPI:
     """Uvicorn entry point (run with --factory so importing this module
-    never requires credentials): reads MANIFOLD_MOCK to pick the mode."""
-    return create_app(mock=os.environ.get("MANIFOLD_MOCK", "") == "1")
+    never requires credentials): reads MANIFOLD_MOCK to pick the mode.
+
+    In mock mode, MANIFOLD_MOCK_CAPACITY_FAILURES=N scripts N
+    insufficient-capacity errors before launches succeed, so the
+    dashboard's retry states can be demonstrated end to end.
+    """
+    mock = os.environ.get("MANIFOLD_MOCK", "") == "1"
+    lambda_client = None
+    if mock:
+        failures = int(os.environ.get("MANIFOLD_MOCK_CAPACITY_FAILURES", "0"))
+        if failures:
+            lambda_client = MockLambdaClient(
+                scripted_launch_errors=[capacity_error() for _ in range(failures)]
+            )
+    return create_app(mock=mock, lambda_client=lambda_client)

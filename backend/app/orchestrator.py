@@ -64,6 +64,7 @@ class LaunchPlan:
     region: str
     filesystem: str
     connection_mode: str
+    ssh_key_name: str
     types_to_try: list[str]          # requested type first, then fallbacks
     prices: dict[str, int]           # cents/hour per candidate type
     name: str
@@ -100,6 +101,7 @@ class Orchestrator:
         region: str,
         filesystem: str,
         connection_mode: str | None = None,
+        ssh_key_name: str | None = None,
         name: str = "",
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
@@ -136,11 +138,23 @@ class Orchestrator:
                 f"launch — launch in {fs.region} instead.",
             )
 
-        if not self.settings.ssh.key_name:
+        # SSH key: per-launch choice wins, config.yaml is the fallback. The
+        # name must be registered with Lambda or the launch call would fail
+        # minutes later — catch typos now.
+        resolved_key = ssh_key_name or self.settings.ssh.key_name
+        registered = [k.name for k in await self.client.list_ssh_keys()]
+        if not resolved_key:
             raise LaunchRejected(
                 400,
-                "No SSH key configured. Set ssh.key_name in config.yaml to the "
-                "key name registered with Lambda (GET /ssh-keys lists them).",
+                "No SSH key selected. Pick one of your Lambda SSH keys "
+                f"({', '.join(registered) or 'none registered yet'}) or set "
+                "ssh.key_name in config.yaml.",
+            )
+        if resolved_key not in registered:
+            raise LaunchRejected(
+                400,
+                f"SSH key '{resolved_key}' is not registered with Lambda. "
+                f"Registered keys: {', '.join(registered) or '(none)'}.",
             )
 
         # Guards run against LIVE state, not our database, so instances
@@ -189,6 +203,7 @@ class Orchestrator:
             region=region,
             filesystem=filesystem,
             connection_mode=mode,
+            ssh_key_name=resolved_key,
             types_to_try=candidates,
             prices={t: types[t].price_cents_per_hour for t in candidates},
             name=name or f"manifold-{launch_id}",
@@ -225,6 +240,7 @@ class Orchestrator:
                 "ip": inst.ip,
                 "region": inst.region,
                 "instance_type": inst.instance_type,
+                "gpu_description": inst.gpu_description,
                 "hourly_rate_usd": inst.hourly_rate_cents / 100,
                 "filesystems": inst.file_system_names,
                 "connection_mode": launch["connection_mode"] if launch else None,
@@ -289,7 +305,7 @@ class Orchestrator:
                     instance_id = await self.client.launch_instance(
                         instance_type=candidate,
                         region=plan.region,
-                        ssh_key_names=[self.settings.ssh.key_name],
+                        ssh_key_names=[plan.ssh_key_name],
                         filesystem_names=[plan.filesystem],
                         name=plan.name,
                     )

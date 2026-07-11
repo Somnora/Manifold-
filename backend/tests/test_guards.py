@@ -104,6 +104,25 @@ def test_tailscale_mode_unavailable_without_authkey(client):
     assert "TAILSCALE_AUTHKEY" in resp.json()["detail"]
 
 
+def test_unregistered_ssh_key_rejected(client, mock_client):
+    resp = client.post("/instances", json={
+        "instance_type": "gpu_1x_a10",
+        "region": "us-east-1",
+        "filesystem": "manifold-data",
+        "ssh_key_name": "not-a-real-key",
+    })
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "not-a-real-key" in detail and "mock-key" in detail
+    assert mock_client.launch_calls == []
+
+
+def test_ssh_keys_endpoint(client):
+    body = client.get("/ssh-keys").json()
+    assert body["ssh_keys"] == ["mock-key", "test-ssh-key"]
+    assert body["default"] == "test-ssh-key"
+
+
 def test_unknown_connection_mode_rejected(client):
     resp = client.post("/instances", json={
         "instance_type": "gpu_1x_a10",
