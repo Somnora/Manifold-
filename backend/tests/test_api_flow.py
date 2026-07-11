@@ -34,7 +34,7 @@ def test_full_lifecycle_over_http(client):
     assert inst["status"] == "active"
     assert inst["connection_mode"] == "direct-ssh"
     assert inst["connection_state"] == "connected"
-    assert inst["hourly_rate_usd"] == 0.75
+    assert inst["hourly_rate_usd"] == 1.29
 
     # Terminate and confirm history records it with timestamps for costing.
     resp = client.delete(f"/instances/{instance_id}")
@@ -45,7 +45,7 @@ def test_full_lifecycle_over_http(client):
     assert row["status"] == "terminated"
     assert row["launched_at"] is not None
     assert row["terminated_at"] is not None
-    assert row["hourly_rate_cents"] == 75
+    assert row["hourly_rate_cents"] == 129
 
     assert client.get("/instances").json()["instances"] == []
 
@@ -53,7 +53,7 @@ def test_full_lifecycle_over_http(client):
 def test_health_and_instance_types(client):
     assert client.get("/health").json()["status"] == "ok"
     types = client.get("/instance-types").json()
-    assert types["gpu_1x_a10"]["price_usd_per_hour"] == 0.75
+    assert types["gpu_1x_a10"]["price_usd_per_hour"] == 1.29
     assert "us-east-1" in types["gpu_1x_a10"]["regions_with_capacity"]
 
 

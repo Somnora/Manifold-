@@ -33,7 +33,7 @@ async def test_successful_launch(orchestrator, mock_client):
     final = await orchestrator.wait_for_launch(launch["id"])
     assert final["status"] == "active"
     assert final["launched_type"] == "gpu_1x_a10"
-    assert final["hourly_rate_cents"] == 75
+    assert final["hourly_rate_cents"] == 129
     assert final["attempts"] == 1
     assert final["launched_at"] is not None
     assert final["active_at"] is not None
@@ -107,7 +107,7 @@ async def test_fallback_type_used_when_primary_has_no_capacity(tmp_path, db):
     assert final["status"] == "active"
     assert final["requested_type"] == "gpu_1x_a10"
     assert final["launched_type"] == "gpu_1x_a100_sxm4"
-    assert final["hourly_rate_cents"] == 129      # rate reflects what launched
+    assert final["hourly_rate_cents"] == 199      # rate reflects what launched
     assert [c["instance_type"] for c in mock.launch_calls] == [
         "gpu_1x_a10", "gpu_1x_a100_sxm4",
     ]

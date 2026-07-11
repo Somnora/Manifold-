@@ -6,6 +6,7 @@ import { usePolling } from "@/lib/usePolling";
 import { LaunchForm } from "@/components/LaunchForm";
 import { InstanceCard } from "@/components/InstanceCard";
 import { StatusBadge } from "@/components/Badge";
+import { formatMoney, launchCost } from "@/lib/format";
 
 const IN_FLIGHT = ["launching", "retrying", "booting"];
 const RECENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
@@ -34,8 +35,31 @@ export default function InstancesPage() {
       Date.now() - new Date(l.created_at).getTime() < RECENT_FAILURE_WINDOW_MS,
   );
 
+  // Live cost picture: what running instances burn per hour, and what every
+  // launch in the ledger has cost so far (running ones keep ticking).
+  const hourlyBurn = instances.reduce((sum, i) => sum + i.hourly_rate_usd, 0);
+  const totalSpend = launches.reduce(
+    (sum, l) => sum + (launchCost(l)?.usd ?? 0),
+    0,
+  );
+
   return (
     <div className="space-y-6">
+      <div className="flex items-center justify-end gap-6 text-sm">
+        <span className="text-zinc-500">
+          Current burn:{" "}
+          <span className="font-medium text-zinc-900">
+            {formatMoney(hourlyBurn)}/hr
+          </span>
+        </span>
+        <span className="text-zinc-500">
+          Total spend:{" "}
+          <span className="font-medium text-zinc-900">
+            {formatMoney(totalSpend)}
+          </span>
+        </span>
+      </div>
+
       <section>
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
           Launch an instance

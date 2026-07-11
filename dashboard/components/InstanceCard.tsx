@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { api, ApiError, type Instance } from "@/lib/api";
 import { StatusBadge } from "@/components/Badge";
+import { formatMoney } from "@/lib/format";
 
 export function InstanceCard({
   instance,
@@ -38,7 +39,7 @@ export function InstanceCard({
           </div>
           <p className="mt-1 text-sm text-zinc-500">
             {instance.gpu_description || instance.instance_type} in{" "}
-            {instance.region}
+            {instance.region} at {formatMoney(instance.hourly_rate_usd)}/hr
           </p>
         </div>
         <div className="text-right">
