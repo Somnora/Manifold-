@@ -339,6 +339,30 @@ def create_app(
             for name, t in sorted(types.items())
         }
 
+    @app.get("/regions")
+    async def list_regions():
+        """The full region universe with human names, so the launch form can
+        show every region and grey out the ones a chosen GPU can't use.
+
+        Order: the known NA regions east->west first, then any extra region
+        the live catalog reports (named if we know it, else its code). If the
+        Lambda client is unconfigured, we still return the static NA set."""
+        from .lambda_api import NA_REGIONS, REGION_NAMES
+        codes = list(NA_REGIONS)
+        try:
+            types = await lambda_client.list_instance_types()
+            for t in types.values():
+                for code in t.regions_with_capacity:
+                    if code not in codes:
+                        codes.append(code)
+        except LambdaAPIError:
+            pass  # unconfigured/unreachable: the static NA set is still useful
+        return {
+            "regions": [
+                {"code": c, "name": REGION_NAMES.get(c, c)} for c in codes
+            ]
+        }
+
     @app.post("/instances", status_code=202)
     async def launch_instance(req: LaunchRequest):
         launch = await orchestrator.request_launch(

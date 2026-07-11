@@ -342,19 +342,26 @@ def _mock_type(name: str, description: str, cents: int, vcpus: int,
     )
 
 
-# North American Lambda regions (from the console, July 2026). Real mode
-# gets regions live from the API; the mock spreads capacity across these.
-NA_REGIONS = [
-    "us-east-1",     # Virginia
-    "us-east-2",     # Washington DC
-    "us-midwest-1",  # Illinois
-    "us-south-1",    # Texas
-    "us-south-2",    # North Texas
-    "us-south-3",    # Central Texas
-    "us-west-1",     # California
-    "us-west-2",     # Arizona
-    "us-west-3",     # Utah
-]
+# North American Lambda regions (from the console, July 2026), listed
+# roughly east -> west. Real mode gets regions live from the API; the mock
+# spreads capacity across these. REGION_NAMES maps each code to the human
+# label the Lambda console shows, so the dashboard reads "Virginia, USA"
+# instead of "us-east-1".
+REGION_NAMES = {
+    "us-east-1": "Virginia, USA",
+    "us-east-2": "Washington DC, USA",
+    "us-east-3": "Washington DC, USA",
+    "us-southeast-1": "Georgia, USA",
+    "us-midwest-1": "Illinois, USA",
+    "us-midwest-2": "Ohio, USA",
+    "us-south-1": "Texas, USA",
+    "us-south-2": "North Texas, USA",
+    "us-south-3": "Central Texas, USA",
+    "us-west-1": "California, USA",
+    "us-west-2": "Arizona, USA",
+    "us-west-3": "Utah, USA",
+}
+NA_REGIONS = list(REGION_NAMES)
 
 # Mirrors the real Lambda catalog (prices/specs from the console, July 2026)
 # so mock mode looks and costs like production. Types with an empty region
@@ -367,7 +374,8 @@ DEFAULT_MOCK_TYPES = {
         _mock_type("gpu_1x_h100_sxm5", "1x H100 (80 GB SXM5)", 429, 26, 225, 2867, 1, ["us-east-1", "us-east-2", "us-south-1"]),
         _mock_type("gpu_1x_h100_pcie", "1x H100 (80 GB PCIe)", 329, 26, 200, 1024, 1, ["us-west-1", "us-west-2"]),
         _mock_type("gpu_8x_a100_80gb_sxm4", "8x A100 (80 GB SXM4)", 2232, 240, 1800, 20480, 8, ["us-east-1", "us-midwest-1"]),
-        _mock_type("gpu_1x_a10", "1x A10 (24 GB PCIe)", 129, 30, 200, 1434, 1, ["us-east-1", "us-west-1"]),
+        # A10: available in Virginia + Arizona, matching the console.
+        _mock_type("gpu_1x_a10", "1x A10 (24 GB PCIe)", 129, 30, 200, 1434, 1, ["us-east-1", "us-west-2"]),
         _mock_type("gpu_1x_a100_sxm4", "1x A100 (40 GB SXM4)", 199, 30, 200, 512, 1, ["us-east-1", "us-west-3"]),
         # Out of capacity (empty regions), matching the console screenshots:
         _mock_type("gpu_1x_gh200", "1x GH200 (96 GB)", 229, 64, 432, 4096, 1, []),

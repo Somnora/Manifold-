@@ -48,6 +48,8 @@ export type InstanceTypeInfo = {
   regions_with_capacity: string[];
 };
 
+export type Region = { code: string; name: string };
+
 export type Filesystem = {
   name: string;
   region: string;
@@ -151,6 +153,9 @@ export type Watch = {
 export const api = {
   instanceTypes: () =>
     request<Record<string, InstanceTypeInfo>>("/instance-types"),
+
+  regions: () =>
+    request<{ regions: Region[] }>("/regions").then((r) => r.regions),
 
   filesystems: () =>
     request<{ filesystems: Filesystem[] }>("/filesystems").then(
