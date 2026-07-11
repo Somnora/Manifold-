@@ -36,6 +36,7 @@ npm run dev     # then open http://localhost:3000
   - `templates.py` — job-template registry; mount rules enforced at load
   - `task_queue.py` — `TaskQueue` interface + SQLite implementation
   - `dispatcher.py` — task push over SSH, idle auto-termination, capacity watches
+  - `agent.py` — Autopilot: agent loop driven by a model served on an instance; fixed action allowlist
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes
   - `mcp_server.py` — MCP stdio bridge; HTTP-only thin client (AST-enforced), run via `uv run manifold-mcp`

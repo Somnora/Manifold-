@@ -150,6 +150,29 @@ export type Watch = {
   triggered_at: string | null;
 };
 
+export type AgentRun = {
+  id: string;
+  created_at: string;
+  goal: string;
+  brain_instance_id: string;
+  brain_model: string | null;
+  status: "running" | "succeeded" | "failed" | "cancelled" | "exhausted";
+  max_steps: number;
+  steps_taken: number;
+  summary: string | null;
+  error: string | null;
+  finished_at: string | null;
+};
+
+export type AgentStep = {
+  seq: number;
+  at: string;
+  thought: string | null;
+  action: string;
+  args: Record<string, unknown>;
+  result: Record<string, unknown>;
+};
+
 export const api = {
   instanceTypes: () =>
     request<Record<string, InstanceTypeInfo>>("/instance-types"),
@@ -228,6 +251,27 @@ export const api = {
         access_key_id: accessKeyId,
         secret_access_key: secretAccessKey,
       }),
+    }),
+
+  autopilotRuns: () =>
+    request<{ runs: AgentRun[] }>("/autopilot/runs").then((r) => r.runs),
+
+  autopilotRun: (runId: string) =>
+    request<AgentRun & { steps: AgentStep[] }>(`/autopilot/runs/${runId}`),
+
+  startAutopilot: (body: {
+    goal: string;
+    brain_instance_id: string;
+    max_steps?: number;
+  }) =>
+    request<{ run: AgentRun }>("/autopilot/runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }).then((r) => r.run),
+
+  cancelAutopilot: (runId: string) =>
+    request<{ cancelling: boolean }>(`/autopilot/runs/${runId}/cancel`, {
+      method: "POST",
     }),
 
   audit: (actor?: string, limit = 200) =>

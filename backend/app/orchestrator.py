@@ -308,9 +308,57 @@ class Orchestrator:
                 "rsync_stats": stdout.strip()[:500]}
 
     async def instances_with_state(self) -> list[dict]:
-        """Live Lambda instances joined with connection state + launch info."""
+        """Live Lambda instances joined with connection state + launch info.
+
+        Also the reconcile point with Lambda's truth: instances that were
+        terminated out-of-band (Lambda console, API) are dropped from the
+        view, their SSH supervisors reaped, and their launch rows closed —
+        otherwise a ghost card lingers and a supervisor reconnect-loops at
+        a dead host forever."""
+        listed = await self.client.list_instances()
+        gone_statuses = ("terminated", "terminating")
+        live_ids = {i.id for i in listed if i.status not in gone_statuses}
+
+        # Reap connections to instances Lambda no longer runs. Only do this
+        # on a successful list (an API failure raises before we get here),
+        # so a transient outage can't reap healthy connections.
+        for instance_id in list(self.connections):
+            if instance_id in live_ids:
+                continue
+            conn = self.connections.pop(instance_id)
+            await conn.close()
+            launch = self.db.find_launch_by_instance(instance_id)
+            if launch and launch["status"] not in ("terminated", "failed"):
+                self.db.update_launch(
+                    launch["id"], status="terminated", terminated_at=utcnow()
+                )
+            self.db.record_audit(
+                "backend", "external_termination_detected",
+                f"{instance_id} no longer running on Lambda; connection "
+                f"reaped and history closed",
+            )
+
+        # History rows still marked active whose instance is gone (e.g. it
+        # was terminated while the backend was down, so there was never a
+        # connection to reap). Close them so cost history stops ticking.
+        for launch in self.db.list_launches():
+            if (launch["status"] == "active"
+                    and launch["lambda_instance_id"]
+                    and launch["lambda_instance_id"] not in live_ids):
+                self.db.update_launch(
+                    launch["id"], status="terminated", terminated_at=utcnow()
+                )
+                self.db.record_audit(
+                    "backend", "external_termination_detected",
+                    f"launch {launch['id']}: instance "
+                    f"{launch['lambda_instance_id']} gone from Lambda; "
+                    f"history closed",
+                )
+
         result = []
-        for inst in await self.client.list_instances():
+        for inst in listed:
+            if inst.status in gone_statuses:
+                continue   # Lambda can report these for a while; not a card
             conn = self.connections.get(inst.id)
             launch = self.db.find_launch_by_instance(inst.id)
             result.append({

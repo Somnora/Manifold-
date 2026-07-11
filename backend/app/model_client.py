@@ -103,7 +103,23 @@ class RealModelClient(ModelClient):
 
 
 class MockModelClient(ModelClient):
-    """Canned OpenAI-compatible endpoint for tests and mock mode."""
+    """Canned OpenAI-compatible endpoint for tests and mock mode.
+
+    When the conversation is an Autopilot run (recognizable by its system
+    prompt), it plays a small scripted agent — inspect the catalog, check
+    instances, finish — so the whole loop is demoable in mock mode with
+    zero spend. Plain chats get the echo reply."""
+
+    AUTOPILOT_SCRIPT = [
+        '{"thought": "First see what GPUs exist and what they cost.",'
+        ' "action": "list_instance_types", "args": {}}',
+        '{"thought": "Now check what is currently running.",'
+        ' "action": "list_instances", "args": {}}',
+        '{"thought": "I have surveyed the account; reporting back.",'
+        ' "action": "done", "args": {"summary": "Demo run complete: '
+        'inspected the GPU catalog and the running instances. In a real '
+        'run I would launch, run jobs, and terminate based on your goal."}}',
+    ]
 
     def __init__(self, model_id: str = "mock/llama-3-8b"):
         self.model_id = model_id
@@ -114,8 +130,15 @@ class MockModelClient(ModelClient):
 
     async def chat_stream(self, port: int, payload: dict) -> AsyncIterator[str]:
         self.requests.append({"port": port, "payload": payload})
-        last = payload["messages"][-1]["content"] if payload.get("messages") else ""
-        words = f"Mock reply to: {last}".split(" ")
+        messages = payload.get("messages", [])
+        system = messages[0]["content"] if messages else ""
+        if system.startswith("You are Manifold Autopilot"):
+            turn = sum(1 for m in messages if m["role"] == "assistant")
+            idx = min(turn, len(self.AUTOPILOT_SCRIPT) - 1)
+            words = self.AUTOPILOT_SCRIPT[idx].split(" ")
+        else:
+            last = messages[-1]["content"] if messages else ""
+            words = f"Mock reply to: {last}".split(" ")
         for i, word in enumerate(words):
             chunk = {
                 "id": "chatcmpl-mock",

@@ -644,3 +644,40 @@ SSH forward -> vLLM, without opening any new listener anywhere.
   while the loopback mapping stays 8080:8080; chat uses the host side of
   the mapping, which is what the dispatcher actually publishes, so it
   works regardless. Cleaning up that parameter is cosmetic backlog.
+
+## Phase 11 — Autopilot: a self-hosted model drives Manifold (2026-07-11)
+
+**What:** Agent runs. Pick a brain (any instance serving a model via
+vllm-serve), give a goal, and the backend runs the loop: send conversation
+to the brain over the managed SSH connection -> expect ONE JSON action ->
+execute it against Manifold's own guarded operations -> feed the observation
+back. GPU A literally manages GPU B. New Autopilot page shows every run and
+step live, with cancel; steps also land in Agent Activity under actor
+"autopilot". Also: instances terminated out-of-band are now reconciled away
+(card dropped, SSH supervisor reaped, history row closed), and the dashboard
+marks stale data as stale when the backend stops answering (James hit both).
+
+**Why this shape (the honest version):**
+- A strict one-JSON-action-per-turn protocol instead of OpenAI tool-calls:
+  vLLM's native tool-call support varies wildly by model; plain JSON is the
+  thing 7B-class open models can reliably produce, and parse errors are
+  bounced back as correction hints (3 consecutive failures end the run).
+- The loop lives IN the backend, next to the guards, not in a client:
+  launch_gpu IS orchestrator.request_launch, so budget/concurrency/region
+  guards bind the autopilot with zero new enforcement code. Test-proven:
+  an over-budget launch comes back as {"error": "Budget guard: ..."} data
+  the model reads and adapts to.
+- Caps everywhere: hard step ceiling (config autopilot.max_steps_cap),
+  wait cap, per-turn chat timeout, MAX_CONSECUTIVE_FAILURES, fixed action
+  allowlist (no shell, no arbitrary HTTP, no self-modification). Runs are
+  cancellable; orphaned runs are marked failed at startup.
+- Honest limits, stated in docs: a 7B open model is a mediocre long-horizon
+  agent. The harness compensates (tiny action space, errors-as-data, hard
+  caps), and the same guarded surface is what a heavyweight brain (Claude
+  via MCP) uses for hard jobs. Autopilot is the self-sufficient tier, not
+  the only tier.
+
+**Alternatives:** LangChain/agent frameworks (dependency ban, and the loop
+is ~200 lines); letting the agent shell into instances (unbounded blast
+radius — refused); OpenAI-native tool calling (model-dependent, brittle on
+small models).

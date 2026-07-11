@@ -39,6 +39,7 @@ from .lambda_api import (
     UnconfiguredLambdaClient,
     capacity_error,
 )
+from .agent import Autopilot, find_serving_task
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
@@ -76,6 +77,12 @@ class AgentAuditRequest(BaseModel):
     args: dict = Field(default_factory=dict)
     note: str = ""                     # caller-supplied session note
     result: str = ""                   # one-line result summary
+
+
+class AutopilotRequest(BaseModel):
+    goal: str = Field(min_length=4, max_length=4000)
+    brain_instance_id: str
+    max_steps: int | None = Field(default=None, ge=1)
 
 
 class ChatRequest(BaseModel):
@@ -167,6 +174,7 @@ def create_app(
     dispatcher = Dispatcher(
         settings, orchestrator, queue, templates, db, lambda_client
     )
+    autopilot = Autopilot(settings, orchestrator, queue, templates, db)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -176,8 +184,14 @@ def create_app(
         adopted = await orchestrator.adopt_running_instances()
         if adopted:
             logger.info("reconnect-on-startup: adopted %d instance(s)", adopted)
+        # An agent loop is in-memory; a run left 'running' by a previous
+        # process is dead. Say so instead of showing it running forever.
+        orphaned = db.fail_orphaned_agent_runs()
+        if orphaned:
+            logger.info("marked %d orphaned autopilot run(s) failed", orphaned)
         dispatcher.start()
         yield
+        await autopilot.stop()
         await dispatcher.stop()
         await orchestrator.shutdown()
         await lambda_client.close()
@@ -188,6 +202,7 @@ def create_app(
     app.state.settings = settings
     app.state.dispatcher = dispatcher
     app.state.queue = queue
+    app.state.autopilot = autopilot
 
     # The dashboard (Phase 2) runs on localhost:3000 and is the only
     # expected browser client; the backend itself binds to localhost.
@@ -472,24 +487,9 @@ def create_app(
     # -- chat with a served model -----------------------------------------------
 
     def _serving_task(instance_id: str) -> dict | None:
-        """The running task on this instance whose template publishes a
-        port — i.e. a live model server (vllm-serve). Returns the task
-        enriched with its host port and model id, or None."""
-        for task in queue.list():
-            if task["status"] != "running" or task["instance_id"] != instance_id:
-                continue
-            template = templates.get(task["template"])
-            if template is None or not template.ports:
-                continue
-            return {
-                **task,
-                # The dispatcher publishes template ports on the instance's
-                # loopback; the host side of the first mapping is the API.
-                "port": template.ports[0].host,
-                "model_id": task["parameters"].get("model_id")
-                or task["template"],
-            }
-        return None
+        """A live model server on this instance (see agent.find_serving_task,
+        the shared single source of truth)."""
+        return find_serving_task(queue, templates, instance_id)
 
     @app.get("/instances/{instance_id}/model")
     async def instance_model(instance_id: str):
@@ -685,6 +685,55 @@ def create_app(
             raise HTTPException(404, f"watch {watch_id} not found")
         db.update_watch(watch_id, status="cancelled")
         return {"watch": db.get_watch(watch_id)}
+
+    # -- autopilot (agent runs driven by a model served on an instance) ------------
+
+    @app.post("/autopilot/runs", status_code=202)
+    async def start_autopilot_run(req: AutopilotRequest):
+        serving = _serving_task(req.brain_instance_id)
+        if serving is None:
+            raise HTTPException(
+                409,
+                f"No model is being served on {req.brain_instance_id}. "
+                "Queue a vllm-serve job there first; the running model "
+                "becomes the run's brain.",
+            )
+        if orchestrator.model_client_for(req.brain_instance_id) is None:
+            raise HTTPException(
+                409, f"no managed connection to {req.brain_instance_id}"
+            )
+        cap = settings.autopilot.max_steps_cap
+        max_steps = min(req.max_steps or settings.autopilot.max_steps_default,
+                        cap)
+        run_id = autopilot.start_run(
+            goal=req.goal,
+            brain_instance_id=req.brain_instance_id,
+            brain_model=serving["model_id"],
+            brain_port=serving["port"],
+            max_steps=max_steps,
+        )
+        return {"run": db.get_agent_run(run_id)}
+
+    @app.get("/autopilot/runs")
+    async def list_autopilot_runs():
+        return {"runs": db.list_agent_runs()}
+
+    @app.get("/autopilot/runs/{run_id}")
+    async def get_autopilot_run(run_id: str):
+        run = db.get_agent_run(run_id)
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        return {**run, "steps": db.get_agent_steps(run_id)}
+
+    @app.post("/autopilot/runs/{run_id}/cancel")
+    async def cancel_autopilot_run(run_id: str):
+        run = db.get_agent_run(run_id)
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        if run["status"] != "running":
+            raise HTTPException(409, f"run is already {run['status']}")
+        autopilot.cancel_run(run_id)
+        return {"cancelling": True}
 
     # -- audit (agent activity) -----------------------------------------------------
 
