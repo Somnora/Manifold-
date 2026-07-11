@@ -32,6 +32,7 @@ from .config import Settings
 from .connections import ConnectionState, ManagedConnection
 from .db import Database, utcnow
 from .lambda_api import LambdaClient
+from .model_client import ModelClientError
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
 from .task_queue import TaskQueue
 from .templates import JobTemplate, PERSISTENT_TOKEN
@@ -164,6 +165,12 @@ class Dispatcher:
         # jobs update it too, so "idle" means neither jobs nor shells.
         self.last_activity: dict[str, float] = {}
         self.on_capacity_available = None   # hook for notifications (set by app)
+        # Model-readiness cache: task_id -> {ready, error, checked_at}. A
+        # served model's task goes 'running' the instant its container is
+        # launched, but vLLM needs minutes to pull the image, download
+        # weights, and load the GPU before its API answers. This tracks
+        # "actually answering", probed via GET /v1/models with a TTL.
+        self._readiness: dict[str, dict] = {}
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -187,6 +194,41 @@ class Dispatcher:
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
         self.last_activity[instance_id] = self._clock()
+
+    # -- model readiness ---------------------------------------------------------------
+
+    # Re-probe cadence: a model confirmed ready is rechecked rarely; one
+    # that's still loading is rechecked often so the UI flips promptly.
+    READY_TTL = 30.0
+    LOADING_TTL = 3.0
+
+    async def model_ready(self, instance_id: str, task_id: str,
+                          port: int) -> dict:
+        """Whether the model served by `task_id` actually answers yet.
+
+        Probes GET /v1/models on the instance at most once per TTL and
+        caches the verdict. Returns {"ready": bool, "error": str}. The
+        error carries the probe failure ('connection refused' while vLLM is
+        still starting) so callers can show a helpful loading message."""
+        now = self._clock()
+        cached = self._readiness.get(task_id)
+        ttl = self.READY_TTL if (cached and cached["ready"]) else self.LOADING_TTL
+        if cached and now - cached["checked_at"] < ttl:
+            return {"ready": cached["ready"], "error": cached["error"]}
+
+        client = self.orchestrator.model_client_for(instance_id)
+        if client is None:
+            result = {"ready": False, "error": "no managed connection"}
+        else:
+            try:
+                await client.model_info(port)
+                result = {"ready": True, "error": ""}
+            except ModelClientError as exc:
+                result = {"ready": False, "error": str(exc)}
+            except Exception as exc:   # never let a probe raise into a caller
+                result = {"ready": False, "error": str(exc)}
+        self._readiness[task_id] = {**result, "checked_at": now}
+        return result
 
     # -- task loop -----------------------------------------------------------------
 

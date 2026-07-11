@@ -107,9 +107,28 @@ export function ChatPanel({ instanceId }: { instanceId: string }) {
       <div className="mt-3 rounded border border-zinc-100 bg-zinc-50 p-4 text-sm text-zinc-500">
         No model is being served here yet. Queue a{" "}
         <span className="font-mono text-xs">vllm-serve</span> job on the Jobs
-        page with the HuggingFace model you want; once it is running, the
-        chat opens automatically. (First run downloads the weights to
-        persistent storage — subsequent serves start much faster.)
+        page with the HuggingFace model you want; once it is ready, the chat
+        opens automatically. (First run downloads the weights to persistent
+        storage — subsequent serves start much faster.)
+      </div>
+    );
+  }
+
+  if (!model.ready) {
+    return (
+      <div className="mt-3 flex items-center gap-3 rounded border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+        <span>
+          <span className="font-mono">{model.model_id}</span> is loading on
+          this instance (downloading weights and warming up the GPU). This
+          takes a few minutes on first serve; chat opens automatically when
+          it is ready.
+          {model.status_detail ? (
+            <span className="mt-1 block text-xs text-amber-700">
+              {model.status_detail}
+            </span>
+          ) : null}
+        </span>
       </div>
     );
   }

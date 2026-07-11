@@ -40,7 +40,9 @@ export default function AutopilotPage() {
         const results = await Promise.all(
           connected.map(async (i: Instance) => {
             const m = await api.modelStatus(i.id).catch(() => null);
-            return m?.serving
+            // Only a READY model can be a brain — a still-loading one would
+            // fail the run on its first turn.
+            return m?.serving && m?.ready
               ? { instanceId: i.id, name: i.name || i.id, model: m.model_id! }
               : null;
           }),

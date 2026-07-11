@@ -290,6 +290,8 @@ export const api = {
   modelStatus: (instanceId: string) =>
     request<{
       serving: boolean;
+      ready: boolean;
+      status_detail?: string;
       task_id?: string;
       template?: string;
       model_id?: string;

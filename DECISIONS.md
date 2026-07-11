@@ -745,3 +745,32 @@ OpenAI surface is wide and evolving; a permissive pass-through of the raw
 JSON is more compatible and less brittle); reassembling non-streaming
 responses from the stream (rejected — loses usage, more code, faithful
 pass-through is simpler and correct).
+
+## Post-13 — Model readiness probe: "serving" vs "ready" (2026-07-11)
+
+**Problem (found in a next-move audit):** chat, the OpenAI proxy, and
+autopilot all treated a model as usable the instant its vllm-serve task was
+'running'. But that task goes running when the CONTAINER launches, while
+vLLM then spends minutes pulling the image, downloading weights, and
+loading the GPU before its API answers. On real hardware the dashboard
+would advertise a model as available and every call would get
+connection-refused for minutes — three features looking broken on first
+real use.
+
+**Fix:** `Dispatcher.model_ready(instance_id, task_id, port)` probes GET
+/v1/models on the instance (via the previously-unused
+`ModelClient.model_info`) and caches the verdict with a TTL — short (3s)
+while loading so the UI flips promptly, long (30s) once ready. Every
+model-using path now gates on it: `/instances/{id}/model` reports
+serving + ready + status_detail; chat returns 503 "still loading" instead
+of a connection error; `/v1/models` lists only ready models (a client
+picking from the list can always use it); `/v1/chat/completions` returns a
+clean 503 model_loading; autopilot refuses to start on a loading brain; the
+chat panel shows a loading state and the autopilot brain picker only offers
+ready models.
+
+**Why a TTL cache, not a background loop:** the probe opens an SSH forward,
+so doing it on every request (the chat panel polls every 5s) would be
+wasteful; a background loop would probe instances nobody is looking at. On-
+demand with a TTL probes only what's actually being used, at most once per
+window. Keyed by task_id so a fresh serve gets a fresh verdict.
