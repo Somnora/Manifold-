@@ -51,6 +51,7 @@ export type Instance = {
   ip: string | null;
   region: string;
   instance_type: string;
+  gpu_description: string;
   hourly_rate_usd: number;
   filesystems: string[];
   connection_mode: string | null;
@@ -88,6 +89,7 @@ export type LaunchRequest = {
   region: string;
   filesystem: string;
   connection_mode: string;
+  ssh_key_name?: string;
   name?: string;
 };
 
@@ -99,6 +101,9 @@ export const api = {
     request<{ filesystems: Filesystem[] }>("/filesystems").then(
       (r) => r.filesystems,
     ),
+
+  sshKeys: () =>
+    request<{ ssh_keys: string[]; default: string }>("/ssh-keys"),
 
   instances: () =>
     request<{ instances: Instance[] }>("/instances").then((r) => r.instances),

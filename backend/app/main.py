@@ -41,6 +41,7 @@ class LaunchRequest(BaseModel):
     region: str
     filesystem: str
     connection_mode: str | None = None
+    ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
 
 
@@ -148,9 +149,18 @@ def create_app(
             region=req.region,
             filesystem=req.filesystem,
             connection_mode=req.connection_mode,
+            ssh_key_name=req.ssh_key_name,
             name=req.name,
         )
         return {"launch": launch}
+
+    @app.get("/ssh-keys")
+    async def list_ssh_keys():
+        keys = await lambda_client.list_ssh_keys()
+        return {
+            "ssh_keys": [k.name for k in keys],
+            "default": settings.ssh.key_name,
+        }
 
     @app.get("/instances")
     async def list_instances():

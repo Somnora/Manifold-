@@ -65,6 +65,12 @@ class FilesystemInfo:
 
 
 @dataclass
+class SSHKeyInfo:
+    id: str
+    name: str
+
+
+@dataclass
 class InstanceInfo:
     id: str
     name: str
@@ -73,6 +79,7 @@ class InstanceInfo:
     region: str
     instance_type: str
     hourly_rate_cents: int
+    gpu_description: str = ""
     file_system_names: list[str] = field(default_factory=list)
 
     @property
@@ -90,6 +97,9 @@ class LambdaClient(abc.ABC):
 
     @abc.abstractmethod
     async def list_filesystems(self) -> list[FilesystemInfo]: ...
+
+    @abc.abstractmethod
+    async def list_ssh_keys(self) -> list[SSHKeyInfo]: ...
 
     @abc.abstractmethod
     async def list_instances(self) -> list[InstanceInfo]: ...
@@ -177,6 +187,10 @@ class RealLambdaClient(LambdaClient):
             for fs in data
         ]
 
+    async def list_ssh_keys(self) -> list[SSHKeyInfo]:
+        data = await self._request("GET", "/ssh-keys")
+        return [SSHKeyInfo(id=k["id"], name=k["name"]) for k in data]
+
     @staticmethod
     def _instance_from_api(inst: dict) -> InstanceInfo:
         return InstanceInfo(
@@ -187,6 +201,7 @@ class RealLambdaClient(LambdaClient):
             region=inst["region"]["name"],
             instance_type=inst["instance_type"]["name"],
             hourly_rate_cents=inst["instance_type"]["price_cents_per_hour"],
+            gpu_description=inst["instance_type"].get("gpu_description", ""),
             file_system_names=inst.get("file_system_names", []),
         )
 
@@ -289,11 +304,16 @@ class MockLambdaClient(LambdaClient):
         *,
         instance_types: dict[str, InstanceTypeInfo] | None = None,
         filesystems: list[FilesystemInfo] | None = None,
+        ssh_keys: list[SSHKeyInfo] | None = None,
         scripted_launch_errors: list[LambdaAPIError] | None = None,
         polls_until_active: int = 2,
     ):
         self.instance_types = instance_types or dict(DEFAULT_MOCK_TYPES)
         self.filesystems = filesystems if filesystems is not None else default_mock_filesystems()
+        self.ssh_keys = ssh_keys if ssh_keys is not None else [
+            SSHKeyInfo(id="key1", name="mock-key"),
+            SSHKeyInfo(id="key2", name="test-ssh-key"),
+        ]
         self.scripted_launch_errors = list(scripted_launch_errors or [])
         self.polls_until_active = polls_until_active
         self.instances: dict[str, InstanceInfo] = {}
@@ -305,6 +325,9 @@ class MockLambdaClient(LambdaClient):
 
     async def list_filesystems(self) -> list[FilesystemInfo]:
         return list(self.filesystems)
+
+    async def list_ssh_keys(self) -> list[SSHKeyInfo]:
+        return list(self.ssh_keys)
 
     async def list_instances(self) -> list[InstanceInfo]:
         return [i for i in self.instances.values() if i.status != "terminated"]
@@ -346,6 +369,7 @@ class MockLambdaClient(LambdaClient):
             id=instance_id, name=name, status="booting", ip=None,
             region=region, instance_type=instance_type,
             hourly_rate_cents=type_info.price_cents_per_hour,
+            gpu_description=type_info.gpu_description,
             file_system_names=list(filesystem_names),
         )
         return instance_id

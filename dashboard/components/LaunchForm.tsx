@@ -7,7 +7,6 @@ import {
   type Filesystem,
   type InstanceTypeInfo,
 } from "@/lib/api";
-import { formatMoney } from "@/lib/format";
 
 // The form only collects input; every rule (region match, budget,
 // concurrency) is enforced by the backend, and its rejection message is
@@ -15,19 +14,28 @@ import { formatMoney } from "@/lib/format";
 export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
   const [filesystems, setFilesystems] = useState<Filesystem[]>([]);
+  const [sshKeys, setSshKeys] = useState<string[]>([]);
   const [instanceType, setInstanceType] = useState("");
   const [region, setRegion] = useState("");
   const [filesystem, setFilesystem] = useState("");
+  const [sshKey, setSshKey] = useState("");
   const [mode, setMode] = useState("direct-ssh");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
-    Promise.all([api.instanceTypes(), api.filesystems()])
-      .then(([t, fs]) => {
+    Promise.all([api.instanceTypes(), api.filesystems(), api.sshKeys()])
+      .then(([t, fs, keys]) => {
         setTypes(t);
         setFilesystems(fs);
+        setSshKeys(keys.ssh_keys);
+        // Prefer the key configured in config.yaml, else the first registered.
+        const defaultKey =
+          keys.default && keys.ssh_keys.includes(keys.default)
+            ? keys.default
+            : (keys.ssh_keys[0] ?? "");
+        setSshKey((v) => v || defaultKey);
         const firstType = Object.keys(t)[0] ?? "";
         setInstanceType((v) => v || firstType);
         if (fs.length > 0) {
@@ -61,6 +69,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         region,
         filesystem,
         connection_mode: mode,
+        ssh_key_name: sshKey || undefined,
       });
       onLaunched();
     } catch (err) {
@@ -86,9 +95,9 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       onSubmit={submit}
       className="rounded-lg border border-zinc-200 bg-white p-4"
     >
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <label className="block text-xs font-medium text-zinc-600">
-          Instance type
+          GPU
           <select
             className={`${field} mt-1`}
             value={instanceType}
@@ -96,7 +105,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           >
             {Object.entries(types).map(([name, t]) => (
               <option key={name} value={name}>
-                {name} ({formatMoney(t.price_usd_per_hour)}/hr)
+                {t.description}
               </option>
             ))}
           </select>
@@ -130,6 +139,23 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             {filesystems.map((f) => (
               <option key={f.name} value={f.name}>
                 {f.name} ({f.region})
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="block text-xs font-medium text-zinc-600">
+          SSH key
+          <select
+            className={`${field} mt-1`}
+            value={sshKey}
+            onChange={(e) => setSshKey(e.target.value)}
+          >
+            {sshKeys.length === 0 && (
+              <option value="">No keys registered</option>
+            )}
+            {sshKeys.map((k) => (
+              <option key={k} value={k}>
+                {k}
               </option>
             ))}
           </select>
