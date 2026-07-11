@@ -45,6 +45,7 @@ from .connections import (
 )
 from .db import Database, utcnow
 from .lambda_api import InstanceInfo, LambdaAPIError, LambdaClient
+from .model_client import ModelClient, RealModelClient
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 
 logger = logging.getLogger("manifold.orchestrator")
@@ -96,6 +97,7 @@ class Orchestrator:
         *,
         connect_fn: Callable[[str], Callable[[], Awaitable]] | None = None,
         sidecar_factory: Callable[[ManagedConnection], SidecarClient] | None = None,
+        model_client_factory: Callable[[ManagedConnection], "ModelClient"] | None = None,
     ):
         self.settings = settings
         self.client = lambda_client
@@ -106,6 +108,9 @@ class Orchestrator:
         # sidecar_factory(conn) builds the sidecar client for an instance;
         # mock mode injects MockSidecarClient.
         self._sidecar_factory = sidecar_factory or RealSidecarClient
+        # model_client_factory(conn) reaches a model served on the instance
+        # (vllm-serve etc.) over the same managed connection.
+        self._model_client_factory = model_client_factory or RealModelClient
         self.managers: dict[str, ConnectionManager] = {
             m.mode: m
             for m in (DirectSSHConnectionManager(), TailscaleConnectionManager())
@@ -237,6 +242,12 @@ class Orchestrator:
         if conn is None:
             return None
         return self._sidecar_factory(conn)
+
+    def model_client_for(self, instance_id: str) -> ModelClient | None:
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            return None
+        return self._model_client_factory(conn)
 
     async def terminate(self, instance_id: str, *, force: bool = False) -> dict:
         """Terminate an instance, guarded by the unpersisted-files hook.

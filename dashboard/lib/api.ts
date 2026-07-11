@@ -243,6 +243,15 @@ export const api = {
       `/audit?limit=${limit}${actor ? `&actor=${encodeURIComponent(actor)}` : ""}`,
     ).then((r) => r.entries),
 
+  modelStatus: (instanceId: string) =>
+    request<{
+      serving: boolean;
+      task_id?: string;
+      template?: string;
+      model_id?: string;
+      port?: number;
+    }>(`/instances/${instanceId}/model`),
+
   recentFiles: (instanceId: string, hours = 24, limit = 50) =>
     request<{
       files: { root: string; path: string; size_bytes: number; modified: string }[];
