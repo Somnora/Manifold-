@@ -46,6 +46,22 @@ class SidecarClient(abc.ABC):
     def metrics_stream(self) -> AsyncIterator[dict]:
         """Yield metrics payloads until cancelled."""
 
+    # -- file navigator ---------------------------------------------------------
+
+    @abc.abstractmethod
+    async def list_dir(self, root_name: str, path: str) -> dict:
+        """One directory level: {root, path, entries}."""
+
+    @abc.abstractmethod
+    async def usage(self, root_name: str, path: str) -> dict:
+        """Recursive child sizes: {root, path, children, truncated}."""
+
+    @abc.abstractmethod
+    async def delete_path(self, root_name: str, path: str,
+                          recursive: bool) -> dict:
+        """Delete a file/directory. Raises SidecarError with the sidecar's
+        message on refusal (root delete, non-recursive dir, missing)."""
+
 
 class RealSidecarClient(SidecarClient):
     """Talks to the sidecar through an SSH local port forward.
@@ -72,18 +88,34 @@ class RealSidecarClient(SidecarClient):
         except Exception as exc:
             raise SidecarError(f"could not forward sidecar port: {exc}") from exc
 
-    async def _get(self, path: str) -> dict:
+    async def _request(self, method: str, path: str, *,
+                       params: dict | None = None,
+                       json_body: dict | None = None,
+                       timeout: float = 10.0) -> dict:
         listener = await self._forward()
         try:
             port = listener.get_port()
-            async with httpx.AsyncClient(timeout=10.0) as http:
-                resp = await http.get(f"http://127.0.0.1:{port}{path}")
-                resp.raise_for_status()
+            async with httpx.AsyncClient(timeout=timeout) as http:
+                resp = await http.request(
+                    method, f"http://127.0.0.1:{port}{path}",
+                    params=params, json=json_body,
+                )
+                if resp.status_code >= 400:
+                    # Surface the sidecar's own message (jail refusals,
+                    # non-recursive dir deletes) instead of a bare status.
+                    try:
+                        detail = resp.json().get("detail", resp.text)
+                    except Exception:
+                        detail = resp.text
+                    raise SidecarError(str(detail)[:300])
                 return resp.json()
         except httpx.HTTPError as exc:
             raise SidecarError(f"sidecar request {path} failed: {exc}") from exc
         finally:
             listener.close()
+
+    async def _get(self, path: str) -> dict:
+        return await self._request("GET", path)
 
     async def unpersisted_files(self) -> dict:
         return await self._get("/storage/unpersisted")
@@ -103,6 +135,27 @@ class RealSidecarClient(SidecarClient):
             yield await self.metrics()
             await asyncio.sleep(2.0)
 
+    async def list_dir(self, root_name: str, path: str) -> dict:
+        return await self._request(
+            "GET", "/fs/list", params={"root_name": root_name, "path": path},
+            timeout=30.0,   # NFS metadata can be slow on big directories
+        )
+
+    async def usage(self, root_name: str, path: str) -> dict:
+        return await self._request(
+            "GET", "/fs/usage", params={"root_name": root_name, "path": path},
+            timeout=120.0,  # a bounded recursive walk, but still a walk
+        )
+
+    async def delete_path(self, root_name: str, path: str,
+                          recursive: bool) -> dict:
+        return await self._request(
+            "POST", "/fs/delete",
+            json_body={"root_name": root_name, "path": path,
+                       "recursive": recursive},
+            timeout=120.0,  # recursive rmtree on NFS takes time
+        )
+
 
 class MockSidecarClient(SidecarClient):
     """Canned sidecar for tests and mock mode.
@@ -120,6 +173,8 @@ class MockSidecarClient(SidecarClient):
              "size_bytes": 8_912_896, "modified": "2026-07-10T22:14:00+00:00"},
         ]
         self._tick = 0
+        import copy
+        self.tree = copy.deepcopy(self.DEMO_TREE)   # mutable per instance
 
     def clear_unpersisted(self) -> None:
         self.unpersisted = []
@@ -165,3 +220,91 @@ class MockSidecarClient(SidecarClient):
         while True:
             yield await self.metrics()
             await asyncio.sleep(1.0)
+
+    # -- file navigator (an in-memory tree: dict = dir, int = file size) -----------
+
+    DEMO_TREE = {
+        "persistent": {
+            "manifold-data": {
+                "research": {
+                    "scrapes": {
+                        "candidates-2026-raw.jsonl": 3_221_225_472,
+                        "donors-dump.csv": 1_073_741_824,
+                    },
+                    "notes.md": 4_096,
+                },
+                "datasets": {"interviews": {"day1.wav": 412_000_000}},
+                "models": {"llama-3-8b": {"model.safetensors": 16_060_000_000}},
+                "outputs": {"transcripts": {"day1.srt": 48_211}},
+                "cache": {"huggingface": {"blobs": {"a1b2c3": 2_147_483_648}}},
+            },
+        },
+        "ephemeral": {
+            "checkpoints": {"step-2000.safetensors": 4_294_967_296},
+            "outputs": {"samples": {"grid-final.png": 8_912_896}},
+        },
+    }
+
+    def _node(self, root_name: str, path: str):
+        if root_name not in self.tree:
+            raise SidecarError(f"unknown root '{root_name}'; "
+                               f"use ephemeral or persistent")
+        node = self.tree[root_name]
+        parts = [p for p in path.strip("/").split("/") if p and p != "."]
+        if any(p == ".." for p in parts):
+            raise SidecarError(f"path escapes the {root_name} root")
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                raise SidecarError(f"{root_name}:{path} not found")
+            node = node[part]
+        return node, parts
+
+    @staticmethod
+    def _tree_size(node) -> tuple[int, int]:
+        if isinstance(node, int):
+            return node, 1
+        total = files = 0
+        for child in node.values():
+            size, count = MockSidecarClient._tree_size(child)
+            total += size
+            files += count
+        return total, files
+
+    async def list_dir(self, root_name: str, path: str) -> dict:
+        node, _ = self._node(root_name, path)
+        if isinstance(node, int):
+            raise SidecarError(f"{root_name}:{path} is a file, not a directory")
+        entries = [
+            {"name": name, "is_dir": isinstance(child, dict),
+             "size_bytes": 0 if isinstance(child, dict) else child,
+             "modified": "2026-07-11T06:00:00+00:00"}
+            for name, child in node.items()
+        ]
+        entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+        return {"root": root_name, "path": path, "entries": entries}
+
+    async def usage(self, root_name: str, path: str) -> dict:
+        node, _ = self._node(root_name, path)
+        if isinstance(node, int):
+            raise SidecarError(f"{root_name}:{path} is not a directory")
+        children = []
+        for name, child in node.items():
+            size, count = self._tree_size(child)
+            children.append({"name": name, "is_dir": isinstance(child, dict),
+                             "total_bytes": size, "file_count": count})
+        children.sort(key=lambda c: c["total_bytes"], reverse=True)
+        return {"root": root_name, "path": path, "children": children,
+                "truncated": False}
+
+    async def delete_path(self, root_name: str, path: str,
+                          recursive: bool) -> dict:
+        node, parts = self._node(root_name, path)
+        if not parts:
+            raise SidecarError("refusing to delete a filesystem root")
+        if isinstance(node, dict) and not recursive:
+            raise SidecarError(
+                f"{path} is a directory; pass recursive=true to delete it "
+                f"and everything inside")
+        parent, _ = self._node(root_name, "/".join(parts[:-1]))
+        del parent[parts[-1]]
+        return {"deleted": f"{root_name}:{path}"}

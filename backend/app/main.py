@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 from contextlib import asynccontextmanager
 from dataclasses import replace
 
@@ -850,6 +851,103 @@ def create_app(
             media_type="application/octet-stream",
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"'
+            },
+        )
+
+    # -- file navigator (sidecar-backed browse/usage/delete + tar.gz archive) -------
+
+    def _sidecar_or_409(instance_id: str):
+        sidecar = orchestrator.sidecar_for(instance_id)
+        if sidecar is None:
+            raise HTTPException(409, f"no managed connection to {instance_id}")
+        return sidecar
+
+    def _sidecar_error_to_http(exc: SidecarError):
+        message = str(exc)
+        if "not found" in message:
+            return HTTPException(404, message)
+        if "recursive" in message:
+            return HTTPException(409, message)
+        return HTTPException(400, message)
+
+    @app.get("/instances/{instance_id}/files/list")
+    async def fs_list(instance_id: str, root_name: str = "persistent",
+                      path: str = ""):
+        """One directory level, served by the sidecar (local disk speed)."""
+        try:
+            return await _sidecar_or_409(instance_id).list_dir(root_name, path)
+        except SidecarError as exc:
+            raise _sidecar_error_to_http(exc)
+
+    @app.get("/instances/{instance_id}/files/usage")
+    async def fs_usage(instance_id: str, root_name: str = "persistent",
+                       path: str = ""):
+        """Recursive child sizes, heaviest first — the cleanup view."""
+        try:
+            return await _sidecar_or_409(instance_id).usage(root_name, path)
+        except SidecarError as exc:
+            raise _sidecar_error_to_http(exc)
+
+    @app.delete("/instances/{instance_id}/files")
+    async def fs_delete(instance_id: str, root_name: str, path: str,
+                        recursive: bool = False):
+        """Delete a file or directory on the instance. Destructive and
+        audited; directories require recursive=true (the UI confirms)."""
+        try:
+            result = await _sidecar_or_409(instance_id).delete_path(
+                root_name, path, recursive
+            )
+        except SidecarError as exc:
+            raise _sidecar_error_to_http(exc)
+        dispatcher.touch_activity(instance_id)
+        db.record_audit(
+            "api", "file_delete",
+            f"{instance_id} {root_name}:{path}"
+            + (" (recursive)" if recursive else ""),
+        )
+        return result
+
+    @app.get("/instances/{instance_id}/files/archive")
+    async def fs_archive(instance_id: str, path: str):
+        """Download a whole directory as one .tar.gz: tar runs ON the
+        instance (compression where bandwidth is cheap), the archive is
+        streamed down over SFTP, and the temp file is removed after."""
+        import hashlib
+        import posixpath
+        from fastapi.responses import StreamingResponse
+        conn = _connected(instance_id)
+        remote = _resolve_remote_path(instance_id, path)
+        parent, name = posixpath.dirname(remote), posixpath.basename(remote)
+        if not name:
+            raise HTTPException(400, "cannot archive a filesystem root")
+        tmp = ("/workspace/ephemeral/.manifold-archives/"
+               + hashlib.sha256(remote.encode()).hexdigest()[:16] + ".tar.gz")
+        exit_status, _, stderr = await conn.run(
+            f"mkdir -p /workspace/ephemeral/.manifold-archives && "
+            f"tar czf {shlex.quote(tmp)} -C {shlex.quote(parent)} "
+            f"{shlex.quote(name)}"
+        )
+        if exit_status != 0:
+            raise HTTPException(
+                502, f"tar failed (exit {exit_status}): {stderr[:200]}")
+        dispatcher.touch_activity(instance_id)
+        db.record_audit("api", "file_archive", f"{instance_id}:{remote}")
+
+        async def stream():
+            try:
+                async for chunk in conn.sftp_read(tmp):
+                    yield chunk
+            finally:
+                try:
+                    await conn.run(f"rm -f {shlex.quote(tmp)}")
+                except ConnectionError:
+                    pass   # connection died mid-download; temp dies with box
+
+        return StreamingResponse(
+            stream(),
+            media_type="application/gzip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{name}.tar.gz"'
             },
         )
 

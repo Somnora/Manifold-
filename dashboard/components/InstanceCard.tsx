@@ -6,6 +6,7 @@ import { StatusBadge } from "@/components/Badge";
 import { TelemetryChart } from "@/components/TelemetryChart";
 import { TerminalPanel } from "@/components/TerminalPanel";
 import { RecentFiles } from "@/components/RecentFiles";
+import { FileNavigator } from "@/components/FileNavigator";
 import { ChatPanel } from "@/components/ChatPanel";
 import { formatBytes, formatMoney } from "@/lib/format";
 
@@ -19,6 +20,7 @@ export function InstanceCard({
   const [confirming, setConfirming] = useState(false);
   const [showTerminal, setShowTerminal] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
+  const [showBrowse, setShowBrowse] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [busy, setBusy] = useState<"" | "terminating" | "syncing">("");
   const [blockedFiles, setBlockedFiles] = useState<UnpersistedFile[] | null>(
@@ -100,6 +102,16 @@ export function InstanceCard({
                 Files
               </button>
               <button
+                onClick={() => setShowBrowse((s) => !s)}
+                className={`rounded border px-3 py-1 text-xs font-medium ${
+                  showBrowse
+                    ? "border-zinc-900 bg-zinc-900 text-white"
+                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
+                }`}
+              >
+                Browse
+              </button>
+              <button
                 onClick={() => setShowChat((s) => !s)}
                 className={`rounded border px-3 py-1 text-xs font-medium ${
                   showChat
@@ -176,6 +188,9 @@ export function InstanceCard({
       )}
       {showFiles && instance.connection_state === "connected" && (
         <RecentFiles instanceId={instance.id} />
+      )}
+      {showBrowse && instance.connection_state === "connected" && (
+        <FileNavigator instanceId={instance.id} />
       )}
       {showChat && instance.connection_state === "connected" && (
         <ChatPanel instanceId={instance.id} />
