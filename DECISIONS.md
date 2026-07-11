@@ -357,3 +357,71 @@ map instead of silently vanishing.
 YAML, not the person dispatching a job hours later. The loopback rule is
 enforced in the dispatcher (one place) rather than trusted to each template,
 consistent with "nothing on the instance listens publicly except sshd."
+
+## 2026-07-11 — Tasks validate twice: at enqueue and at dispatch
+
+**Decided:** `POST /tasks` runs the template's parameter validation
+immediately (bad requests fail with 422 at the door), and the dispatcher
+re-runs it before rendering the docker command.
+
+**Alternatives:** Validate only at dispatch (a typo sits silently in the
+queue until an instance connects, maybe minutes later); only at enqueue
+(the template YAML can change between enqueue and dispatch).
+
+**Why:** The person is present at enqueue time — that is when an error is
+cheap. The dispatch-time recheck covers the gap where a template was edited
+or deleted while tasks were queued. Same principle as the launch guards:
+fail at the earliest moment the failure is knowable.
+
+## 2026-07-11 — One task at a time; a running task pins the instance
+
+**Decided:** The dispatcher runs a single task at once, and the idle loop
+skips entirely while any task is running. Idle = connected + no running
+task + no activity (job or terminal) for the timeout, with the clock seeded
+at connection time and reset by every dispatch/completion.
+
+**Alternatives:** Concurrent tasks per instance (GPU contention chaos for
+no benefit at max_concurrent_instances=1); counting time-since-last-log as
+activity (a long quiet training epoch would read as idle — wrong).
+
+**Why:** Serialized tasks match the one-GPU-instance reality and make logs,
+idle logic, and failure attribution trivially understandable. The
+"running task = alive" rule is the conservative one: better to keep a box
+an hour too long than kill a fine-tune at 90%.
+
+## 2026-07-11 — Idle termination reuses the safety hook, then syncs, then forces
+
+**Decided:** Idle auto-termination calls the standard `terminate(force=False)`.
+If the Phase 3 hook blocks (unpersisted files), the dispatcher syncs
+ephemeral → persistent and retries with force=true; every step lands in the
+audit log (demonstrated live at the gate: idle_termination → idle_sync →
+terminated in one trace).
+
+**Alternatives:** Idle-terminate with force=true directly (defeats the whole
+point of the hook — unattended termination is exactly when data loss
+happens); block and wait for a human (the machine bills all night).
+
+**Why:** Unattended is when the safety hook matters most, and sync-then-
+terminate is the only resolution that needs no human. The files end up in
+`<filesystem>/ephemeral-backup/`, the box stops billing, and the audit log
+tells the story next morning.
+
+## 2026-07-11 — Capacity watches: notify by default, auto-launch double-gated
+
+**Decided:** (James's feature request at Gate 3.) `POST /watches` registers
+an instance-type + region watch; the dispatcher polls the catalog and flips
+the watch to "available" when capacity appears. Auto-launch requires BOTH
+`auto_launch` on the watch AND `watches.auto_launch_enabled: true` in
+config.yaml, and goes through `request_launch` — budget, concurrency, and
+region guards all apply (test-proven: an over-budget auto-launch watch sees
+capacity but is refused, with the rejection audited).
+
+**Alternatives:** Notify-only (capacity at 3am is gone by 8am — the user
+called this "a game changer" precisely because reacting manually loses the
+race); auto-launch by default (spending money unattended should need two
+deliberate switches, not one checkbox).
+
+**Why:** The double gate splits "what I want" (per watch) from "what I
+permit" (global config), so an experimenting user cannot accidentally
+arm unattended spending. Routing through the normal launch pipeline means a
+watch can never become a guard bypass.

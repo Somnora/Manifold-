@@ -12,11 +12,14 @@ REPO_TEMPLATES = Path(__file__).resolve().parent.parent.parent / "templates"
 def test_reference_templates_load_cleanly():
     templates, errors = load_templates(REPO_TEMPLATES)
     assert errors == {}
-    assert set(templates) == {"vllm-serve", "whisper-batch", "axolotl-finetune"}
-    # Every reference template maps the HF cache to persistent storage.
-    for t in templates.values():
+    # The registry grows over time; the three reference templates must exist.
+    assert {"vllm-serve", "whisper-batch", "axolotl-finetune"} <= set(templates)
+    # Every model-downloading reference template maps the HF cache to
+    # persistent storage (gpu-smoke pulls no models, so it is exempt).
+    for name in ("vllm-serve", "whisper-batch", "axolotl-finetune"):
+        t = templates[name]
         hf = [v for v in t.volumes if v.container == "/root/.cache/huggingface"]
-        assert hf, f"{t.name} must map the HuggingFace cache to persistent"
+        assert hf, f"{name} must map the HuggingFace cache to persistent"
         assert hf[0].host.startswith("{persistent}")
 
 

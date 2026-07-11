@@ -34,12 +34,18 @@ export function statusTone(status: string): { tone: Tone; pulse: boolean } {
   switch (status) {
     case "active":
     case "connected":
+    case "succeeded":
+    case "available":
+    case "launched":
       return { tone: "green", pulse: false };
     case "booting":
     case "launching":
     case "retrying":
     case "connecting":
     case "reconnecting":
+    case "queued":
+    case "running":
+    case "watching":
       return { tone: "amber", pulse: true };
     case "failed":
     case "unhealthy":

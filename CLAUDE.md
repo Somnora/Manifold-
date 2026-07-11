@@ -33,6 +33,8 @@ npm run dev     # then open http://localhost:3000
   - `cloud_init.py` — user-data generation (Docker, sidecar, Claude CLI, optional Tailscale)
   - `sidecar_client.py` — `SidecarClient` interface: real (SSH port forward + httpx) and mock
   - `templates.py` — job-template registry; mount rules enforced at load
+  - `task_queue.py` — `TaskQueue` interface + SQLite implementation
+  - `dispatcher.py` — task push over SSH, idle auto-termination, capacity watches
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes
 - `backend/tests/` — pytest; everything runs against mocks

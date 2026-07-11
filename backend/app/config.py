@@ -47,6 +47,23 @@ class SSHSettings:
 
 
 @dataclass(frozen=True)
+class TaskSettings:
+    poll_seconds: float = 1.0
+
+
+@dataclass(frozen=True)
+class IdleSettings:
+    timeout_seconds: float = 300.0
+    poll_seconds: float = 15.0
+
+
+@dataclass(frozen=True)
+class WatchSettings:
+    poll_seconds: float = 60.0
+    auto_launch_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class Settings:
     # Secrets (from .env). Empty string means "not configured".
     lambda_api_key: str = ""
@@ -57,6 +74,9 @@ class Settings:
     guardrails: Guardrails = field(default_factory=Guardrails)
     launch: LaunchPolicy = field(default_factory=LaunchPolicy)
     ssh: SSHSettings = field(default_factory=SSHSettings)
+    tasks: TaskSettings = field(default_factory=TaskSettings)
+    idle: IdleSettings = field(default_factory=IdleSettings)
+    watches: WatchSettings = field(default_factory=WatchSettings)
     default_connection_mode: str = "direct-ssh"
     db_path: str = str(REPO_ROOT / "manifold.db")
 
@@ -77,6 +97,9 @@ def load_settings(
     ssh = raw.get("ssh", {})
     conn = raw.get("connection", {})
     database = raw.get("database", {})
+    tasks = raw.get("tasks", {})
+    idle = raw.get("idle", {})
+    watches = raw.get("watches", {})
 
     db_path = database.get("path", "manifold.db")
     if not os.path.isabs(db_path):
@@ -98,6 +121,17 @@ def load_settings(
             fallback_instance_types=tuple(launch.get("fallback_instance_types") or ()),
             boot_timeout_seconds=float(launch.get("boot_timeout_seconds", 900)),
             boot_poll_seconds=float(launch.get("boot_poll_seconds", 10)),
+        ),
+        tasks=TaskSettings(
+            poll_seconds=float(tasks.get("poll_seconds", 1.0)),
+        ),
+        idle=IdleSettings(
+            timeout_seconds=float(idle.get("timeout_seconds", 300)),
+            poll_seconds=float(idle.get("poll_seconds", 15)),
+        ),
+        watches=WatchSettings(
+            poll_seconds=float(watches.get("poll_seconds", 60)),
+            auto_launch_enabled=bool(watches.get("auto_launch_enabled", False)),
         ),
         ssh=SSHSettings(
             key_name=str(ssh.get("key_name", "")),
