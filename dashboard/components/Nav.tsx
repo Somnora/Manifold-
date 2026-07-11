@@ -9,6 +9,7 @@ const links = [
   { href: "/storage", label: "Storage" },
   { href: "/history", label: "History" },
   { href: "/agents", label: "Agent Activity" },
+  { href: "/settings", label: "Settings" },
 ];
 
 export function Nav() {

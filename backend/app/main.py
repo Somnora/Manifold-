@@ -27,12 +27,15 @@ from .sidecar_client import SidecarError
 from .config import Settings, load_settings
 from .connections import MockSSHConnection
 from .db import Database
+from .config import update_env_file
 from .lambda_api import (
     FilesystemInfo,
     LambdaAPIError,
     LambdaClient,
     MockLambdaClient,
     RealLambdaClient,
+    SwappableLambdaClient,
+    UnconfiguredLambdaClient,
     capacity_error,
 )
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
@@ -71,6 +74,15 @@ class AgentAuditRequest(BaseModel):
     result: str = ""                   # one-line result summary
 
 
+class LambdaKeyRequest(BaseModel):
+    api_key: str = Field(min_length=8)
+
+
+class S3KeysRequest(BaseModel):
+    access_key_id: str = Field(min_length=4)
+    secret_access_key: str = Field(min_length=8)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -78,10 +90,15 @@ def create_app(
     storage_factory=None,          # (FilesystemInfo) -> StorageClient
     connect_fn=None,               # (host) -> coroutine factory, for tests
     sidecar_factory=None,          # (ManagedConnection) -> SidecarClient
+    lambda_client_factory=None,    # (api_key) -> LambdaClient, for key validation
+    env_path=None,                 # where /settings writes secrets (.env)
     templates_dir=None,
     mock: bool = False,
 ) -> FastAPI:
     settings = settings or load_settings()
+    lambda_client_factory = lambda_client_factory or RealLambdaClient
+    from .config import REPO_ROOT
+    env_file = env_path if env_path is not None else REPO_ROOT / ".env"
 
     if mock:
         if sidecar_factory is None:
@@ -101,7 +118,15 @@ def create_app(
                 settings, ssh=replace(settings.ssh, key_name="mock-key")
             )
     elif lambda_client is None:
-        lambda_client = RealLambdaClient(settings.lambda_api_key)
+        # Real mode: never crash on a missing key. Start with a placeholder
+        # that returns a clear "configure me" error on every call; the
+        # Settings page swaps in a real client once a key is validated.
+        if settings.lambda_api_key:
+            lambda_client = SwappableLambdaClient(
+                RealLambdaClient(settings.lambda_api_key)
+            )
+        else:
+            lambda_client = SwappableLambdaClient(UnconfiguredLambdaClient())
 
     if storage_factory is None:
         def storage_factory(fs: FilesystemInfo) -> StorageClient:
@@ -119,7 +144,6 @@ def create_app(
     )
     storage_cache: dict[str, StorageClient] = {}
 
-    from .config import REPO_ROOT
     templates, template_errors = load_templates(
         templates_dir if templates_dir is not None else REPO_ROOT / "templates"
     )
@@ -188,6 +212,107 @@ def create_app(
     @app.get("/health")
     async def health():
         return {"status": "ok", "mock": mock}
+
+    # -- settings (first-run setup; secrets go to .env, never echoed back) --------
+
+    @app.get("/settings/status")
+    async def settings_status():
+        """Configuration status only — booleans, never secret values."""
+        return {
+            "mock": mock,
+            "lambda_configured": bool(settings.lambda_api_key),
+            "s3_configured": bool(
+                settings.s3_access_key_id and settings.s3_secret_access_key
+            ),
+            "tailscale_available": bool(settings.tailscale_authkey),
+            "env_path": str(env_file),
+        }
+
+    @app.post("/settings/lambda-key")
+    async def set_lambda_key(req: LambdaKeyRequest):
+        """Validate a Lambda API key against the live API, persist it to
+        .env, and hot-swap the running client. The key is never logged,
+        audited, or returned."""
+        nonlocal settings
+        candidate = lambda_client_factory(req.api_key)
+        try:
+            types = await candidate.list_instance_types()
+        except LambdaAPIError as exc:
+            await candidate.close()
+            raise HTTPException(
+                400, f"Lambda rejected this key: {exc.message}"
+            )
+        except Exception as exc:
+            await candidate.close()
+            raise HTTPException(502, f"Could not reach Lambda to validate: {exc}")
+
+        update_env_file(env_file, {"LAMBDA_API_KEY": req.api_key})
+        settings = replace(settings, lambda_api_key=req.api_key)
+        orchestrator.settings = settings
+        dispatcher.settings = settings
+        if not mock and isinstance(lambda_client, SwappableLambdaClient):
+            old = lambda_client.inner
+            lambda_client.inner = candidate
+            await old.close()
+        else:
+            # Mock mode keeps serving the demo catalog; the key is saved
+            # for the next real-mode start.
+            await candidate.close()
+        db.record_audit(
+            "api", "settings_lambda_key",
+            f"Lambda API key validated ({len(types)} instance types visible) "
+            f"and saved to .env",
+        )
+        return {
+            "valid": True,
+            "instance_types_visible": len(types),
+            "applied_live": not mock,
+        }
+
+    @app.post("/settings/s3-keys")
+    async def set_s3_keys(req: S3KeysRequest):
+        """Persist S3-adapter credentials to .env. Validated against the
+        first filesystem when one is visible; saved either way."""
+        nonlocal settings
+        validated = False
+        try:
+            filesystems = await lambda_client.list_filesystems()
+        except LambdaAPIError:
+            filesystems = []
+        if filesystems and not mock:
+            probe = S3AdapterStorage(
+                region=filesystems[0].region,
+                bucket=filesystems[0].id,
+                access_key_id=req.access_key_id,
+                secret_access_key=req.secret_access_key,
+            )
+            try:
+                await run_in_threadpool(probe.list_files, "")
+                validated = True
+            except Exception as exc:
+                raise HTTPException(
+                    400,
+                    f"S3 adapter rejected these keys against filesystem "
+                    f"'{filesystems[0].name}': {str(exc)[:200]}",
+                )
+        update_env_file(env_file, {
+            "S3_ACCESS_KEY_ID": req.access_key_id,
+            "S3_SECRET_ACCESS_KEY": req.secret_access_key,
+        })
+        settings = replace(
+            settings,
+            s3_access_key_id=req.access_key_id,
+            s3_secret_access_key=req.secret_access_key,
+        )
+        orchestrator.settings = settings
+        dispatcher.settings = settings
+        storage_cache.clear()   # rebuild storage clients with the new keys
+        db.record_audit(
+            "api", "settings_s3_keys",
+            f"S3 adapter keys saved to .env "
+            f"({'validated against a filesystem' if validated else 'not validated: no filesystem visible'})",
+        )
+        return {"saved": True, "validated": validated}
 
     # -- instances ----------------------------------------------------------------
 

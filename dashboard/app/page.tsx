@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { api, type Launch } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { LaunchForm } from "@/components/LaunchForm";
@@ -22,6 +23,8 @@ export default function InstancesPage() {
     ]);
     return { instances, launches };
   }, 2000);
+
+  const { data: setup } = usePolling(() => api.settingsStatus(), 10000);
 
   const instances = data?.instances ?? [];
   const launches = data?.launches ?? [];
@@ -46,6 +49,26 @@ export default function InstancesPage() {
 
   return (
     <div className="space-y-6">
+      {setup && !setup.mock && !setup.lambda_configured && (
+        <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <span className="font-medium">Almost there:</span> no Lambda API
+          key is configured, so the launch form has nothing to show.{" "}
+          <Link href="/settings" className="font-medium underline">
+            Add your key in Settings
+          </Link>{" "}
+          — it takes one paste.
+        </div>
+      )}
+      {setup?.mock && (
+        <div className="rounded-lg border border-zinc-300 bg-zinc-100 px-4 py-3 text-xs text-zinc-600">
+          Mock mode: demo catalog, zero spend. Real GPUs need the backend
+          started without MANIFOLD_MOCK=1 and a key in{" "}
+          <Link href="/settings" className="underline">
+            Settings
+          </Link>
+          .
+        </div>
+      )}
       <div className="flex items-center justify-end gap-6 text-sm">
         <span className="text-zinc-500">
           Current burn:{" "}

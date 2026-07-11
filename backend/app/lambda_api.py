@@ -127,6 +127,80 @@ class LambdaClient(abc.ABC):
         pass
 
 
+class UnconfiguredLambdaClient(LambdaClient):
+    """Placeholder used when real mode starts without a Lambda API key.
+
+    Every call fails with the same clear, actionable message — the backend
+    stays up and the dashboard can point the user at Settings, instead of
+    the old behavior (crash at startup, blank dropdowns, no explanation).
+    """
+
+    def _err(self) -> LambdaAPIError:
+        return LambdaAPIError(
+            code="manifold/not-configured",
+            message="No Lambda API key configured. Open the dashboard's "
+                    "Settings page to add one (or edit .env).",
+            status=503,
+        )
+
+    async def list_instance_types(self):
+        raise self._err()
+
+    async def list_filesystems(self):
+        raise self._err()
+
+    async def list_ssh_keys(self):
+        raise self._err()
+
+    async def list_instances(self):
+        raise self._err()
+
+    async def get_instance(self, instance_id: str):
+        raise self._err()
+
+    async def launch_instance(self, **kwargs):
+        raise self._err()
+
+    async def terminate_instance(self, instance_id: str):
+        raise self._err()
+
+
+class SwappableLambdaClient(LambdaClient):
+    """Delegating wrapper so credentials can be applied at runtime.
+
+    Everything (orchestrator, dispatcher, routes) holds this one object;
+    the Settings flow replaces `inner` and every holder sees the new
+    client immediately. No restart required.
+    """
+
+    def __init__(self, inner: LambdaClient):
+        self.inner = inner
+
+    async def list_instance_types(self):
+        return await self.inner.list_instance_types()
+
+    async def list_filesystems(self):
+        return await self.inner.list_filesystems()
+
+    async def list_ssh_keys(self):
+        return await self.inner.list_ssh_keys()
+
+    async def list_instances(self):
+        return await self.inner.list_instances()
+
+    async def get_instance(self, instance_id: str):
+        return await self.inner.get_instance(instance_id)
+
+    async def launch_instance(self, **kwargs):
+        return await self.inner.launch_instance(**kwargs)
+
+    async def terminate_instance(self, instance_id: str):
+        return await self.inner.terminate_instance(instance_id)
+
+    async def close(self):
+        await self.inner.close()
+
+
 # -- Real client ----------------------------------------------------------------
 
 
