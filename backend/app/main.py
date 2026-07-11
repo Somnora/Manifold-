@@ -16,10 +16,12 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+from .sidecar_client import SidecarError
 
 from .config import Settings, load_settings
 from .connections import MockSSHConnection
@@ -32,8 +34,10 @@ from .lambda_api import (
     RealLambdaClient,
     capacity_error,
 )
-from .orchestrator import LaunchRejected, Orchestrator
+from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
+from .sidecar_client import MockSidecarClient
 from .storage import MockStorage, S3AdapterStorage, StorageClient
+from .templates import load_templates
 
 
 class LaunchRequest(BaseModel):
@@ -51,11 +55,16 @@ def create_app(
     lambda_client: LambdaClient | None = None,
     storage_factory=None,          # (FilesystemInfo) -> StorageClient
     connect_fn=None,               # (host) -> coroutine factory, for tests
+    sidecar_factory=None,          # (ManagedConnection) -> SidecarClient
+    templates_dir=None,
     mock: bool = False,
 ) -> FastAPI:
     settings = settings or load_settings()
 
     if mock:
+        if sidecar_factory is None:
+            shared_sidecar = MockSidecarClient()
+            sidecar_factory = lambda conn: shared_sidecar  # noqa: E731
         lambda_client = lambda_client or MockLambdaClient()
         if storage_factory is None:
             shared = MockStorage()
@@ -82,8 +91,16 @@ def create_app(
             )
 
     db = Database(settings.db_path)
-    orchestrator = Orchestrator(settings, lambda_client, db, connect_fn=connect_fn)
+    orchestrator = Orchestrator(
+        settings, lambda_client, db,
+        connect_fn=connect_fn, sidecar_factory=sidecar_factory,
+    )
     storage_cache: dict[str, StorageClient] = {}
+
+    from .config import REPO_ROOT
+    templates, template_errors = load_templates(
+        templates_dir if templates_dir is not None else REPO_ROOT / "templates"
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -110,6 +127,21 @@ def create_app(
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=exc.status_code,
                             content={"detail": exc.detail})
+
+    @app.exception_handler(TerminationBlocked)
+    async def _termination_blocked(request, exc: TerminationBlocked):
+        from fastapi.responses import JSONResponse
+        # 409 with the evidence: clients show the list and offer
+        # sync-then-terminate or force=true. Never a silent block.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "blocked": True,
+                "instance_id": exc.instance_id,
+                "unpersisted_files": exc.files,
+            },
+        )
 
     @app.exception_handler(LambdaAPIError)
     async def _lambda_error(request, exc: LambdaAPIError):
@@ -167,8 +199,50 @@ def create_app(
         return {"instances": await orchestrator.instances_with_state()}
 
     @app.delete("/instances/{instance_id}")
-    async def terminate_instance(instance_id: str):
-        return await orchestrator.terminate(instance_id)
+    async def terminate_instance(instance_id: str, force: bool = False):
+        return await orchestrator.terminate(instance_id, force=force)
+
+    @app.post("/instances/{instance_id}/sync")
+    async def sync_instance(instance_id: str):
+        return await orchestrator.sync_ephemeral(instance_id)
+
+    @app.get("/instances/{instance_id}/metrics")
+    async def instance_metrics(instance_id: str):
+        sidecar = orchestrator.sidecar_for(instance_id)
+        if sidecar is None:
+            raise HTTPException(409, f"no managed connection to {instance_id}")
+        return await sidecar.metrics()
+
+    @app.websocket("/instances/{instance_id}/metrics/stream")
+    async def instance_metrics_stream(ws: WebSocket, instance_id: str):
+        """Relay: sidecar (via SSH forward) -> this WS -> browser chart."""
+        await ws.accept()
+        sidecar = orchestrator.sidecar_for(instance_id)
+        if sidecar is None:
+            await ws.send_json({"error": f"no managed connection to {instance_id}"})
+            await ws.close()
+            return
+        try:
+            async for payload in sidecar.metrics_stream():
+                await ws.send_json(payload)
+        except (WebSocketDisconnect, SidecarError):
+            pass
+        finally:
+            try:
+                await ws.close()
+            except RuntimeError:
+                pass  # already closed by the client
+
+    # -- job templates --------------------------------------------------------------
+
+    @app.get("/templates")
+    async def list_templates():
+        """Valid templates with parameter schemas, plus load errors so a
+        broken YAML file is visible instead of silently missing."""
+        return {
+            "templates": [t.to_api() for t in templates.values()],
+            "errors": template_errors,
+        }
 
     # -- launches (retry status + cost history) ------------------------------------
 

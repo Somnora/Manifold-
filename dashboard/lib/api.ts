@@ -5,6 +5,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export class ApiError extends Error {
   status: number;
+  body?: Record<string, unknown>;
   constructor(status: number, detail: string) {
     super(detail);
     this.status = status;
@@ -23,10 +24,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new ApiError(resp.status, body.detail ?? `HTTP ${resp.status}`);
+    const err = new ApiError(
+      resp.status,
+      body.detail ?? `HTTP ${resp.status}`,
+    );
+    err.body = body;
+    throw err;
   }
   return body as T;
 }
+
+export type UnpersistedFile = {
+  path: string;
+  size_bytes: number;
+  modified: string;
+};
 
 export type InstanceTypeInfo = {
   description: string;
@@ -117,9 +129,15 @@ export const api = {
       body: JSON.stringify(body),
     }).then((r) => r.launch),
 
-  terminate: (instanceId: string) =>
-    request<{ terminated: boolean }>(`/instances/${instanceId}`, {
-      method: "DELETE",
+  terminate: (instanceId: string, force = false) =>
+    request<{ terminated: boolean }>(
+      `/instances/${instanceId}${force ? "?force=true" : ""}`,
+      { method: "DELETE" },
+    ),
+
+  syncEphemeral: (instanceId: string) =>
+    request<{ synced_to: string }>(`/instances/${instanceId}/sync`, {
+      method: "POST",
     }),
 
   storageFiles: (filesystem: string, prefix = "") =>

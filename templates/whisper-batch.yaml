@@ -1,0 +1,45 @@
+# Transcribe every audio/video file in a persistent input directory with
+# faster-whisper, writing .srt and .json next to each other in a persistent
+# output directory. Inputs and outputs both live on the filesystem, so
+# nothing is lost when the instance dies.
+name: whisper-batch
+description: Batch-transcribe audio/video from persistent input to .srt + .json
+image: ghcr.io/speaches-ai/faster-whisper-server:latest-cuda
+
+command: >
+  python -m scripts.batch_transcribe
+  --input-dir /data/input
+  --output-dir /data/output
+  --model {{model_size}}
+  --language {{language}}
+  --compute-type float16
+  --output-formats srt,json
+
+parameters:
+  - name: input_dir
+    type: string
+    description: Directory on the persistent filesystem containing audio/video files
+    default: inbox
+  - name: model_size
+    type: string
+    default: large-v3
+    description: Whisper model size (tiny, base, small, medium, large-v3)
+  - name: language
+    type: string
+    default: en
+    description: Language code, or "auto" to detect per file
+
+volumes:
+  - host: "{persistent}/{{input_dir}}"
+    container: /data/input
+    read_only: true
+  - host: "{persistent}/transcripts"
+    container: /data/output
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+
+gpu:
+  min_vram_gib: 10
+  recommended_types:
+    - gpu_1x_a10
+    - gpu_1x_a6000

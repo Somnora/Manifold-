@@ -73,13 +73,20 @@ def mock_storage() -> MockStorage:
 
 
 @pytest.fixture
-def client(settings, mock_client, mock_storage):
+def mock_sidecar():
+    from app.sidecar_client import MockSidecarClient
+    return MockSidecarClient()
+
+
+@pytest.fixture
+def client(settings, mock_client, mock_storage, mock_sidecar):
     """TestClient over the real app wiring, with mocks injected."""
     app = create_app(
         settings,
         lambda_client=mock_client,
         storage_factory=lambda fs: mock_storage,
         connect_fn=mock_connect_fn,
+        sidecar_factory=lambda conn: mock_sidecar,
     )
     with TestClient(app) as test_client:
         yield test_client

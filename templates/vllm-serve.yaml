@@ -1,0 +1,43 @@
+# Serve a model with vLLM's OpenAI-compatible server.
+# The port is bound to 127.0.0.1 on the instance by the dispatcher; reach it
+# from your machine through the backend's SSH port forward.
+name: vllm-serve
+description: Serve a model with vLLM (OpenAI-compatible API on a loopback port)
+image: vllm/vllm-openai:latest
+
+command: >
+  --model {{model_id}}
+  --max-model-len {{max_context}}
+  --port {{port}}
+
+parameters:
+  - name: model_id
+    type: string
+    description: HuggingFace model id to serve (e.g. meta-llama/Llama-3.1-8B-Instruct)
+  - name: max_context
+    type: integer
+    default: 8192
+    description: Maximum context length in tokens
+  - name: port
+    type: integer
+    default: 8080
+    description: Container port for the API server (loopback-only on the host)
+
+volumes:
+  # HuggingFace cache on persistent storage: models survive the instance.
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+
+ports:
+  - host: 8080
+    container: 8080
+
+env:
+  VLLM_NO_USAGE_STATS: "1"
+
+gpu:
+  min_vram_gib: 24
+  recommended_types:
+    - gpu_1x_a10
+    - gpu_1x_h100_pcie
+    - gpu_1x_h100_sxm5

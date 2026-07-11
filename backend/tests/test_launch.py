@@ -33,7 +33,7 @@ async def test_successful_launch(orchestrator, mock_client):
     final = await orchestrator.wait_for_launch(launch["id"])
     assert final["status"] == "active"
     assert final["launched_type"] == "gpu_1x_a10"
-    assert final["hourly_rate_cents"] == 75
+    assert final["hourly_rate_cents"] == 129
     assert final["attempts"] == 1
     assert final["launched_at"] is not None
     assert final["active_at"] is not None
@@ -57,6 +57,44 @@ async def test_launch_with_explicit_ssh_key(orchestrator, mock_client):
     )
     await orchestrator.wait_for_launch(launch["id"])
     assert mock_client.launch_calls[0]["ssh_key_names"] == ["mock-key"]
+
+
+async def test_user_data_installs_sidecar_not_tailscale(orchestrator, mock_client):
+    launch = await orchestrator.request_launch(
+        instance_type="gpu_1x_a10", region="us-east-1", filesystem="manifold-data",
+    )
+    await orchestrator.wait_for_launch(launch["id"])
+    user_data = mock_client.launch_calls[0]["user_data"]
+    assert "manifold_sidecar" in user_data
+    assert 'host="127.0.0.1"' in user_data          # loopback-only sidecar
+    assert "tailscale" not in user_data.lower()     # direct-ssh: no tailscale
+
+
+async def test_tailscale_launch_gets_key_in_user_data_and_dials_hostname(tmp_path, db):
+    from tests.conftest import make_settings, mock_connect_fn
+    from app.orchestrator import Orchestrator
+
+    settings = make_settings(tmp_path, tailscale_authkey="tskey-test-not-real")
+    mock = MockLambdaClient()
+    dialed = []
+
+    def tracking_connect_fn(host):
+        dialed.append(host)
+        return mock_connect_fn(host)
+
+    orch = Orchestrator(settings, mock, db, connect_fn=tracking_connect_fn)
+    launch = await orch.request_launch(
+        instance_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data", connection_mode="tailscale",
+    )
+    final = await orch.wait_for_launch(launch["id"])
+    assert final["status"] == "active"
+
+    user_data = mock.launch_calls[0]["user_data"]
+    assert "tailscale up --authkey='tskey-test-not-real'" in user_data
+    # The dial target is the tailnet hostname, not the public IP.
+    assert dialed == [mock.launch_calls[0]["name"]]
+    assert dialed[0].startswith("manifold-")
 
 
 async def test_capacity_failures_then_success(settings, db):
@@ -107,7 +145,7 @@ async def test_fallback_type_used_when_primary_has_no_capacity(tmp_path, db):
     assert final["status"] == "active"
     assert final["requested_type"] == "gpu_1x_a10"
     assert final["launched_type"] == "gpu_1x_a100_sxm4"
-    assert final["hourly_rate_cents"] == 129      # rate reflects what launched
+    assert final["hourly_rate_cents"] == 199      # rate reflects what launched
     assert [c["instance_type"] for c in mock.launch_calls] == [
         "gpu_1x_a10", "gpu_1x_a100_sxm4",
     ]

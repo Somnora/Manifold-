@@ -1,0 +1,40 @@
+# LoRA fine-tune with axolotl from a config that lives on the persistent
+# filesystem. Config, base-model cache, and outputs all persist; only
+# intermediate scratch uses the ephemeral volume.
+name: axolotl-finetune
+description: LoRA fine-tune from an axolotl config on persistent storage
+image: axolotlai/axolotl:main-latest
+
+command: >
+  accelerate launch -m axolotl.cli.train /data/config/{{config_path}}
+  --output_dir /data/output/{{output_dir}}
+
+parameters:
+  - name: config_path
+    type: string
+    description: Path to the axolotl YAML config, relative to <filesystem>/configs
+  - name: output_dir
+    type: string
+    default: lora-out
+    description: Output directory name, created under <filesystem>/outputs
+
+volumes:
+  - host: "{persistent}/configs"
+    container: /data/config
+    read_only: true
+  - host: "{persistent}/outputs"
+    container: /data/output
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+  - host: /workspace/ephemeral/axolotl-tmp
+    container: /tmp/axolotl
+
+env:
+  HF_HOME: /root/.cache/huggingface
+
+gpu:
+  min_vram_gib: 24
+  recommended_types:
+    - gpu_1x_a100_sxm4
+    - gpu_1x_h100_sxm5
+    - gpu_1x_a6000

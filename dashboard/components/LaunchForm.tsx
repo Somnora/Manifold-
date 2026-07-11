@@ -7,6 +7,7 @@ import {
   type Filesystem,
   type InstanceTypeInfo,
 } from "@/lib/api";
+import { formatMoney } from "@/lib/format";
 
 // The form only collects input; every rule (region match, budget,
 // concurrency) is enforced by the backend, and its rejection message is
@@ -105,7 +106,8 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           >
             {Object.entries(types).map(([name, t]) => (
               <option key={name} value={name}>
-                {t.description}
+                {t.description} ({formatMoney(t.price_usd_per_hour)}/hr)
+                {t.regions_with_capacity.length === 0 ? " - out of capacity" : ""}
               </option>
             ))}
           </select>

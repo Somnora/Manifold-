@@ -25,7 +25,7 @@ def test_budget_guard_rejects_expensive_type(client, mock_client):
     })
     assert resp.status_code == 409
     detail = resp.json()["detail"]
-    assert "$10.32" in detail and "$4.00" in detail
+    assert "$15.92" in detail and "$4.00" in detail
     assert mock_client.launch_calls == []
 
 
@@ -49,12 +49,12 @@ def test_budget_guard_counts_running_instances(tmp_path, mock_client, mock_stora
                      connect_fn=mock_connect_fn)
     with TestClient(app) as client:
         resp = client.post("/instances", json={
-            "instance_type": "gpu_1x_a10",       # $0.75 + $0.75 > $1.00
+            "instance_type": "gpu_1x_a10",       # $0.75 running + $1.29 new > $1.00
             "region": "us-east-1",
             "filesystem": "manifold-data",
         })
     assert resp.status_code == 409
-    assert "$1.50" in resp.json()["detail"]
+    assert "$2.04" in resp.json()["detail"]
     assert mock_client.launch_calls == []
 
 
