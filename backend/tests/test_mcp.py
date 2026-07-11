@@ -1,0 +1,211 @@
+"""The MCP bridge: thin client, guard parity, safety hook, audit trail.
+
+Tools are exercised against the real app wired through an in-process ASGI
+transport — the same HTTP surface a live backend serves over the socket.
+"""
+
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+import app.mcp_server as mcp_server
+from app.lambda_api import MockLambdaClient
+from app.main import create_app
+from tests.conftest import make_settings, mock_connect_fn
+
+
+@pytest.fixture
+def wired_app(tmp_path, mock_client, mock_storage, mock_sidecar):
+    """Real app + the MCP module's HTTP client pointed at it in-process."""
+    from app.config import IdleSettings, TaskSettings, WatchSettings
+    settings = make_settings(
+        tmp_path,
+        tasks=TaskSettings(poll_seconds=0.02),
+        idle=IdleSettings(timeout_seconds=60, poll_seconds=10),
+        watches=WatchSettings(poll_seconds=60),
+    )
+    application = create_app(
+        settings,
+        lambda_client=mock_client,
+        storage_factory=lambda fs: mock_storage,
+        connect_fn=mock_connect_fn,
+        sidecar_factory=lambda conn: mock_sidecar,
+    )
+    return application
+
+
+@pytest.fixture
+async def mcp_wired(wired_app):
+    """Run the app lifespan and point the MCP module at it, in-process."""
+    from asgi_lifespan import LifespanManager
+    async with LifespanManager(wired_app) as manager:
+        old = mcp_server._client
+        mcp_server._client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=manager.app),
+            base_url="http://manifold.test",
+        )
+        yield wired_app
+        await mcp_server._client.aclose()
+        mcp_server._client = old
+
+
+def test_mcp_server_is_structurally_thin():
+    """The bridge may import httpx and the MCP SDK — never backend
+    internals. No imports, no bypass: guards cannot be circumvented by a
+    code path that does not exist."""
+    import ast
+    tree = ast.parse(Path(mcp_server.__file__).read_text())
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            imported.add(("." * node.level) + module)
+    allowed = {"__future__", "os", "typing", "httpx", "mcp.server.fastmcp"}
+    assert imported <= allowed, (
+        f"MCP server imports beyond the thin-client allowlist: "
+        f"{imported - allowed}"
+    )
+
+
+async def test_budget_guard_identical_for_mcp_and_dashboard(mcp_wired, mock_client):
+    """THE gate test: an MCP launch is rejected by the budget guard with
+    byte-identical detail to a dashboard launch."""
+    # Dashboard path: direct HTTP POST, exactly what the launch form sends.
+    resp = await mcp_server._http().post("/instances", json={
+        "instance_type": "gpu_8x_a100_80gb_sxm4",   # $22.32/hr >> $4.00
+        "region": "us-east-1",
+        "filesystem": "manifold-data",
+    })
+    assert resp.status_code == 409
+    dashboard_detail = resp.json()["detail"]
+
+    # MCP path: the tool an agent calls.
+    result = await mcp_server.launch_gpu(
+        instance_type="gpu_8x_a100_80gb_sxm4",
+        region="us-east-1",
+        filesystem="manifold-data",
+        note="gate-6 parity test",
+    )
+    assert result["error"] == dashboard_detail
+    assert "Budget guard" in result["error"]
+    # Neither path reached the Lambda API.
+    assert mock_client.launch_calls == []
+
+
+async def test_region_guard_applies_to_mcp(mcp_wired, mock_client):
+    result = await mcp_server.launch_gpu(
+        instance_type="gpu_1x_a10", region="us-west-1",
+        filesystem="manifold-data",
+    )
+    assert "Region mismatch" in result["error"]
+    assert mock_client.launch_calls == []
+
+
+async def test_terminate_blocked_returns_file_list(mcp_wired, mock_client):
+    import asyncio
+    launch = await mcp_server.launch_gpu(
+        instance_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data", note="for hook test",
+    )
+    launch_id = launch["launch"]["id"]
+    for _ in range(200):
+        status = await mcp_server.get_launch_status(launch_id)
+        if status["status"] == "active":
+            break
+        await asyncio.sleep(0.02)
+    instance_id = status["lambda_instance_id"]
+
+    # force=false: the hook returns evidence instead of terminating.
+    result = await mcp_server.terminate_instance(instance_id)
+    assert result["blocked"] is True
+    paths = [f["path"] for f in result["unpersisted_files"]]
+    assert "checkpoints/step-2000.safetensors" in paths
+    assert mock_client.instances[instance_id].status == "active"   # still up
+
+    # sync, then force is honest and final.
+    sync = await mcp_server.sync_outputs(instance_id, note="save then stop")
+    assert "ephemeral-backup" in sync["synced_to"]
+    done = await mcp_server.terminate_instance(instance_id, force=True)
+    assert done["terminated"] is True
+    assert mock_client.instances[instance_id].status == "terminated"
+
+
+async def test_every_tool_call_is_audited(mcp_wired):
+    await mcp_server.list_templates(note="looking for whisper")
+    await mcp_server.launch_gpu(
+        instance_type="gpu_8x_a100_80gb_sxm4", region="us-east-1",
+        filesystem="manifold-data", note="too expensive on purpose",
+    )
+    resp = await mcp_server._http().get("/audit", params={"actor": "mcp"})
+    entries = resp.json()["entries"]
+    by_tool = {e["action"]: json.loads(e["detail"]) for e in entries}
+
+    assert by_tool["list_templates"]["note"] == "looking for whisper"
+    assert by_tool["list_templates"]["result"] == "ok"
+    launch_entry = by_tool["launch_gpu"]
+    assert launch_entry["note"] == "too expensive on purpose"
+    assert launch_entry["result"].startswith("rejected: Budget guard")
+    assert launch_entry["args"]["instance_type"] == "gpu_8x_a100_80gb_sxm4"
+
+
+async def test_worked_example_transcribe_inbox_then_shut_down(mcp_wired, mock_client):
+    """The docs' example conversation, tool by tool: transcribe everything
+    in /inbox with whisper-large, then shut down."""
+    import asyncio
+
+    # Agent discovers what it can run and where files live.
+    templates = await mcp_server.list_templates(note="find transcription")
+    assert any(t["name"] == "whisper-batch" for t in templates["templates"])
+    files = await mcp_server.list_persistent_files(prefix="")
+    assert files["files"]                    # single filesystem auto-selected
+
+    # Launch and wait until active.
+    launch = await mcp_server.launch_gpu(
+        instance_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data", note="GPU for whisper batch",
+    )
+    launch_id = launch["launch"]["id"]
+    for _ in range(300):
+        status = await mcp_server.get_launch_status(launch_id)
+        if status["status"] in ("active", "failed"):
+            break
+        await asyncio.sleep(0.02)
+    assert status["status"] == "active"
+    instance_id = status["lambda_instance_id"]
+
+    # Run whisper-large over /inbox; poll to completion; read logs.
+    job = await mcp_server.run_job(
+        "whisper-batch",
+        {"input_dir": "inbox", "model_size": "large-v3"},
+        note="transcribe inbox",
+    )
+    task_id = job["task"]["id"]
+    for _ in range(300):
+        job_status = await mcp_server.get_job_status(task_id)
+        if job_status["status"] in ("succeeded", "failed"):
+            break
+        await asyncio.sleep(0.02)
+    assert job_status["status"] == "succeeded"
+    assert "/lambda/nfs/manifold-data/transcripts" in job_status["output_paths"]
+    logs = await mcp_server.get_job_logs(task_id, tail=50)
+    assert any("docker run" in l["line"] for l in logs["lines"])
+
+    # Shut down: hook -> sync -> force. Instance ends terminated.
+    blocked = await mcp_server.terminate_instance(instance_id, note="job done")
+    assert blocked["blocked"] is True
+    await mcp_server.sync_outputs(instance_id, note="save outputs first")
+    final = await mcp_server.terminate_instance(
+        instance_id, force=True, note="all synced"
+    )
+    assert final["terminated"] is True
+
+    # The whole session is on the audit trail.
+    resp = await mcp_server._http().get("/audit", params={"actor": "mcp"})
+    tools_used = [e["action"] for e in resp.json()["entries"]]
+    for expected in ("launch_gpu", "run_job", "get_job_logs",
+                     "terminate_instance", "sync_outputs"):
+        assert expected in tools_used
