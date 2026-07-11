@@ -278,3 +278,82 @@ Client Manifest" errors on every page.
 **Rule going forward:** kill dev processes by port (`lsof -ti :8000 :3000 |
 xargs kill`), never by job id; and if dev-server behavior looks impossible,
 `rm -rf .next` before deeper debugging.
+
+## 2026-07-11 — Sidecar ships inside cloud-init, not fetched at boot
+
+**Decided:** `build_user_data()` embeds the sidecar's source verbatim in the
+cloud-init script (heredoc into /opt/manifold), runs it under systemd as a
+loopback-only service.
+
+**Alternatives:** Fetch from a URL at boot (needs somewhere public to host
+it, plus a supply-chain surface); scp it after SSH comes up (adds a
+provisioning step that can race jobs).
+
+**Why:** The sidecar is one file far under Lambda's 1 MB user-data cap. What
+an instance runs is exactly what this commit contains, the instance needs no
+extra credentials or network fetch, and the version question ("which sidecar
+is on that box?") answers itself: the one the launching backend shipped.
+
+## 2026-07-11 — Tailscale dial target is the MagicDNS hostname
+
+**Decided:** A tailscale-mode launch names the instance `manifold-<launch_id>`,
+cloud-init joins the tailnet with that hostname (`tailscale up --ssh
+--hostname=...`), and `TailscaleConnectionManager.dial_target()` returns the
+instance name. The contract test asserts both managers expose exactly
+{mode, dial_target} — nowhere for mode-specific logic to hide.
+
+**Alternatives:** Query the tailnet for the node's 100.x.y.z IP via the
+local `tailscale` CLI or Tailscale's API (extra dependency and credentials;
+the IP is just what MagicDNS resolves anyway).
+
+**Why:** The orchestrator host is on the tailnet, so the hostname resolves
+like any other address — dialing a name keeps the swap point one line and
+zero new dependencies. asyncssh does not care whether it dials an IP or a
+name; everything above the dial stays byte-identical.
+
+## 2026-07-11 — Safety hook is evidence, not a lock
+
+**Decided:** `terminate(force=False)` asks the sidecar for unpersisted
+ephemeral files and blocks with the file list (HTTP 409) if any exist. But
+if the sidecar is unreachable — instance still booting, connection down,
+orphan instance launched outside Manifold — termination proceeds.
+
+**Alternatives:** Refuse to terminate whenever the check cannot run.
+
+**Why:** The hook's job is preventing accidental data loss, not preventing
+termination. A hard requirement would make an unhealthy or half-booted
+instance unkillable from the dashboard while it bills by the minute — a
+worse failure than losing scratch files the user was warned are ephemeral.
+force=true remains the explicit override either way, and sync-then-terminate
+is the safe path the dashboard offers first.
+
+## 2026-07-11 — Telemetry: WS to the browser, polling over the SSH forward
+
+**Decided:** The browser gets a real WebSocket from the backend
+(`/instances/{id}/metrics/stream`). Behind it, `RealSidecarClient` polls the
+sidecar's GET /metrics through a per-call SSH local port forward every 2s,
+rather than holding a second long-lived WS through the tunnel.
+
+**Alternatives:** Proxy the sidecar's own WS end-to-end through the forward
+(same data rate, but a long-lived forward + WS client to supervise through
+every SSH reconnect).
+
+**Why:** The payload is a few hundred bytes every 2 seconds; polling over
+the already-supervised managed connection delivers identical freshness with
+one less stateful thing to babysit. The sidecar keeps its WS endpoint (it
+costs nothing and a future client may want it); the browser-facing contract
+is a WS either way, so swapping the internals later touches one class.
+
+## 2026-07-11 — Template placeholders validated at load, ports forced to loopback
+
+**Decided:** Templates are validated when loaded, not when run: every
+`{{placeholder}}` in a command must be a declared parameter, every host
+mount must start with `/workspace/ephemeral` or `{persistent}`, and declared
+ports are published on 127.0.0.1 by the dispatcher regardless of what the
+template says. Broken templates are surfaced in GET /templates' `errors`
+map instead of silently vanishing.
+
+**Why:** Load-time failure puts the error in front of the person editing
+YAML, not the person dispatching a job hours later. The loopback rule is
+enforced in the dispatcher (one place) rather than trusted to each template,
+consistent with "nothing on the instance listens publicly except sshd."

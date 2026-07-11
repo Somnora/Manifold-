@@ -37,7 +37,12 @@ def test_full_lifecycle_over_http(client):
     assert inst["hourly_rate_usd"] == 1.29
 
     # Terminate and confirm history records it with timestamps for costing.
+    # The Phase 3 safety hook blocks first (mock sidecar reports unpersisted
+    # files), then force goes through.
     resp = client.delete(f"/instances/{instance_id}")
+    assert resp.status_code == 409
+    assert resp.json()["blocked"] is True
+    resp = client.delete(f"/instances/{instance_id}", params={"force": "true"})
     assert resp.status_code == 200
 
     history = client.get("/launches").json()["launches"]

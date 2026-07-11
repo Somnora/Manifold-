@@ -32,6 +32,7 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+from .cloud_init import build_user_data
 from .config import Settings
 from .connections import (
     CONNECTION_MODES,
@@ -44,6 +45,7 @@ from .connections import (
 )
 from .db import Database, utcnow
 from .lambda_api import InstanceInfo, LambdaAPIError, LambdaClient
+from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 
 logger = logging.getLogger("manifold.orchestrator")
 
@@ -55,6 +57,21 @@ class LaunchRejected(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+class TerminationBlocked(Exception):
+    """The pre-termination safety hook found unpersisted files.
+
+    Carries the file list so clients can show it and offer sync or force.
+    """
+
+    def __init__(self, instance_id: str, files: list[dict]):
+        super().__init__(
+            f"{len(files)} unpersisted file(s) on {instance_id}; "
+            f"sync them or pass force=true"
+        )
+        self.instance_id = instance_id
+        self.files = files
 
 
 @dataclass
@@ -78,6 +95,7 @@ class Orchestrator:
         db: Database,
         *,
         connect_fn: Callable[[str], Callable[[], Awaitable]] | None = None,
+        sidecar_factory: Callable[[ManagedConnection], SidecarClient] | None = None,
     ):
         self.settings = settings
         self.client = lambda_client
@@ -85,6 +103,9 @@ class Orchestrator:
         # connect_fn(host) returns the coroutine factory a ManagedConnection
         # uses to dial; tests and mock mode inject one, real mode uses asyncssh.
         self._connect_fn = connect_fn
+        # sidecar_factory(conn) builds the sidecar client for an instance;
+        # mock mode injects MockSidecarClient.
+        self._sidecar_factory = sidecar_factory or RealSidecarClient
         self.managers: dict[str, ConnectionManager] = {
             m.mode: m
             for m in (DirectSSHConnectionManager(), TailscaleConnectionManager())
@@ -211,11 +232,35 @@ class Orchestrator:
         self._launch_tasks[launch_id] = asyncio.create_task(self._run_launch(plan))
         return self.db.get_launch(launch_id)
 
-    async def terminate(self, instance_id: str) -> dict:
-        """Terminate an instance and close its managed connection.
+    def sidecar_for(self, instance_id: str) -> SidecarClient | None:
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            return None
+        return self._sidecar_factory(conn)
 
-        Phase 3 inserts the unpersisted-files safety hook in front of this.
+    async def terminate(self, instance_id: str, *, force: bool = False) -> dict:
+        """Terminate an instance, guarded by the unpersisted-files hook.
+
+        Unless force=true, ask the sidecar (over the managed connection)
+        what valuable files sit in ephemeral scratch; if any, raise
+        TerminationBlocked with the list instead of terminating. If the
+        sidecar is unreachable (still booting, connection down), proceed —
+        the hook is best-effort evidence, not a way to wedge termination.
         """
+        if not force:
+            sidecar = self.sidecar_for(instance_id)
+            if sidecar is not None:
+                try:
+                    report = await sidecar.unpersisted_files()
+                    files = report.get("files", [])
+                except SidecarError as exc:
+                    logger.warning(
+                        "sidecar check skipped for %s: %s", instance_id, exc
+                    )
+                    files = []
+                if files:
+                    raise TerminationBlocked(instance_id, files)
+
         conn = self.connections.pop(instance_id, None)
         if conn is not None:
             await conn.close()
@@ -226,6 +271,30 @@ class Orchestrator:
                 launch["id"], status="terminated", terminated_at=utcnow()
             )
         return {"instance_id": instance_id, "terminated": True}
+
+    async def sync_ephemeral(self, instance_id: str) -> dict:
+        """rsync ephemeral scratch to the persistent filesystem, over the
+        managed connection. Destination: <mount>/ephemeral-backup/."""
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            raise LaunchRejected(409, f"no managed connection to {instance_id}")
+        launch = self.db.find_launch_by_instance(instance_id)
+        filesystem = launch["filesystem"] if launch else None
+        if not filesystem:
+            raise LaunchRejected(
+                409, f"no filesystem recorded for {instance_id}; cannot sync"
+            )
+        dest = f"/lambda/nfs/{filesystem}/ephemeral-backup/"
+        exit_status, stdout, stderr = await conn.run(
+            f"mkdir -p {dest} && rsync -a --info=stats1 /workspace/ephemeral/ {dest}"
+        )
+        if exit_status != 0:
+            raise LaunchRejected(
+                502, f"sync failed (rsync exit {exit_status}): {stderr[:300]}"
+            )
+        self.db.record_audit("backend", "sync_ephemeral", f"{instance_id} -> {dest}")
+        return {"instance_id": instance_id, "synced_to": dest,
+                "rsync_stats": stdout.strip()[:500]}
 
     async def instances_with_state(self) -> list[dict]:
         """Live Lambda instances joined with connection state + launch info."""
@@ -308,6 +377,14 @@ class Orchestrator:
                         ssh_key_names=[plan.ssh_key_name],
                         filesystem_names=[plan.filesystem],
                         name=plan.name,
+                        user_data=build_user_data(
+                            # Only a tailscale-mode launch carries the key.
+                            tailscale_authkey=(
+                                self.settings.tailscale_authkey
+                                if plan.connection_mode == "tailscale" else ""
+                            ),
+                            hostname=plan.name,
+                        ),
                     )
                 except LambdaAPIError as err:
                     if err.is_capacity_error:

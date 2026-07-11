@@ -62,10 +62,22 @@ class DirectSSHConnectionManager(ConnectionManager):
 
 
 class TailscaleConnectionManager(ConnectionManager):
+    """Dials the instance's tailnet MagicDNS name instead of its public IP.
+
+    cloud-init joins the instance to the tailnet with hostname = the
+    instance's Manifold name, so that name resolves on any tailnet machine
+    (including this orchestrator host). Everything above the dial is
+    byte-identical to direct-ssh.
+    """
+
     mode = "tailscale"
 
     def dial_target(self, instance: InstanceInfo) -> str:
-        raise NotImplementedError("tailscale mode is implemented in Phase 3")
+        if not instance.name:
+            raise ValueError(
+                f"instance {instance.id} has no name to resolve on the tailnet"
+            )
+        return instance.name
 
 
 def backoff_delay(attempt: int, base: float, cap: float) -> float:
@@ -148,6 +160,13 @@ class ManagedConnection:
                 attempt += 1
                 await self._sleep(delay)
         self.state = ConnectionState.DISCONNECTED
+
+    def ssh_connection(self):
+        """The live asyncssh connection, or None when not connected.
+        Used for port forwards; command execution should go through run()."""
+        if self.state != ConnectionState.CONNECTED:
+            return None
+        return self._conn
 
     async def run(self, command: str) -> tuple[int, str, str]:
         """Run a command over the managed connection.

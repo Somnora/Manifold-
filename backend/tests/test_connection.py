@@ -129,13 +129,22 @@ async def test_run_executes_over_connection():
 # -- ConnectionManager: the mode swap point ------------------------------------
 
 
-def test_both_managers_implement_the_same_interface():
-    """Contract stub (completed in Phase 3): identical surface, mode-only diff."""
+def test_contract_both_managers_are_interchangeable():
+    """The two modes must be drop-in replacements: same interface, same
+    behavior shape — a valid instance yields a dialable host string, an
+    incomplete one raises ValueError. Only the returned address differs."""
+    instance = make_instance()
     managers = [DirectSSHConnectionManager(), TailscaleConnectionManager()]
     assert [m.mode for m in managers] == list(CONNECTION_MODES)
     for manager in managers:
         assert isinstance(manager, ConnectionManager)
-        assert callable(manager.dial_target)
+        host = manager.dial_target(instance)
+        assert isinstance(host, str) and host
+        # ConnectionManager's whole public surface is `mode` and
+        # `dial_target` — anything more would be a place for mode-specific
+        # logic to hide.
+        public = {n for n in dir(manager) if not n.startswith("_")}
+        assert public == {"mode", "dial_target"}
 
 
 def test_direct_ssh_dials_public_ip():
@@ -147,6 +156,14 @@ def test_direct_ssh_requires_ip():
         DirectSSHConnectionManager().dial_target(make_instance(ip=None))
 
 
-def test_tailscale_stubbed_until_phase_3():
-    with pytest.raises(NotImplementedError):
-        TailscaleConnectionManager().dial_target(make_instance())
+def test_tailscale_dials_tailnet_hostname():
+    instance = make_instance()
+    instance.name = "manifold-abc123"
+    assert TailscaleConnectionManager().dial_target(instance) == "manifold-abc123"
+
+
+def test_tailscale_requires_name():
+    instance = make_instance()
+    instance.name = ""
+    with pytest.raises(ValueError):
+        TailscaleConnectionManager().dial_target(instance)

@@ -29,10 +29,15 @@ npm run dev     # then open http://localhost:3000
   - `lambda_api.py` — `LambdaClient` interface + real (httpx) and mock clients
   - `connections.py` — `ConnectionManager` (mode swap point) + `ManagedConnection` (SSH supervisor)
   - `storage.py` — `StorageClient` interface + S3-adapter and mock backends
-  - `orchestrator.py` — launch pipeline: validate → guards → retry → persist → connect
+  - `orchestrator.py` — launch pipeline: validate → guards → retry → persist → connect; termination safety hook; sync
+  - `cloud_init.py` — user-data generation (Docker, sidecar, Claude CLI, optional Tailscale)
+  - `sidecar_client.py` — `SidecarClient` interface: real (SSH port forward + httpx) and mock
+  - `templates.py` — job-template registry; mount rules enforced at load
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes
 - `backend/tests/` — pytest; everything runs against mocks
+- `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init
+- `templates/*.yaml` — job templates (vllm-serve, whisper-batch, axolotl-finetune)
 - `config.yaml` — guardrails, retry policy, SSH settings
 - `.env` — secrets only (gitignored; template in `.env.example`)
 - `DECISIONS.md` — every non-obvious choice gets an entry (what/alternatives/why)
