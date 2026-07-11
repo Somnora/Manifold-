@@ -1,0 +1,132 @@
+"""ModelClient: talk to a model served ON an instance (e.g. by vllm-serve).
+
+Same seam pattern as SidecarClient: an interface with a real implementation
+that rides an SSH local port forward on the managed connection, and a mock
+for tests/mock mode. The served model's API (vLLM's OpenAI-compatible
+server) listens on 127.0.0.1 on the instance — the dispatcher publishes
+template ports loopback-only — so the ONLY path to it is the managed
+connection. Nothing new listens anywhere.
+
+    browser chat panel
+        -> backend POST /instances/{id}/chat   (SSE relay)
+        -> SSH local port forward (managed connection)
+        -> 127.0.0.1:<port> on the instance    (vLLM /v1/chat/completions)
+"""
+
+from __future__ import annotations
+
+import abc
+import asyncio
+import json
+from typing import AsyncIterator
+
+import httpx
+
+
+class ModelClientError(Exception):
+    pass
+
+
+class ModelClient(abc.ABC):
+    @abc.abstractmethod
+    async def model_info(self, port: int) -> dict:
+        """GET /v1/models on the served endpoint (also a liveness probe)."""
+
+    @abc.abstractmethod
+    def chat_stream(self, port: int, payload: dict) -> AsyncIterator[str]:
+        """POST /v1/chat/completions with stream=true; yields raw SSE lines
+        (each already newline-terminated) exactly as the server sent them."""
+
+
+class RealModelClient(ModelClient):
+    """Reaches the served model through an SSH local port forward.
+
+    The forward is created per call and closed after, mirroring
+    RealSidecarClient — the managed connection itself stays up.
+    """
+
+    def __init__(self, managed_connection):
+        self._mc = managed_connection
+
+    async def _forward(self, remote_port: int):
+        conn = self._mc.ssh_connection()
+        if conn is None:
+            raise ModelClientError(
+                f"no SSH connection to {self._mc.host} "
+                f"(state: {self._mc.state.value})"
+            )
+        try:
+            return await conn.forward_local_port(
+                "127.0.0.1", 0, "127.0.0.1", remote_port
+            )
+        except Exception as exc:
+            raise ModelClientError(
+                f"could not forward model port {remote_port}: {exc}"
+            ) from exc
+
+    async def model_info(self, port: int) -> dict:
+        listener = await self._forward(port)
+        try:
+            local = listener.get_port()
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                resp = await http.get(f"http://127.0.0.1:{local}/v1/models")
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.HTTPError as exc:
+            raise ModelClientError(f"model endpoint not responding: {exc}") from exc
+        finally:
+            listener.close()
+
+    async def chat_stream(self, port: int, payload: dict) -> AsyncIterator[str]:
+        listener = await self._forward(port)
+        try:
+            local = listener.get_port()
+            # No read timeout: token generation can pause arbitrarily long.
+            timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as http:
+                async with http.stream(
+                    "POST",
+                    f"http://127.0.0.1:{local}/v1/chat/completions",
+                    json={**payload, "stream": True},
+                ) as resp:
+                    if resp.status_code >= 400:
+                        body = (await resp.aread()).decode(errors="replace")
+                        raise ModelClientError(
+                            f"model returned {resp.status_code}: {body[:300]}"
+                        )
+                    async for line in resp.aiter_lines():
+                        yield line + "\n"
+        except httpx.HTTPError as exc:
+            raise ModelClientError(f"chat stream failed: {exc}") from exc
+        finally:
+            listener.close()
+
+
+class MockModelClient(ModelClient):
+    """Canned OpenAI-compatible endpoint for tests and mock mode."""
+
+    def __init__(self, model_id: str = "mock/llama-3-8b"):
+        self.model_id = model_id
+        self.requests: list[dict] = []
+
+    async def model_info(self, port: int) -> dict:
+        return {"object": "list", "data": [{"id": self.model_id, "object": "model"}]}
+
+    async def chat_stream(self, port: int, payload: dict) -> AsyncIterator[str]:
+        self.requests.append({"port": port, "payload": payload})
+        last = payload["messages"][-1]["content"] if payload.get("messages") else ""
+        words = f"Mock reply to: {last}".split(" ")
+        for i, word in enumerate(words):
+            chunk = {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "model": self.model_id,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": ("" if i == 0 else " ") + word},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            await asyncio.sleep(0)   # yield control, like a real stream
+        yield "data: [DONE]\n\n"

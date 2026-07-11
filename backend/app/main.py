@@ -40,6 +40,7 @@ from .lambda_api import (
     capacity_error,
 )
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
+from .model_client import MockModelClient, ModelClientError
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
 from .sidecar_client import MockSidecarClient
 from .storage import MockStorage, S3AdapterStorage, StorageClient
@@ -77,6 +78,12 @@ class AgentAuditRequest(BaseModel):
     result: str = ""                   # one-line result summary
 
 
+class ChatRequest(BaseModel):
+    messages: list[dict] = Field(min_length=1)   # [{role, content}, ...]
+    max_tokens: int = Field(default=1024, ge=1, le=32768)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+
+
 class LambdaKeyRequest(BaseModel):
     api_key: str = Field(min_length=8)
 
@@ -93,6 +100,7 @@ def create_app(
     storage_factory=None,          # (FilesystemInfo) -> StorageClient
     connect_fn=None,               # (host) -> coroutine factory, for tests
     sidecar_factory=None,          # (ManagedConnection) -> SidecarClient
+    model_client_factory=None,     # (ManagedConnection) -> ModelClient
     lambda_client_factory=None,    # (api_key) -> LambdaClient, for key validation
     env_path=None,                 # where /settings writes secrets (.env)
     templates_dir=None,
@@ -107,6 +115,9 @@ def create_app(
         if sidecar_factory is None:
             shared_sidecar = MockSidecarClient()
             sidecar_factory = lambda conn: shared_sidecar  # noqa: E731
+        if model_client_factory is None:
+            shared_model = MockModelClient()
+            model_client_factory = lambda conn: shared_model  # noqa: E731
         lambda_client = lambda_client or MockLambdaClient()
         if storage_factory is None:
             shared = MockStorage()
@@ -144,6 +155,7 @@ def create_app(
     orchestrator = Orchestrator(
         settings, lambda_client, db,
         connect_fn=connect_fn, sidecar_factory=sidecar_factory,
+        model_client_factory=model_client_factory,
     )
     storage_cache: dict[str, StorageClient] = {}
 
@@ -456,6 +468,91 @@ def create_app(
         finally:
             output_task.cancel()
             process.close()
+
+    # -- chat with a served model -----------------------------------------------
+
+    def _serving_task(instance_id: str) -> dict | None:
+        """The running task on this instance whose template publishes a
+        port — i.e. a live model server (vllm-serve). Returns the task
+        enriched with its host port and model id, or None."""
+        for task in queue.list():
+            if task["status"] != "running" or task["instance_id"] != instance_id:
+                continue
+            template = templates.get(task["template"])
+            if template is None or not template.ports:
+                continue
+            return {
+                **task,
+                # The dispatcher publishes template ports on the instance's
+                # loopback; the host side of the first mapping is the API.
+                "port": template.ports[0].host,
+                "model_id": task["parameters"].get("model_id")
+                or task["template"],
+            }
+        return None
+
+    @app.get("/instances/{instance_id}/model")
+    async def instance_model(instance_id: str):
+        """Is a model being served on this instance, and which one?"""
+        task = _serving_task(instance_id)
+        if task is None:
+            return {"serving": False}
+        return {
+            "serving": True,
+            "task_id": task["id"],
+            "template": task["template"],
+            "model_id": task["model_id"],
+            "port": task["port"],
+        }
+
+    @app.post("/instances/{instance_id}/chat")
+    async def instance_chat(instance_id: str, req: ChatRequest):
+        """Relay a chat completion to the model served on the instance,
+        streaming the OpenAI-style SSE response straight through. The model
+        listens on the instance's loopback; this rides the managed SSH
+        connection — the chat never touches the public internet unencrypted."""
+        task = _serving_task(instance_id)
+        if task is None:
+            raise HTTPException(
+                409,
+                "No model is being served on this instance. Queue a "
+                "vllm-serve job first (Jobs page), then chat once it is "
+                "running.",
+            )
+        model_client = orchestrator.model_client_for(instance_id)
+        if model_client is None:
+            raise HTTPException(409, f"no managed connection to {instance_id}")
+
+        payload = {
+            "model": task["model_id"],
+            "messages": req.messages,
+            "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
+        }
+        db.record_audit(
+            "api", "chat",
+            f"{instance_id}: {len(req.messages)} message(s) -> {task['model_id']}",
+        )
+        dispatcher.touch_activity(instance_id)
+
+        import json
+        from fastapi.responses import StreamingResponse
+
+        async def relay():
+            try:
+                async for line in model_client.chat_stream(task["port"], payload):
+                    yield line
+                    dispatcher.touch_activity(instance_id)
+            except ModelClientError as exc:
+                # Mid-stream failure: surface it as an SSE event the panel
+                # can render instead of silently truncating the reply.
+                yield f'data: {{"error": {json.dumps(str(exc))}}}\n\n'
+
+        return StreamingResponse(
+            relay(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/instances/{instance_id}/files/recent")
     async def instance_recent_files(instance_id: str, hours: float = 24,

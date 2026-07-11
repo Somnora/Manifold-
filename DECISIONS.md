@@ -610,3 +610,37 @@ region names live in a separate `/regions` endpoint so nothing breaks. Native
 matches the console, stays readable. Auto-selection fills sensible defaults
 (cheapest available GPU; a region where a filesystem exists) but never fights
 an explicit choice.
+
+## Phase 10 — in-dashboard chat with a served model (2026-07-11)
+
+**What:** A Chat button on connected instance cards. `GET
+/instances/{id}/model` reports whether a model server is live (a running
+task whose template publishes a port — vllm-serve today) and which model.
+`POST /instances/{id}/chat` relays an OpenAI-style chat completion to the
+model's loopback port over an SSH local port forward and streams the SSE
+response straight through to the browser. New `ModelClient` seam
+(real = per-call port forward + httpx streaming, mock = canned SSE chunks),
+mirroring `SidecarClient` exactly.
+
+**Why:** James's original vision: download a HuggingFace model and talk to
+it inside the dashboard. vllm-serve already served the model on the
+instance's loopback; this adds the one missing hop, browser -> backend ->
+SSH forward -> vLLM, without opening any new listener anywhere.
+
+**Design choices:**
+- Discovery, not registration: "a model is being served" is derived from
+  the task queue (running task + template with ports), so there is no
+  separate serving state to drift out of sync. Kill the job, chat closes.
+- The relay passes vLLM's SSE bytes through untouched instead of
+  re-encoding: the browser parses the standard OpenAI chunk format, and
+  mid-stream failures are surfaced as a data: {"error": ...} event rather
+  than a silently truncated reply.
+- Chat traffic counts as activity (touch_activity per chunk), and a
+  serving task already pins the instance alive via the running-task rule,
+  so a conversation can't be idle-terminated mid-reply.
+- Every chat call is audited (instance, message count, model) — message
+  CONTENT is deliberately not logged.
+- Known quirk: vllm-serve's `port` parameter changes the container port
+  while the loopback mapping stays 8080:8080; chat uses the host side of
+  the mapping, which is what the dispatcher actually publishes, so it
+  works regardless. Cleaning up that parameter is cosmetic backlog.
