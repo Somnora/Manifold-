@@ -105,6 +105,49 @@ export type LaunchRequest = {
   name?: string;
 };
 
+export type TemplateParameter = {
+  name: string;
+  type: "string" | "integer" | "number" | "boolean";
+  description: string;
+  default: string | number | boolean | null;
+  required: boolean;
+};
+
+export type Template = {
+  name: string;
+  description: string;
+  image: string;
+  command: string;
+  parameters: TemplateParameter[];
+  gpu: { min_vram_gib?: number; recommended_types?: string[] };
+};
+
+export type Task = {
+  id: string;
+  created_at: string;
+  template: string;
+  parameters: Record<string, unknown>;
+  status: "queued" | "running" | "succeeded" | "failed";
+  instance_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  exit_code: number | null;
+  error: string | null;
+  output_paths: string[];
+};
+
+export type Watch = {
+  id: string;
+  created_at: string;
+  instance_type: string;
+  region: string;
+  filesystem: string | null;
+  auto_launch: number;
+  status: "watching" | "available" | "launched" | "cancelled";
+  last_checked: string | null;
+  triggered_at: string | null;
+};
+
 export const api = {
   instanceTypes: () =>
     request<Record<string, InstanceTypeInfo>>("/instance-types"),
@@ -139,6 +182,41 @@ export const api = {
     request<{ synced_to: string }>(`/instances/${instanceId}/sync`, {
       method: "POST",
     }),
+
+  templates: () =>
+    request<{ templates: Template[]; errors: Record<string, string> }>(
+      "/templates",
+    ),
+
+  tasks: () => request<{ tasks: Task[] }>("/tasks").then((r) => r.tasks),
+
+  enqueueTask: (template: string, parameters: Record<string, unknown>) =>
+    request<{ task: Task }>("/tasks", {
+      method: "POST",
+      body: JSON.stringify({ template, parameters }),
+    }).then((r) => r.task),
+
+  taskLogs: (taskId: string, tail?: number) =>
+    request<{ lines: { seq: number; at: string; line: string }[] }>(
+      `/tasks/${taskId}/logs${tail ? `?tail=${tail}` : ""}`,
+    ).then((r) => r.lines),
+
+  watches: () =>
+    request<{ watches: Watch[]; auto_launch_enabled: boolean }>("/watches"),
+
+  createWatch: (body: {
+    instance_type: string;
+    region: string;
+    filesystem?: string;
+    auto_launch?: boolean;
+  }) =>
+    request<{ watch: Watch }>("/watches", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }).then((r) => r.watch),
+
+  cancelWatch: (watchId: string) =>
+    request<{ watch: Watch }>(`/watches/${watchId}`, { method: "DELETE" }),
 
   storageFiles: (filesystem: string, prefix = "") =>
     request<{ files: StoredFile[] }>(

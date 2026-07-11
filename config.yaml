@@ -36,5 +36,21 @@ connection:
   # direct-ssh (default) or tailscale. Overridable per launch.
   default_mode: direct-ssh
 
+tasks:
+  # How often the dispatcher looks for queued tasks and a connected instance.
+  poll_seconds: 1.0
+
+idle:
+  # No running job and no terminal activity for this long -> the backend
+  # requests termination through the standard flow (safety hook included).
+  timeout_seconds: 300
+  poll_seconds: 15
+
+watches:
+  # Capacity watches: poll the instance-types catalog on this interval.
+  poll_seconds: 60
+  # If false, a watch marked auto_launch only notifies; it never launches.
+  auto_launch_enabled: false
+
 database:
   path: manifold.db

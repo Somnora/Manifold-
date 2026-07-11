@@ -6,6 +6,7 @@ import { usePolling } from "@/lib/usePolling";
 import { LaunchForm } from "@/components/LaunchForm";
 import { InstanceCard } from "@/components/InstanceCard";
 import { StatusBadge } from "@/components/Badge";
+import { WatchPanel } from "@/components/WatchPanel";
 import { formatMoney, launchCost } from "@/lib/format";
 
 const IN_FLIGHT = ["launching", "retrying", "booting"];
@@ -104,6 +105,13 @@ export default function InstancesPage() {
             <InstanceCard key={i.id} instance={i} onChanged={refresh} />
           ))
         )}
+      </section>
+
+      <section>
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
+          Capacity watches
+        </h2>
+        <WatchPanel />
       </section>
     </div>
   );

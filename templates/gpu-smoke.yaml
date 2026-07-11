@@ -1,0 +1,22 @@
+# Trivial smoke-test job: prints GPU info and writes a marker file to
+# persistent storage. Added at Gate 4 to prove new templates need zero
+# frontend changes.
+name: gpu-smoke
+description: Smoke test - run nvidia-smi and write a marker to persistent storage
+image: nvidia/cuda:12.4.1-base-ubuntu22.04
+
+command: >
+  bash -c "nvidia-smi && echo 'smoke {{note}}' > /out/smoke-test.txt && cat /out/smoke-test.txt"
+
+parameters:
+  - name: note
+    type: string
+    default: ok
+    description: Text written into the persistent marker file
+
+volumes:
+  - host: "{persistent}/smoke"
+    container: /out
+
+gpu:
+  min_vram_gib: 1

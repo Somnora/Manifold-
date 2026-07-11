@@ -34,9 +34,11 @@ from .lambda_api import (
     RealLambdaClient,
     capacity_error,
 )
+from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
 from .sidecar_client import MockSidecarClient
 from .storage import MockStorage, S3AdapterStorage, StorageClient
+from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
 
 
@@ -47,6 +49,18 @@ class LaunchRequest(BaseModel):
     connection_mode: str | None = None
     ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
+
+
+class TaskRequest(BaseModel):
+    template: str
+    parameters: dict = Field(default_factory=dict)
+
+
+class WatchRequest(BaseModel):
+    instance_type: str
+    region: str
+    filesystem: str | None = None      # required only for auto_launch
+    auto_launch: bool = False
 
 
 def create_app(
@@ -102,9 +116,16 @@ def create_app(
         templates_dir if templates_dir is not None else REPO_ROOT / "templates"
     )
 
+    queue = SQLiteTaskQueue(db)
+    dispatcher = Dispatcher(
+        settings, orchestrator, queue, templates, db, lambda_client
+    )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        dispatcher.start()
         yield
+        await dispatcher.stop()
         await orchestrator.shutdown()
         await lambda_client.close()
         db.close()
@@ -112,6 +133,8 @@ def create_app(
     app = FastAPI(title="Manifold", lifespan=lifespan)
     app.state.orchestrator = orchestrator
     app.state.settings = settings
+    app.state.dispatcher = dispatcher
+    app.state.queue = queue
 
     # The dashboard (Phase 2) runs on localhost:3000 and is the only
     # expected browser client; the backend itself binds to localhost.
@@ -243,6 +266,97 @@ def create_app(
             "templates": [t.to_api() for t in templates.values()],
             "errors": template_errors,
         }
+
+    # -- tasks ------------------------------------------------------------------------
+
+    @app.post("/tasks", status_code=202)
+    async def enqueue_task(req: TaskRequest):
+        template = templates.get(req.template)
+        if template is None:
+            raise HTTPException(
+                404,
+                f"Unknown template '{req.template}'. "
+                f"Available: {', '.join(sorted(templates)) or '(none)'}",
+            )
+        # Validate NOW so a bad request fails at enqueue, not minutes later
+        # on the instance. The dispatcher re-validates before running.
+        try:
+            coerce_parameters(template, req.parameters)
+        except ParameterError as exc:
+            raise HTTPException(422, str(exc))
+        task_id = queue.enqueue(template=req.template, parameters=req.parameters)
+        db.record_audit("api", "task_enqueue", f"{task_id} ({req.template})")
+        return {"task": queue.get(task_id)}
+
+    @app.get("/tasks")
+    async def list_tasks():
+        return {"tasks": queue.list()}
+
+    @app.get("/tasks/{task_id}")
+    async def get_task(task_id: str):
+        task = queue.get(task_id)
+        if task is None:
+            raise HTTPException(404, f"task {task_id} not found")
+        return task
+
+    @app.get("/tasks/{task_id}/logs")
+    async def get_task_logs(task_id: str, tail: int | None = None):
+        if queue.get(task_id) is None:
+            raise HTTPException(404, f"task {task_id} not found")
+        return {"task_id": task_id, "lines": queue.get_logs(task_id, tail)}
+
+    # -- capacity watches ---------------------------------------------------------------
+
+    @app.post("/watches", status_code=201)
+    async def create_watch(req: WatchRequest):
+        types = await lambda_client.list_instance_types()
+        if req.instance_type not in types:
+            raise HTTPException(
+                400,
+                f"Unknown instance type '{req.instance_type}'. "
+                f"Valid types: {', '.join(sorted(types))}",
+            )
+        if req.auto_launch:
+            if not req.filesystem:
+                raise HTTPException(
+                    400, "auto_launch requires a filesystem to attach"
+                )
+            filesystems = {
+                fs.name: fs for fs in await lambda_client.list_filesystems()
+            }
+            fs = filesystems.get(req.filesystem)
+            if fs is None:
+                raise HTTPException(400, f"Unknown filesystem '{req.filesystem}'")
+            if fs.region != req.region:
+                raise HTTPException(
+                    400,
+                    f"Region mismatch: filesystem '{req.filesystem}' lives in "
+                    f"{fs.region} but the watch targets {req.region}.",
+                )
+        watch_id = db.create_watch(
+            instance_type=req.instance_type, region=req.region,
+            filesystem=req.filesystem, auto_launch=req.auto_launch,
+        )
+        db.record_audit(
+            "api", "watch_create",
+            f"{watch_id}: {req.instance_type} in {req.region}"
+            f"{' (auto-launch)' if req.auto_launch else ''}",
+        )
+        return {"watch": db.get_watch(watch_id)}
+
+    @app.get("/watches")
+    async def list_watches():
+        return {
+            "watches": db.list_watches(),
+            "auto_launch_enabled": settings.watches.auto_launch_enabled,
+        }
+
+    @app.delete("/watches/{watch_id}")
+    async def cancel_watch(watch_id: str):
+        if db.get_watch(watch_id) is None:
+            raise HTTPException(404, f"watch {watch_id} not found")
+        db.update_watch(watch_id, status="cancelled")
+        return {"watch": db.get_watch(watch_id)}
 
     # -- launches (retry status + cost history) ------------------------------------
 

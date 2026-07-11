@@ -8,6 +8,7 @@ local tool and every statement here runs in well under a millisecond.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -39,6 +40,40 @@ CREATE TABLE IF NOT EXISTS audit_log (
     actor       TEXT NOT NULL,      -- "dashboard" | "mcp" | ...
     action      TEXT NOT NULL,
     detail      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id              TEXT PRIMARY KEY,
+    created_at      TEXT NOT NULL,
+    template        TEXT NOT NULL,
+    parameters      TEXT NOT NULL,      -- JSON of user-supplied values
+    status          TEXT NOT NULL,      -- queued|running|succeeded|failed
+    instance_id     TEXT,               -- where it ran
+    started_at      TEXT,
+    finished_at     TEXT,
+    exit_code       INTEGER,
+    error           TEXT,               -- dispatcher-level error, if any
+    output_paths    TEXT                -- JSON list of persistent paths
+);
+
+CREATE TABLE IF NOT EXISTS task_logs (
+    task_id     TEXT NOT NULL,
+    seq         INTEGER NOT NULL,       -- ordering within a task
+    at          TEXT NOT NULL,
+    line        TEXT NOT NULL,
+    PRIMARY KEY (task_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS watches (
+    id              TEXT PRIMARY KEY,
+    created_at      TEXT NOT NULL,
+    instance_type   TEXT NOT NULL,
+    region          TEXT NOT NULL,
+    filesystem      TEXT,               -- needed only for auto-launch
+    auto_launch     INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL,      -- watching|available|launched|cancelled
+    last_checked    TEXT,
+    triggered_at    TEXT                -- when capacity was first seen
 );
 """
 
@@ -128,3 +163,132 @@ class Database:
             "INSERT INTO audit_log (at, actor, action, detail) VALUES (?, ?, ?, ?)",
             (utcnow(), actor, action, detail),
         )
+
+    # -- tasks -----------------------------------------------------------------
+
+    def create_task(self, *, template: str, parameters: dict) -> str:
+        task_id = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO tasks (id, created_at, template, parameters, status)
+               VALUES (?, ?, ?, ?, 'queued')""",
+            (task_id, utcnow(), template, json.dumps(parameters)),
+        )
+        return task_id
+
+    def update_task(self, task_id: str, **fields: Any) -> None:
+        allowed = {"status", "instance_id", "started_at", "finished_at",
+                   "exit_code", "error", "output_paths"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown task fields: {unknown}")
+        if "output_paths" in fields and not isinstance(fields["output_paths"], str):
+            fields["output_paths"] = json.dumps(fields["output_paths"])
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        self._execute(
+            f"UPDATE tasks SET {cols} WHERE id = ?", (*fields.values(), task_id)
+        )
+
+    @staticmethod
+    def _task_row(row: sqlite3.Row) -> dict:
+        task = dict(row)
+        task["parameters"] = json.loads(task["parameters"])
+        task["output_paths"] = json.loads(task["output_paths"] or "[]")
+        return task
+
+    def get_task(self, task_id: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return self._task_row(row) if row else None
+
+    def list_tasks(self) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM tasks ORDER BY created_at DESC, id"
+        ).fetchall()
+        return [self._task_row(r) for r in rows]
+
+    def next_queued_task(self) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at, id LIMIT 1"
+        ).fetchone()
+        return self._task_row(row) if row else None
+
+    def running_task_count(self) -> int:
+        row = self._execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE status = 'running'"
+        ).fetchone()
+        return row["n"]
+
+    # -- task logs ---------------------------------------------------------------
+
+    def append_task_log(self, task_id: str, line: str) -> None:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) + 1 AS seq FROM task_logs WHERE task_id = ?",
+                (task_id,),
+            )
+            seq = cur.fetchone()["seq"]
+            self._conn.execute(
+                "INSERT INTO task_logs (task_id, seq, at, line) VALUES (?, ?, ?, ?)",
+                (task_id, seq, utcnow(), line),
+            )
+            self._conn.commit()
+
+    def get_task_logs(self, task_id: str, tail: int | None = None) -> list[dict]:
+        if tail is not None:
+            rows = self._execute(
+                """SELECT * FROM (
+                       SELECT * FROM task_logs WHERE task_id = ?
+                       ORDER BY seq DESC LIMIT ?
+                   ) ORDER BY seq""",
+                (task_id, tail),
+            ).fetchall()
+        else:
+            rows = self._execute(
+                "SELECT * FROM task_logs WHERE task_id = ? ORDER BY seq",
+                (task_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- capacity watches -----------------------------------------------------------
+
+    def create_watch(self, *, instance_type: str, region: str,
+                     filesystem: str | None, auto_launch: bool) -> str:
+        watch_id = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO watches
+               (id, created_at, instance_type, region, filesystem,
+                auto_launch, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'watching')""",
+            (watch_id, utcnow(), instance_type, region, filesystem,
+             int(auto_launch)),
+        )
+        return watch_id
+
+    def update_watch(self, watch_id: str, **fields: Any) -> None:
+        allowed = {"status", "last_checked", "triggered_at"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown watch fields: {unknown}")
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        self._execute(
+            f"UPDATE watches SET {cols} WHERE id = ?", (*fields.values(), watch_id)
+        )
+
+    def get_watch(self, watch_id: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM watches WHERE id = ?", (watch_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_watches(self) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM watches ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_watches(self) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM watches WHERE status = 'watching'"
+        ).fetchall()
+        return [dict(r) for r in rows]
