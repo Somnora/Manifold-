@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# SQLite databases (local state, not source)
+*.db
+*.db-wal
+*.db-shm
+
+# Node / Next.js (Phase 2+)
+node_modules/
+.next/
+
+# OS noise
+.DS_Store

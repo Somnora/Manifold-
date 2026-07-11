@@ -1,0 +1,40 @@
+# Manifold tunables. Secrets do NOT go here — they live in .env.
+
+guardrails:
+  # Hard limits enforced BEFORE any launch API call. A launch that would
+  # exceed either limit is rejected outright, never queued.
+  max_concurrent_instances: 1
+  max_hourly_spend_usd: 4.00
+
+launch:
+  # Lambda frequently returns insufficient-capacity. One "attempt" tries the
+  # requested type plus each fallback type once, in order; between attempts
+  # we back off exponentially (base * 2^n, capped at max).
+  max_attempts: 5
+  backoff_base_seconds: 5
+  backoff_max_seconds: 120
+  # Ordered fallback instance types tried when the requested type has no
+  # capacity, e.g. [gpu_1x_a10, gpu_1x_a100_sxm4]. Each fallback must still
+  # pass the budget guard or it is skipped.
+  fallback_instance_types: []
+  # How long to wait for a launched instance to reach "active" with an IP.
+  boot_timeout_seconds: 900
+  boot_poll_seconds: 10
+
+ssh:
+  # Name of the SSH key as registered with Lambda (GET /ssh-keys),
+  # and the matching private key on this machine.
+  key_name: ""
+  private_key_path: ~/.ssh/id_ed25519
+  username: ubuntu
+  connect_timeout_seconds: 15
+  # Managed-connection reconnect backoff (base * 2^n, capped).
+  reconnect_base_seconds: 1
+  reconnect_max_seconds: 30
+
+connection:
+  # direct-ssh (default) or tailscale. Overridable per launch.
+  default_mode: direct-ssh
+
+database:
+  path: manifold.db
