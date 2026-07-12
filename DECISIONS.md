@@ -1111,3 +1111,41 @@ changes wait out the TTL. The spend guard is the one caller where staleness
 costs money, so it bypasses the cache unconditionally. The bypass is a
 `fresh` kwarg on the LambdaClient interface (ignored by non-caching
 implementations), keeping the guard's data source explicit at the call site.
+
+## 2026-07-11 — Instance panels survive transient reconnects (no more flap)
+
+**Decided:** InstanceCard latches `everConnected` once the SSH state first
+reaches "connected", and gates the action buttons AND the terminal/files/
+browse/chat/telemetry panels on that latch instead of the live
+`connection_state`. The card still disappears when the instance leaves the
+list (terminated).
+
+**Alternatives:** Keep gating on the live state (what shipped); add
+auto-reconnect to each panel's socket (more code, and a fresh shell loses
+state anyway).
+
+**Why:** During a heavy load (downloading a ~15 GB model), the supervisor
+can briefly flip CONNECTED → reconnecting → CONNECTED. Gating on the live
+value unmounted and remounted the whole control row on every blip — the
+"terminal kept disappearing and reappearing" the user reported. Latching
+keeps the UI stable; each panel already surfaces its own connection status,
+so a real drop is still visible without tearing the card apart. Complements
+the Phase 20 keepalive, which makes those flips rarer in the first place.
+
+## 2026-07-11 — Claude CLI on PATH; honest model-loading copy
+
+**Decided:** cloud-init adds `~/.local/bin` to PATH via
+`/etc/profile.d/manifold-path.sh` and `.bashrc`, so `claude` resolves in a
+fresh Open Terminal shell. The chat panel's loading state reframes the
+readiness-probe error as expected-while-downloading and points to the job
+Logs for real progress.
+
+**Why:** The Claude installer warned "~/.local/bin is not in your PATH", so
+the CLI it just installed wasn't runnable without manual PATH surgery. And
+the chat panel surfaced the raw probe error ("Server disconnected without
+sending a response") while a model was merely still downloading (VRAM 0.4/22
+GiB confirms it never loaded), which reads as a crash. Both are honesty/UX
+fixes, not behavior changes: PATH makes the pre-installed tool usable, and
+the copy tells the user what's actually happening instead of alarming them.
+(Interactive Claude sign-in on a headless box remains manual — that is
+inherent, not something cloud-init can pre-solve.)

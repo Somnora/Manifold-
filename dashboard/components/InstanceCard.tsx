@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError, type Instance, type UnpersistedFile } from "@/lib/api";
 import { StatusBadge } from "@/components/Badge";
 import { TelemetryChart } from "@/components/TelemetryChart";
@@ -28,6 +28,19 @@ export function InstanceCard({
   );
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+
+  // Latch "has been connected". The SSH supervisor can briefly flip to
+  // reconnecting when the box is saturated (e.g. downloading a 15GB model),
+  // and gating the action buttons/panels on the LIVE state made the whole
+  // UI — terminal included — disappear and reappear on every blip. Once an
+  // instance has connected, keep the controls mounted; each panel shows its
+  // own connection status. The card leaves entirely when the instance is
+  // terminated (it drops out of the list), so nothing lingers.
+  const connected = instance.connection_state === "connected";
+  const [everConnected, setEverConnected] = useState(false);
+  useEffect(() => {
+    if (connected) setEverConnected(true);
+  }, [connected]);
 
   async function terminate(force = false) {
     setBusy("terminating");
@@ -89,7 +102,7 @@ export function InstanceCard({
           </p>
         </div>
         <div className="flex items-center gap-2 text-right">
-          {instance.connection_state === "connected" && (
+          {everConnected && (
             <>
               <button
                 onClick={() => setShowTerminal((s) => !s)}
@@ -228,22 +241,20 @@ export function InstanceCard({
         </div>
       )}
 
-      {instance.connection_state === "connected" && (
-        <TelemetryChart instanceId={instance.id} />
-      )}
+      {everConnected && <TelemetryChart instanceId={instance.id} />}
 
-      {showTerminal && instance.connection_state === "connected" && (
+      {/* Panels stay mounted through transient reconnects; each surfaces its
+          own connection state rather than being torn down (which flapped). */}
+      {showTerminal && everConnected && (
         <TerminalPanel instanceId={instance.id} />
       )}
-      {showFiles && instance.connection_state === "connected" && (
+      {showFiles && everConnected && (
         <RecentFiles instanceId={instance.id} />
       )}
-      {showBrowse && instance.connection_state === "connected" && (
+      {showBrowse && everConnected && (
         <FileNavigator instanceId={instance.id} />
       )}
-      {showChat && instance.connection_state === "connected" && (
-        <ChatPanel instanceId={instance.id} />
-      )}
+      {showChat && everConnected && <ChatPanel instanceId={instance.id} />}
 
       {blockedFiles && (
         <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-3">
