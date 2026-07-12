@@ -1,6 +1,5 @@
 <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Manifold">
   <!-- Real Menlo Bold "M" glyph + a full-cell terminal block cursor (taller
-       than the M, overhanging top and bottom). Outlined from the system font
-       so it is exact and needs no font at render time. -->
-  <g transform="translate(8.500 52.0) scale(0.02679 -0.02679)"><path d="M86 1493H438L616 838L793 1493H1147V0H893V1196L735 543H500L340 1196V0H86Z" fill="#2dd4bf"/></g><rect x="44.23" y="9.0" width="10.0" height="46.0" fill="#2dd4bf"/>
+       than the M, overhanging top and bottom). Outlined from the system font. -->
+  <g transform="translate(6.483 52.0) scale(0.02679 -0.02679)"><path d="M86 1493H438L616 838L793 1493H1147V0H893V1196L735 543H500L340 1196V0H86Z" fill="#2dd4bf"/></g><rect x="42.21" y="9.0" width="13.0" height="46.0" fill="#2dd4bf"/>
 </svg>
