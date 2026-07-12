@@ -46,14 +46,14 @@ export function LifecyclePipeline({ task }: { task: Task }) {
           const state = isCurrent ? "current" : reached ? "done" : "todo";
           return (
             <div key={stage.key} className="flex items-center gap-1">
-              {i > 0 && <span className="text-zinc-300">·</span>}
+              {i > 0 && <span className="text-zinc-600">·</span>}
               <StagePill state={state} label={stage.label} />
             </div>
           );
         })}
         {bad && (
           <>
-            <span className="text-zinc-300">·</span>
+            <span className="text-zinc-600">·</span>
             <span
               className={`whitespace-nowrap rounded border px-1.5 py-0.5 text-[11px] font-medium ${bad.klass}`}
             >
@@ -89,7 +89,7 @@ function StagePill({
 }) {
   const klass =
     state === "current"
-      ? "bg-sky-600 text-white border-sky-600"
+      ? "bg-sky-600 text-zinc-900 border-sky-600"
       : state === "done"
         ? "bg-sky-100 text-sky-800 border-sky-200"
         : "bg-white text-zinc-400 border-zinc-200";

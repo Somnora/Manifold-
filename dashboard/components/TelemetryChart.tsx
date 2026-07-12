@@ -103,7 +103,7 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
               {diag.checks.map((c) => (
                 <div key={c.label}>
                   <p className="font-medium text-zinc-600">{c.label}</p>
-                  <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap rounded bg-zinc-950 p-2 text-[11px] leading-relaxed text-zinc-100">
+                  <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap rounded bg-zinc-950 p-2 text-[11px] leading-relaxed text-zinc-800">
                     {c.output || "(no output)"}
                   </pre>
                 </div>
@@ -134,8 +134,8 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
         )}
       </div>
       <div className="mt-2 flex gap-4">
-        <Sparkline label="Utilization" values={history.util} color="#2563eb" />
-        <Sparkline label="VRAM" values={history.vram} color="#9333ea" />
+        <Sparkline label="Utilization" values={history.util} color="#38bdf8" />
+        <Sparkline label="VRAM" values={history.vram} color="#a78bfa" />
       </div>
     </div>
   );
@@ -169,7 +169,7 @@ function Sparkline({
         role="img"
         aria-label={`${label} history`}
       >
-        <line x1="0" y1={h} x2={w} y2={h} stroke="#e4e4e7" strokeWidth="1" />
+        <line x1="0" y1={h} x2={w} y2={h} stroke="#27272f" strokeWidth="1" />
         {values.length > 1 && (
           <polyline
             points={points}

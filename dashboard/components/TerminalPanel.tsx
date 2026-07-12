@@ -101,8 +101,8 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
   }, [instanceId]);
 
   return (
-    <div className="mt-3 overflow-hidden rounded border border-zinc-700 bg-[#09090b]">
-      <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-1.5">
+    <div className="mt-3 overflow-hidden rounded border border-zinc-300 bg-[#09090b]">
+      <div className="flex items-center justify-between border-b border-zinc-200 px-3 py-1.5">
         <span className="text-xs text-zinc-400">
           Terminal (SSH via the managed connection) · drag the bottom-right
           corner to resize

@@ -1,13 +1,158 @@
 @import "tailwindcss";
 
+/* ============================================================================
+   Manifold dark theme - THE design token layer (see CLAUDE.md: tokens live
+   in one place). The whole app is recolored here by remapping the palette
+   the components already use, so class names keep their ROLE, not their
+   literal color:
+
+     bg-white      = card surface          (near-black panel)
+     bg-zinc-50    = page canvas           (true-black-adjacent)
+     bg-zinc-100   = subtle fill / hover
+     border-zinc-200/300 = borders (soft / strong)
+     text-zinc-400/500/600 = muted -> secondary -> readable
+     text-zinc-900 / bg-zinc-900 = primary text / inverted (light) buttons
+     bg-zinc-950   = terminal + log blocks (blackest)
+
+   Accent tints (emerald/amber/red/sky/indigo -50/-100/-200) become dark
+   glass tints; their -700/-800/-900 text shades are lightened to read on
+   them. Mid shades (-400..-600) keep their stock values.
+   ==========================================================================*/
+
+@theme {
+  --font-sans: var(--font-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jbmono), ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* neutrals (cool, slightly blue zinc) */
+  --color-white: #121217;
+  --color-zinc-50: #0b0b0e;
+  --color-zinc-100: #1a1a21;
+  --color-zinc-200: #27272f;
+  --color-zinc-300: #34343e;
+  --color-zinc-400: #70707e;
+  --color-zinc-500: #9494a3;
+  --color-zinc-600: #b7b7c3;
+  --color-zinc-700: #d5d5dd;
+  --color-zinc-800: #e9e9ee;
+  --color-zinc-900: #f6f6f9;
+  --color-zinc-950: #060608;
+
+  /* emerald (success) */
+  --color-emerald-50: #0c211a;
+  --color-emerald-100: #133228;
+  --color-emerald-200: #1e4e3c;
+  --color-emerald-300: #2b7057;
+  --color-emerald-700: #3ecf8e;
+  --color-emerald-800: #62e3ab;
+  --color-emerald-900: #93f0c8;
+
+  /* amber (in-flight, caution) */
+  --color-amber-50: #251b07;
+  --color-amber-100: #392a0b;
+  --color-amber-200: #5b4311;
+  --color-amber-300: #7e5d16;
+  --color-amber-700: #fbbf24;
+  --color-amber-800: #fcd34d;
+  --color-amber-900: #fde68a;
+
+  /* red (failure, destructive) */
+  --color-red-50: #2a0f0f;
+  --color-red-100: #401616;
+  --color-red-200: #602121;
+  --color-red-300: #7f2c2c;
+  --color-red-700: #f87171;
+  --color-red-800: #fca5a5;
+  --color-red-900: #fecaca;
+
+  /* sky (auto-manage, lifecycle) */
+  --color-sky-50: #0a1b25;
+  --color-sky-100: #102b3b;
+  --color-sky-200: #1b4359;
+  --color-sky-300: #265b79;
+  --color-sky-700: #38bdf8;
+  --color-sky-800: #7dd3fc;
+  --color-sky-900: #bae6fd;
+
+  /* indigo (estimates) */
+  --color-indigo-50: #16142b;
+  --color-indigo-100: #1f1c3d;
+  --color-indigo-200: #302c5f;
+  --color-indigo-300: #413c82;
+  --color-indigo-800: #a5b4fc;
+  --color-indigo-900: #c7d2fe;
+}
+
+:root {
+  color-scheme: dark;
+  --accent: #2dd4bf; /* teal phosphor: the one brand accent */
+}
+
 body {
-  font-family:
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    Roboto,
-    "Helvetica Neue",
-    Arial,
-    sans-serif;
+  font-family: var(--font-sans);
+  /* A faint teal aurora at the top of the canvas: the "possibility" glow. */
+  background-image: radial-gradient(
+    60rem 22rem at 50% -8rem,
+    rgba(45, 212, 191, 0.07),
+    transparent 70%
+  );
+  background-repeat: no-repeat;
+}
+
+/* Section headers get the mono treatment: terminal DNA. */
+main h2 {
+  font-family: var(--font-mono);
+  letter-spacing: 0.1em;
+}
+
+/* Selection + focus in the brand accent. */
+::selection {
+  background: rgba(45, 212, 191, 0.28);
+}
+:focus-visible {
+  outline: 2px solid rgba(45, 212, 191, 0.6);
+  outline-offset: 1px;
+}
+
+/* Quiet scrollbars that match the canvas. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #34343e transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #34343e;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* The wordmark's blinking cursor. */
+@keyframes cursor-blink {
+  0%,
+  55% {
+    opacity: 1;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+.cursor-blink {
+  animation: cursor-blink 1.2s steps(1) infinite;
+}
+
+/* Buttons and links ease between states instead of snapping. */
+button,
+a,
+select,
+input[type="checkbox"] {
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
 }
