@@ -5,7 +5,10 @@
 # the persistent filesystem, referenced by the spec as /data/datasets/...
 name: tao-train
 description: Train with NVIDIA TAO Toolkit from a spec file on persistent storage
-image: nvcr.io/nvidia/tao/tao-toolkit:5.5.0-tf2.11.0
+# Tag verified against nvcr's live tag list (2026-07-12): the TF2 image for
+# 5.5.0 is "5.5.0-tf2" — the previously referenced "5.5.0-tf2.11.0" does not
+# exist (that naming stopped at 5.0.0).
+image: nvcr.io/nvidia/tao/tao-toolkit:5.5.0-tf2
 
 command: >
   {{task}} train

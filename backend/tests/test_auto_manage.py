@@ -33,7 +33,8 @@ def _fast(tmp_path, **overrides):
     return make_settings(tmp_path, **base)
 
 
-def _app(settings, *, sidecar, mock=None):
+def _app(settings, *, sidecar, mock=None, image_checker=None):
+    from app.image_checker import MockImageChecker
     mock = mock or MockLambdaClient()
     app = create_app(
         settings,
@@ -42,6 +43,7 @@ def _app(settings, *, sidecar, mock=None):
         connect_fn=mock_connect_fn,
         sidecar_factory=lambda conn: sidecar,
         model_client_factory=lambda conn: MockModelClient(),
+        image_checker=image_checker or MockImageChecker(),
     )
     return app, mock
 

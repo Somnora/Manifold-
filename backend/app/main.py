@@ -53,6 +53,7 @@ from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
 from .sidecar_client import MockSidecarClient
+from .image_checker import MockImageChecker, RealImageChecker
 from .storage import MockStorage, S3AdapterStorage, StorageClient
 from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
@@ -129,6 +130,7 @@ def create_app(
     connect_fn=None,               # (host) -> coroutine factory, for tests
     sidecar_factory=None,          # (ManagedConnection) -> SidecarClient
     model_client_factory=None,     # (ManagedConnection) -> ModelClient
+    image_checker=None,            # ImageChecker; mock mode injects MockImageChecker
     lambda_client_factory=None,    # (api_key) -> LambdaClient, for key validation
     env_path=None,                 # where /settings writes secrets (.env)
     templates_dir=None,
@@ -138,6 +140,16 @@ def create_app(
     lambda_client_factory = lambda_client_factory or RealLambdaClient
     from .config import REPO_ROOT
     env_file = env_path if env_path is not None else REPO_ROOT / ".env"
+
+    # Image preflight wiring. Mock mode gets the offline approve-everything
+    # checker; production (no injected client) verifies against registries.
+    # A test harness that injects a lambda_client but no checker gets the
+    # preflight switched OFF (None) — tests must never hit the network.
+    if image_checker is None:
+        if mock:
+            image_checker = MockImageChecker()
+        elif lambda_client is None:
+            image_checker = RealImageChecker()
 
     if mock:
         if sidecar_factory is None:
@@ -193,7 +205,8 @@ def create_app(
 
     queue = SQLiteTaskQueue(db)
     dispatcher = Dispatcher(
-        settings, orchestrator, queue, templates, db, lambda_client
+        settings, orchestrator, queue, templates, db, lambda_client,
+        image_checker=image_checker,
     )
     autopilot = Autopilot(settings, orchestrator, queue, templates, db)
 
