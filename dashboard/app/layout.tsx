@@ -30,28 +30,9 @@ export default function RootLayout({
       <body className="min-h-screen bg-zinc-50 text-zinc-900 antialiased">
         <header className="sticky top-0 z-40 border-b border-zinc-200 bg-zinc-50/80 backdrop-blur">
           <div className="mx-auto flex max-w-6xl items-center gap-8 px-6 py-3">
-            <span className="flex items-center gap-2">
-              {/* Monogram: the real Menlo Bold "M" glyph, outlined from the
-                  system font so it is exact and font-independent - the same
-                  mark as the favicon and app icon. */}
-              <svg
-                width="18"
-                height="18"
-                viewBox="0 0 64 64"
-                fill="none"
-                aria-hidden="true"
-              >
-                <g transform="translate(15.483 52) scale(0.02679 -0.02679)">
-                  <path
-                    d="M86 1493H438L616 838L793 1493H1147V0H893V1196L735 543H500L340 1196V0H86Z"
-                    fill="#2dd4bf"
-                  />
-                </g>
-              </svg>
-              <span className="flex items-baseline gap-0.5 font-mono text-sm font-semibold tracking-tight">
-                manifold
-                <span className="cursor-blink text-teal-400">▌</span>
-              </span>
+            <span className="flex items-baseline gap-0.5 font-mono text-sm font-semibold tracking-tight">
+              manifold
+              <span className="cursor-blink text-teal-400">▌</span>
             </span>
             <Nav />
           </div>
