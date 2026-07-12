@@ -10,6 +10,9 @@ single guarded gateway; dashboard and MCP server are thin clients of it.
 uv sync                                                    # install deps
 uv run pytest -q                                           # full test suite (mocks only, no spend)
 uv run uvicorn app.main:create_default_app --factory --reload            # real mode (needs .env)
+# NOTE: --reload restarts on every backend file save. Each restart re-adopts
+# running instances and writes ONE reconnect_on_startup audit row — that is
+# expected in dev, not a bug (see DECISIONS.md). Drop --reload for a quiet log.
 MANIFOLD_MOCK=1 uv run uvicorn app.main:create_default_app --factory     # mock mode, zero spend
 ```
 

@@ -13,6 +13,9 @@ export default function StoragePage() {
   const [files, setFiles] = useState<StoredFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // Unreachable is UNKNOWN, not empty: only trust the file list (and the
+  // "no files" / count copy) after a read that actually succeeded.
+  const [readOk, setReadOk] = useState(false);
   const [confirmKey, setConfirmKey] = useState<string | null>(null);
 
   useEffect(() => {
@@ -35,10 +38,14 @@ export default function StoragePage() {
         if (!cancelled) {
           setFiles(f);
           setError("");
+          setReadOk(true);
         }
       })
       .catch((e) => {
-        if (!cancelled) setError(e.message);
+        if (!cancelled) {
+          setError(e.message);
+          setReadOk(false); // read failed: the list on screen is not truth
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -100,7 +107,11 @@ export default function StoragePage() {
         </p>
       )}
 
-      <div className="overflow-hidden rounded-lg border border-zinc-200 bg-white">
+      <div
+        className={`overflow-hidden rounded-lg border border-zinc-200 bg-white ${
+          !readOk && !loading ? "opacity-40" : ""
+        }`}
+      >
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 text-left text-xs uppercase tracking-wide text-zinc-500">
             <tr>
@@ -154,9 +165,11 @@ export default function StoragePage() {
                   colSpan={4}
                   className="px-4 py-8 text-center text-sm text-zinc-500"
                 >
-                  {selected
-                    ? "No files match."
-                    : "No filesystems available."}
+                  {!readOk
+                    ? "Can't read files right now — the backend or storage is unreachable, so this list is unknown (not necessarily empty)."
+                    : selected
+                      ? "No files match."
+                      : "No filesystems available."}
                 </td>
               </tr>
             )}
@@ -164,10 +177,15 @@ export default function StoragePage() {
         </table>
       </div>
 
-      <p className="text-xs text-zinc-500">
-        {files.length} file{files.length === 1 ? "" : "s"},{" "}
-        {formatBytes(totalBytes)} total
-      </p>
+      {/* Count is a claim of fact: only make it after a successful read. */}
+      {readOk ? (
+        <p className="text-xs text-zinc-500">
+          {files.length} file{files.length === 1 ? "" : "s"},{" "}
+          {formatBytes(totalBytes)} total
+        </p>
+      ) : (
+        <p className="text-xs text-zinc-400">File count unavailable.</p>
+      )}
     </div>
   );
 }
