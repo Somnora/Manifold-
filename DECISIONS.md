@@ -966,3 +966,43 @@ directly. The probe is pure and injectable — classification is unit-tested
 against canned probe outputs, so the logic is verified without hardware;
 the live session confirms the root cause. Read-only shell only; it opens no
 new listener and rides the one channel already trusted.
+
+## 2026-07-11 — Model presets + model-id normalization (vllm-serve UX)
+
+**Decided:** A curated catalog (`app/model_catalog.py`, `GET /model-presets`)
+of ungated, VRAM-tiered models shown as click-to-fill chips under the
+vllm-serve model_id field. The dashboard also normalizes model_id on submit:
+a pasted `huggingface.co/owner/model` URL is reduced to `owner/model`, and
+trailing whitespace/punctuation is trimmed.
+
+**Alternatives:** Live HuggingFace API (browse trending) — a network
+dependency and far more surface for a first version; free-text id only (the
+status quo, which let a stray trailing ";" reach vLLM as part of the repo
+id and fail the serve).
+
+**Why:** "Is the model id all we need?" plus a fat-fingered `;` in the field
+showed the id box is the friction point. Presets remove the typo path for
+common models and answer "recommend by GPU" via the tier badge (A10 24GB vs
+H100 80GB) without heavy plumbing. Presets are ungated on purpose so a first
+serve needs no HuggingFace token; gated models (Llama, Gemma) need token
+passthrough, deferred. The URL/trim normalization directly answers "would
+pasting the URL be easier?" — now both work.
+
+## 2026-07-11 — Job History: active/finished split with removal
+
+**Decided:** The Jobs page splits Active (queued/running) from History
+(succeeded/failed). Finished jobs can be removed one at a time
+(`DELETE /tasks/{id}`, refused for a running job) or cleared in bulk
+(`DELETE /tasks/finished`); both drop the task and its logs. Route order
+puts the literal `/tasks/finished` before `/tasks/{task_id}`.
+
+**Alternatives:** Keep one flat queue (what shipped) — finished jobs from
+past sessions accumulate forever with no way to clear; auto-expire old
+tasks (surprising, and history is sometimes worth keeping).
+
+**Why:** Tasks persist in SQLite across instances and sessions (correct), but
+the flat "Queue" list mixed a fresh failure with week-old successes and had
+no clear affordance. Splitting active from history matches how the user
+reasons ("what's running now" vs "what happened"), and explicit removal
+keeps deletion a deliberate act. A running job cannot be removed, so history
+cleanup can never orphan a live container.

@@ -1054,6 +1054,31 @@ def create_app(
             raise HTTPException(404, f"task {task_id} not found")
         return {"task_id": task_id, "lines": queue.get_logs(task_id, tail)}
 
+    # Literal path declared BEFORE /tasks/{task_id} so "finished" is not
+    # captured as a task id.
+    @app.delete("/tasks/finished")
+    async def clear_finished_tasks():
+        """Clear finished (succeeded/failed) jobs from history. Active jobs
+        (queued/running) are left untouched."""
+        return {"cleared": queue.clear_finished()}
+
+    @app.delete("/tasks/{task_id}")
+    async def delete_task(task_id: str):
+        task = queue.get(task_id)
+        if task is None:
+            raise HTTPException(404, f"task {task_id} not found")
+        if task["status"] == "running":
+            raise HTTPException(
+                409, "cannot remove a running job; wait for it to finish")
+        queue.delete(task_id)
+        return {"deleted": task_id}
+
+    @app.get("/model-presets")
+    async def model_presets():
+        """Curated, ungated vLLM-serveable models tiered by GPU VRAM."""
+        from .model_catalog import MODEL_PRESETS
+        return {"presets": MODEL_PRESETS}
+
     # -- capacity watches ---------------------------------------------------------------
 
     @app.post("/watches", status_code=201)

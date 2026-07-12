@@ -9,12 +9,18 @@ export function ParameterForm({
   template,
   onSubmit,
   submitting,
+  initialValues,
 }: {
   template: Template;
   onSubmit: (values: Record<string, unknown>) => void;
   submitting: boolean;
+  // Seed field values (e.g. a model preset filling model_id). Remount the
+  // form with a new `key` to re-seed; the user can still edit afterward.
+  initialValues?: Record<string, string>;
 }) {
-  const [values, setValues] = useState<Record<string, string>>({});
+  const [values, setValues] = useState<Record<string, string>>(
+    () => ({ ...initialValues }),
+  );
 
   function currentValue(p: TemplateParameter): string {
     if (p.name in values) return values[p.name];

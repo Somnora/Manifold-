@@ -267,6 +267,29 @@ class Database:
         ).fetchone()
         return row["n"]
 
+    def delete_task(self, task_id: str) -> None:
+        """Remove one task and its logs (used by the Job History 'remove')."""
+        with self._lock:
+            self._conn.execute("DELETE FROM task_logs WHERE task_id = ?",
+                               (task_id,))
+            self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            self._conn.commit()
+
+    def delete_finished_tasks(self) -> int:
+        """Clear all finished (succeeded/failed) tasks and their logs. Active
+        jobs (queued/running) are left untouched. Returns the count removed."""
+        with self._lock:
+            ids = [r["id"] for r in self._conn.execute(
+                "SELECT id FROM tasks WHERE status IN ('succeeded', 'failed')"
+            ).fetchall()]
+            for tid in ids:
+                self._conn.execute("DELETE FROM task_logs WHERE task_id = ?",
+                                   (tid,))
+            self._conn.execute(
+                "DELETE FROM tasks WHERE status IN ('succeeded', 'failed')")
+            self._conn.commit()
+            return len(ids)
+
     # -- task logs ---------------------------------------------------------------
 
     def append_task_log(self, task_id: str, line: str) -> None:

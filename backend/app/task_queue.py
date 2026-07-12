@@ -45,6 +45,12 @@ class TaskQueue(abc.ABC):
     @abc.abstractmethod
     def running_count(self) -> int: ...
 
+    @abc.abstractmethod
+    def delete(self, task_id: str) -> None: ...
+
+    @abc.abstractmethod
+    def clear_finished(self) -> int: ...
+
 
 class SQLiteTaskQueue(TaskQueue):
     def __init__(self, db: Database):
@@ -87,3 +93,9 @@ class SQLiteTaskQueue(TaskQueue):
 
     def running_count(self) -> int:
         return self._db.running_task_count()
+
+    def delete(self, task_id: str) -> None:
+        self._db.delete_task(task_id)
+
+    def clear_finished(self) -> int:
+        return self._db.delete_finished_tasks()
