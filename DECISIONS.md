@@ -1500,3 +1500,28 @@ leaving the launched box up forever, and the idle loop deliberately skips
 auto-owned instances. 'ready' now runs the same settled-check as 'running',
 so the lifecycle still syncs and terminates the box (test:
 test_auto_job_torn_down_after_dispatch_time_failure).
+
+## 2026-07-12 — Chat tools: the served model gets guarded arms
+
+**Context:** the in-dashboard chat relayed text only, so the model (which is
+stateless text-in/text-out) could not see the filesystem or start work —
+James expected "one synergetic system where the instance runs the model and
+the model can talk to the instance and filebase".
+
+**Decided:** the chat endpoint gains a tools mode (`tools: true`, the panel's
+default). The backend runs the loop, Autopilot-style: the model replies with
+one JSON action, the backend executes it through EXISTING guarded paths and
+feeds the observation back; plain text ends the loop as the final answer.
+Tool surface (chat_tools.py): list_files / read_file (sidecar + managed SSH,
+confined to the file-navigator roots, 16 KB head-read cap), list_templates /
+run_job (the same coerce + queue path as everyone else), get_job_status /
+get_job_logs. No shell, no HTTP, no launch/terminate from chat — that stays
+Autopilot's job with its run ledger and step caps. Every tool call is
+audited (actor "chat"). Max 8 tool calls per user message.
+
+**Trade-off:** tools mode answers arrive turn-at-once (the backend must see
+the full reply to detect a tool call); the Tools toggle off restores pure
+token streaming. UI also gained: tool-call progress lines, a vertically
+resizable conversation area (CSS resize-y), and image attach via drag/drop
+or button — sent as OpenAI image_url content parts, which only vision models
+(e.g. Qwen2.5-VL) can read; the panel says so next to pending images.

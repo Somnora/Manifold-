@@ -104,9 +104,14 @@ class AutopilotRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    # content may be a string, or OpenAI content-parts (text + image_url)
+    # for vision models — the payload is relayed verbatim either way.
     messages: list[dict] = Field(min_length=1)   # [{role, content}, ...]
     max_tokens: int = Field(default=1024, ge=1, le=32768)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    # Tools mode: the backend runs a guarded action loop (browse/read the
+    # instance's filesystems, queue jobs) between the user and the model.
+    tools: bool = False
 
 
 class LambdaKeyRequest(BaseModel):
@@ -591,20 +596,30 @@ def create_app(
                 f"download and load — try again shortly.",
             )
 
+        db.record_audit(
+            "api", "chat",
+            f"{instance_id}: {len(req.messages)} message(s) -> "
+            f"{task['model_id']}" + (" [tools]" if req.tools else ""),
+        )
+        dispatcher.touch_activity(instance_id)
+
+        import json
+        from fastapi.responses import StreamingResponse
+
+        if req.tools:
+            return StreamingResponse(
+                _chat_with_tools(instance_id, task, model_client, req),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache",
+                         "X-Accel-Buffering": "no"},
+            )
+
         payload = {
             "model": task["model_id"],
             "messages": req.messages,
             "max_tokens": req.max_tokens,
             "temperature": req.temperature,
         }
-        db.record_audit(
-            "api", "chat",
-            f"{instance_id}: {len(req.messages)} message(s) -> {task['model_id']}",
-        )
-        dispatcher.touch_activity(instance_id)
-
-        import json
-        from fastapi.responses import StreamingResponse
 
         async def relay():
             try:
@@ -621,6 +636,62 @@ def create_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    async def _chat_with_tools(instance_id: str, task: dict,
+                               model_client, req: ChatRequest):
+        """Tool loop between the user and the served model.
+
+        Each turn the model may reply with one JSON tool call; the backend
+        executes it through the guarded paths (chat_tools.py) and feeds the
+        observation back. Plain text ends the loop as the final answer.
+        Emits SSE: {"tool": ...} progress events, then one delta chunk with
+        the answer (turn-at-once — tools mode trades token streaming for
+        arms; the plain relay above still streams)."""
+        import json as _json
+
+        from .agent import parse_action
+        from .chat_tools import (
+            MAX_TOOL_TURNS,
+            TOOLS_PROMPT,
+            ChatToolExecutor,
+        )
+
+        executor = ChatToolExecutor(orchestrator, queue, templates, db,
+                                    instance_id)
+        history = [{"role": "system", "content": TOOLS_PROMPT}] + req.messages
+
+        def delta(text: str) -> str:
+            chunk = {"choices": [{"delta": {"content": text}}]}
+            return f"data: {_json.dumps(chunk)}\n\n"
+
+        try:
+            for turn in range(MAX_TOOL_TURNS + 1):
+                reply = await model_client.chat_completion(task["port"], {
+                    "model": task["model_id"],
+                    "messages": history,
+                    "max_tokens": req.max_tokens,
+                    "temperature": req.temperature,
+                })
+                text = reply["choices"][0]["message"]["content"] or ""
+                parsed, _err = parse_action(text)
+                if parsed is None or turn == MAX_TOOL_TURNS:
+                    # Plain text (or out of turns): the final answer.
+                    yield delta(text)
+                    break
+                action, args = parsed["action"], parsed["args"]
+                observation = await executor.execute(action, args)
+                yield ("data: " + _json.dumps({"tool": {
+                    "action": action, "args": args,
+                    "ok": "error" not in observation,
+                    "error": observation.get("error"),
+                }}) + "\n\n")
+                history.append({"role": "assistant", "content": text})
+                history.append({"role": "user",
+                                "content": _json.dumps(observation)})
+                dispatcher.touch_activity(instance_id)
+            yield "data: [DONE]\n\n"
+        except ModelClientError as exc:
+            yield f'data: {{"error": {_json.dumps(str(exc))}}}\n\n'
 
     # -- OpenAI-compatible proxy (/v1) ---------------------------------------------
     # Point any OpenAI client at http://localhost:8000/v1 and it talks to a
