@@ -1006,3 +1006,27 @@ no clear affordance. Splitting active from history matches how the user
 reasons ("what's running now" vs "what happened"), and explicit removal
 keeps deletion a deliberate act. A running job cannot be removed, so history
 cleanup can never orphan a live container.
+
+## 2026-07-11 — Sidecar deps must target the service's interpreter
+
+**Decided:** cloud-init installs the sidecar's deps with
+`/usr/bin/python3 -m pip install --break-system-packages fastapi uvicorn
+pynvml` (with a bare-pip retry and a non-fatal fallback), and ensures pip
+for that interpreter first — matching the `ExecStart=/usr/bin/python3` the
+systemd unit uses.
+
+**Alternatives:** The old `python3 -m pip install ...` (bare); a virtualenv
+for the sidecar (more moving parts on a single-file service); shipping the
+sidecar as a container (heavier, and it needs host pynvml/NVML anyway).
+
+**Why:** Strongly suspected root cause of the recurring "sidecar not
+reachable yet" seen on every instance. On Lambda ML images `python3` in
+root's PATH is often conda's, so a bare `pip install` puts fastapi/uvicorn
+where `/usr/bin/python3` cannot import them; the service then crash-loops
+(Restart=always) and never listens on 9411, so telemetry AND the file
+browser (both sidecar-backed) fail together. Targeting /usr/bin/python3
+explicitly, plus PEP 668 handling for newer Ubuntu, closes all three
+plausible failure modes at once. Cannot be exercised without live spend, so
+the guard is an invariant test: the fastapi install line must start with
+`/usr/bin/python3 -m pip` and never regress to a bare `python3`. The new
+Diagnose button confirms it on the next launch (service active + listening).
