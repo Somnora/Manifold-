@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError, type SidecarDiagnosis } from "@/lib/api";
+import { wsBase } from "@/lib/backend";
 
 type GpuSample = {
   name: string;
@@ -11,8 +12,6 @@ type GpuSample = {
   temperature_c: number;
 };
 
-const WS_BASE = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000")
-  .replace(/^http/, "ws");
 const HISTORY = 60; // samples kept per series
 
 // Live GPU telemetry over the backend's relay WebSocket
@@ -45,7 +44,7 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
 
   useEffect(() => {
     let closed = false;
-    const ws = new WebSocket(`${WS_BASE}/instances/${instanceId}/metrics/stream`);
+    const ws = new WebSocket(`${wsBase()}/instances/${instanceId}/metrics/stream`);
     wsRef.current = ws;
 
     ws.onmessage = (event) => {

@@ -143,8 +143,8 @@ def create_app(
 ) -> FastAPI:
     settings = settings or load_settings()
     lambda_client_factory = lambda_client_factory or RealLambdaClient
-    from .config import REPO_ROOT
-    env_file = env_path if env_path is not None else REPO_ROOT / ".env"
+    from .config import DATA_ROOT, RESOURCE_ROOT
+    env_file = env_path if env_path is not None else DATA_ROOT / ".env"
 
     # Image preflight wiring. Mock mode gets the offline approve-everything
     # checker; production (no injected client) verifies against registries.
@@ -205,7 +205,7 @@ def create_app(
     storage_cache: dict[str, StorageClient] = {}
 
     templates, template_errors = load_templates(
-        templates_dir if templates_dir is not None else REPO_ROOT / "templates"
+        templates_dir if templates_dir is not None else RESOURCE_ROOT / "templates"
     )
 
     queue = SQLiteTaskQueue(db)
@@ -1470,6 +1470,41 @@ def create_app(
         except KeyError:
             raise HTTPException(404, f"file '{key}' not found")
         return {"deleted": key}
+
+    # -- the dashboard itself (static export) ------------------------------------------
+    # When the exported dashboard exists (dashboard/out in dev, ui/ inside a
+    # PyInstaller bundle), serve it at "/" so the whole product is ONE
+    # process. Mounted last: every API route above wins first. Next's static
+    # export writes each route as <route>.html, so a direct load of /jobs
+    # falls back to jobs.html.
+    import sys as _sys
+
+    ui_dir = (RESOURCE_ROOT / "ui" if getattr(_sys, "frozen", False)
+              else RESOURCE_ROOT / "dashboard" / "out")
+    if (ui_dir / "index.html").exists():
+        from starlette.exceptions import HTTPException as StarletteHTTPException
+        from starlette.staticfiles import StaticFiles
+
+        class ExportedUI(StaticFiles):
+            async def get_response(self, path: str, scope):
+                # StaticFiles reports "not found" two ways: raising 404, or
+                # returning the export's 404.html page (when a same-named
+                # directory of route payloads exists). Catch both and retry
+                # with the route's <path>.html file.
+                try:
+                    response = await super().get_response(path, scope)
+                except StarletteHTTPException as exc:
+                    if exc.status_code != 404 or "." in path:
+                        raise
+                    return await super().get_response(f"{path}.html", scope)
+                if response.status_code == 404 and "." not in path:
+                    try:
+                        return await super().get_response(f"{path}.html", scope)
+                    except StarletteHTTPException:
+                        pass
+                return response
+
+        app.mount("/", ExportedUI(directory=str(ui_dir), html=True), name="ui")
 
     return app
 

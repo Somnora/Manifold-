@@ -1,0 +1,55 @@
+# Desktop builds: .dmg (macOS arm64) and .msi (Windows x64) on demand or tag.
+#
+# Unsigned by design for now - signing needs org secrets:
+#   macOS: Developer ID cert + notarization (APPLE_CERT*, APPLE_ID...)
+#   Windows: Authenticode cert
+# Wire those into the tauri-action step when the accounts exist
+# (docs/desktop-build.md).
+name: desktop
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            bundles: dmg
+          - os: windows-2022
+            bundles: msi
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build backend binary (dashboard export + PyInstaller)
+        shell: bash
+        run: ./scripts/build-backend.sh
+
+      - name: Stage sidecar for Tauri
+        shell: bash
+        run: |
+          cd desktop && npm ci --no-fund --no-audit
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p src-tauri/binaries
+          src=../backend/dist/manifold-backend
+          [ -f "$src.exe" ] && src="$src.exe" && ext=".exe" || ext=""
+          cp "$src" "src-tauri/binaries/manifold-backend-$triple$ext"
+
+      - name: Tauri build
+        shell: bash
+        run: cd desktop && npx tauri build --bundles ${{ matrix.bundles }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifold-${{ matrix.os }}
+          path: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/release/bundle/msi/*.msi

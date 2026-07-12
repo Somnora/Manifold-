@@ -1581,3 +1581,56 @@ cache mount, same ports block - so chat, the /v1 proxy, Autopilot, and
 llm-synthesize work against it unchanged (find_serving_task keys on
 ports + model_id, both present). Image + entrypoint verified against the
 registry (nvidia passthrough entrypoint; full launch command supplied).
+
+## 2026-07-12 — Desktop packaging: Tauri shell around ONE frozen process
+
+**Context:** turn localhost Manifold into a downloadable .dmg/.msi. James
+chose Tauri v2 over pywebview (no installer/updater story) and Electron
+(~200MB Chromium for no gain).
+
+**Shape (two layers, one process of substance):**
+- The dashboard already prerendered every route statically, so
+  `output: "export"` makes it plain files that FastAPI serves at `/`
+  (mounted LAST; API routes win). No Node at runtime.
+- PyInstaller freezes backend + templates/ + sidecar + config default + the
+  exported UI into one ~39MB binary (`backend/desktop.py` entrypoint,
+  loopback-only). This binary alone IS the product; the shell is chrome.
+- Tauri spawns it as a sidecar, shows a themed splash until the port
+  answers, navigates the native window to it, and kills it on exit. If the
+  port already serves (dev backend running), it reuses instead of spawning
+  a duplicate.
+
+**Path split that makes packaging safe** (config.py): RESOURCE_ROOT
+(read-only bundle assets; sys._MEIPASS when frozen) vs DATA_ROOT (mutable
+state: .env, config.yaml, manifold.db, host_keys.json) which moves to
+~/Library/Application Support/Manifold (mac) / %APPDATA%\Manifold (win).
+First run scaffolds the dir and seeds config.yaml from the bundled default.
+Development behavior is byte-identical (both roots = repo root), which is
+why the whole suite passes untouched.
+
+**Frontend URL detection** (`dashboard/lib/backend.ts`): one source of
+truth. Same-origin when served by the backend, localhost:8000 under the
+:3000 dev server, NEXT_PUBLIC_API_URL overrides. Replaced four scattered
+copies of the localhost fallback (api.ts, ChatPanel, TerminalPanel,
+TelemetryChart) - the desktop app breaks without this, since its origin is
+127.0.0.1:8000 itself.
+
+**Receipts:** frozen binary booted standalone: every dashboard route 200,
+all 9 templates loaded from the bundle, fresh DATA_ROOT scaffolded with
+seeded config + empty db. CI (.github/workflows/desktop.yml) builds dmg
+(macos-14) + msi (windows-2022) on v* tags. Local dmg note: Tauri's
+bundle_dmg.sh drives Finder via AppleScript and fails headless; plain
+`hdiutil create` produces the same artifact without the styled window.
+
+**Orphan bug found at the gate:** quitting the app killed only PyInstaller's
+bootloader; the real server survived and held :8000 forever. Fix: the shell
+sets MANIFOLD_PARENT_WATCHDOG=1 and the backend self-terminates on stdin
+EOF (its stdin is a pipe from the shell, so EOF = the shell died, however
+it died). Opt-in via env so terminal runs never self-terminate. Retested:
+launch -> serve -> quit -> zero processes, port released.
+
+**Honest limits:** bundles are UNSIGNED until Apple Developer ($99/yr) /
+Authenticode accounts exist - Gatekeeper/SmartScreen will warn; the
+workflow has the hook points. No auto-updater until signing lands (unsigned
+updates are unsafe). Windows build is CI-defined but untested on real
+hardware. MCP stays a dev-checkout feature for now.
