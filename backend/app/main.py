@@ -940,10 +940,12 @@ def create_app(
             raise HTTPException(400, "cannot archive a filesystem root")
         tmp = ("/workspace/ephemeral/.manifold-archives/"
                + hashlib.sha256(remote.encode()).hexdigest()[:16] + ".tar.gz")
+        # Compressing a large tree can take a while; bound it generously.
         exit_status, _, stderr = await conn.run(
             f"mkdir -p /workspace/ephemeral/.manifold-archives && "
             f"tar czf {shlex.quote(tmp)} -C {shlex.quote(parent)} "
-            f"{shlex.quote(name)}"
+            f"{shlex.quote(name)}",
+            timeout=600,
         )
         if exit_status != 0:
             raise HTTPException(

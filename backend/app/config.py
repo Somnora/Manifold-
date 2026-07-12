@@ -44,6 +44,16 @@ class SSHSettings:
     connect_timeout_seconds: float = 15.0
     reconnect_base_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
+    # Detect a silently-dead TCP path fast: ping every interval, drop after
+    # this many unanswered pings (~45s at 15s x 3), so the supervisor can
+    # reconnect instead of the connection appearing "connected" for the
+    # ~15 min it takes the OS to give up.
+    keepalive_interval_seconds: float = 15.0
+    keepalive_count_max: int = 3
+    # Ceiling on a single remote command run over the connection. A stalled
+    # NFS mount would otherwise wedge a request (archive/sync/diagnose)
+    # forever. Job dispatch streams for hours and passes its own (None).
+    command_timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -181,6 +191,11 @@ def load_settings(
             connect_timeout_seconds=float(ssh.get("connect_timeout_seconds", 15)),
             reconnect_base_seconds=float(ssh.get("reconnect_base_seconds", 1)),
             reconnect_max_seconds=float(ssh.get("reconnect_max_seconds", 30)),
+            keepalive_interval_seconds=float(
+                ssh.get("keepalive_interval_seconds", 15)),
+            keepalive_count_max=int(ssh.get("keepalive_count_max", 3)),
+            command_timeout_seconds=float(
+                ssh.get("command_timeout_seconds", 120)),
         ),
         default_connection_mode=str(conn.get("default_mode", "direct-ssh")),
         db_path=db_path,

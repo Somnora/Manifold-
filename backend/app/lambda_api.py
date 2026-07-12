@@ -15,6 +15,7 @@ API facts verified against the published OpenAPI spec (v1.10.0, July 2026):
 from __future__ import annotations
 
 import abc
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -102,7 +103,10 @@ class LambdaClient(abc.ABC):
     async def list_ssh_keys(self) -> list[SSHKeyInfo]: ...
 
     @abc.abstractmethod
-    async def list_instances(self) -> list[InstanceInfo]: ...
+    async def list_instances(self, *, fresh: bool = False) -> list[InstanceInfo]:
+        """List instances. `fresh=True` bypasses any caching layer — used by
+        the spend guards, which must never decide on stale state."""
+        ...
 
     @abc.abstractmethod
     async def get_instance(self, instance_id: str) -> InstanceInfo: ...
@@ -152,7 +156,7 @@ class UnconfiguredLambdaClient(LambdaClient):
     async def list_ssh_keys(self):
         raise self._err()
 
-    async def list_instances(self):
+    async def list_instances(self, *, fresh: bool = False):
         raise self._err()
 
     async def get_instance(self, instance_id: str):
@@ -171,34 +175,74 @@ class SwappableLambdaClient(LambdaClient):
     Everything (orchestrator, dispatcher, routes) holds this one object;
     the Settings flow replaces `inner` and every holder sees the new
     client immediately. No restart required.
+
+    Also a short-TTL cache for `list_instances`: the dashboard polls it
+    every ~2s (and a second browser tab, MCP, and capacity watches pile on),
+    each poll otherwise hitting Lambda's rate-limited API. The cache is
+    invalidated on any state change WE initiate (launch/terminate) and when
+    `inner` is swapped, so it never masks an action taken through Manifold —
+    only out-of-band changes wait out the TTL, which already matches the
+    poll cadence. Safe for the reconcile in instances_with_state: any
+    instance we hold a connection to was launched through us (cache-busting)
+    minutes before, so a live connection can never be reaped on stale data.
     """
 
-    def __init__(self, inner: LambdaClient):
-        self.inner = inner
+    def __init__(self, inner: LambdaClient, *, cache_ttl_seconds: float = 2.0,
+                 clock=time.monotonic):
+        self._inner = inner
+        self._ttl = cache_ttl_seconds
+        self._clock = clock
+        self._instances_cache = None
+        self._instances_at = 0.0
+
+    @property
+    def inner(self) -> LambdaClient:
+        return self._inner
+
+    @inner.setter
+    def inner(self, value: LambdaClient) -> None:
+        self._inner = value
+        self._invalidate()   # new credentials -> fresh data, not cached
+
+    def _invalidate(self) -> None:
+        self._instances_cache = None
 
     async def list_instance_types(self):
-        return await self.inner.list_instance_types()
+        return await self._inner.list_instance_types()
 
     async def list_filesystems(self):
-        return await self.inner.list_filesystems()
+        return await self._inner.list_filesystems()
 
     async def list_ssh_keys(self):
-        return await self.inner.list_ssh_keys()
+        return await self._inner.list_ssh_keys()
 
-    async def list_instances(self):
-        return await self.inner.list_instances()
+    async def list_instances(self, *, fresh: bool = False):
+        now = self._clock()
+        if (not fresh and self._instances_cache is not None
+                and now - self._instances_at < self._ttl):
+            return self._instances_cache
+        # fresh=True (spend guards) always hits the API and refreshes the
+        # cache, so the guard decides on live state and later readers benefit.
+        result = await self._inner.list_instances()
+        self._instances_cache = result
+        self._instances_at = now
+        return result
 
     async def get_instance(self, instance_id: str):
-        return await self.inner.get_instance(instance_id)
+        return await self._inner.get_instance(instance_id)
 
     async def launch_instance(self, **kwargs):
-        return await self.inner.launch_instance(**kwargs)
+        result = await self._inner.launch_instance(**kwargs)
+        self._invalidate()   # a new instance exists; reflect it now
+        return result
 
     async def terminate_instance(self, instance_id: str):
-        return await self.inner.terminate_instance(instance_id)
+        result = await self._inner.terminate_instance(instance_id)
+        self._invalidate()   # it's gone; don't serve it from cache
+        return result
 
     async def close(self):
-        await self.inner.close()
+        await self._inner.close()
 
 
 # -- Real client ----------------------------------------------------------------
@@ -279,7 +323,7 @@ class RealLambdaClient(LambdaClient):
             file_system_names=inst.get("file_system_names", []),
         )
 
-    async def list_instances(self) -> list[InstanceInfo]:
+    async def list_instances(self, *, fresh: bool = False) -> list[InstanceInfo]:
         data = await self._request("GET", "/instances")
         return [self._instance_from_api(i) for i in data]
 
@@ -451,7 +495,7 @@ class MockLambdaClient(LambdaClient):
     async def list_ssh_keys(self) -> list[SSHKeyInfo]:
         return list(self.ssh_keys)
 
-    async def list_instances(self) -> list[InstanceInfo]:
+    async def list_instances(self, *, fresh: bool = False) -> list[InstanceInfo]:
         return [i for i in self.instances.values() if i.status != "terminated"]
 
     async def get_instance(self, instance_id: str) -> InstanceInfo:

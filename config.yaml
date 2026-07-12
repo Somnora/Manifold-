@@ -31,6 +31,15 @@ ssh:
   # Managed-connection reconnect backoff (base * 2^n, capped).
   reconnect_base_seconds: 1
   reconnect_max_seconds: 30
+  # Liveness pings on the managed connection: drop and reconnect after
+  # ~interval * count_max of silence (~45s), instead of waiting the ~15 min
+  # the OS takes to notice a dead TCP path.
+  keepalive_interval_seconds: 15
+  keepalive_count_max: 3
+  # Ceiling on a single remote command (sidecar-less shell calls: diagnose,
+  # etc.). A stalled NFS mount can't wedge a request forever. Sync/archive
+  # pass their own longer bounds; job dispatch streams unbounded by design.
+  command_timeout_seconds: 120
 
 connection:
   # direct-ssh (default) or tailscale. Overridable per launch.
