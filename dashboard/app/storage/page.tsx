@@ -137,7 +137,7 @@ export default function StoragePage() {
                       <span className="text-xs text-zinc-500">Delete?</span>
                       <button
                         onClick={() => deleteFile(f.key)}
-                        className="rounded bg-red-600 px-2 py-0.5 text-xs font-medium text-white hover:bg-red-500"
+                        className="rounded bg-red-600 px-2 py-0.5 text-xs font-medium text-zinc-900 hover:bg-red-500"
                       >
                         Yes
                       </button>

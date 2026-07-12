@@ -22,6 +22,12 @@ volumes:
   - host: "{persistent}/configs"
     container: /data/config
     read_only: true
+  # llm-synthesize (output_format=alpaca) writes training sets here; mounting
+  # it read-only closes the distillation loop with no file shuffling (see
+  # docs/distill-your-own-model.md).
+  - host: "{persistent}/synthesized"
+    container: /data/synthesized
+    read_only: true
   - host: "{persistent}/outputs"
     container: /data/output
   - host: "{persistent}/cache/huggingface"

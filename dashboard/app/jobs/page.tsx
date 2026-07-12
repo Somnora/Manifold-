@@ -442,7 +442,7 @@ function TaskCard({
             Last log lines
           </p>
           {failTail.length > 0 ? (
-            <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-2.5 font-mono text-[11px] leading-relaxed text-zinc-100">
+            <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-2.5 font-mono text-[11px] leading-relaxed text-zinc-800">
               {failTail.join("\n")}
             </pre>
           ) : (
@@ -462,7 +462,7 @@ function TaskCard({
       {showLogs && (
         /* pre-wrap + break-words: long docker/pip lines wrap instead of
            forcing the whole card into horizontal scroll; height stays capped. */
-        <pre className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-100">
+        <pre className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-800">
           {lines.length > 0 ? lines.join("\n") : "(no output yet)"}
         </pre>
       )}

@@ -1545,3 +1545,39 @@ Presets say so in their tier/notes rather than offering a serve that OOMs.
 existing single-GPU serves unchanged) appended as --tensor-parallel-size;
 cluster presets carry {"tensor_parallel": 8} and the Jobs page seeds a
 preset's extra parameters into the form alongside the model id.
+
+## 2026-07-12 — Night hardening pass: dark theme as tokens, distillation loop closed, SGLang added
+
+**Dark theme via palette remap, one file.** The dashboard was authored light
+and users saw it through the browser's forced dark mode (muddy, accidental).
+Now globals.css IS the theme: Tailwind v4 @theme re-points the palette the
+components already use, so class names keep their ROLE (white = card
+surface, zinc-50 = canvas, zinc-900 = primary text / inverted buttons,
+zinc-950 = terminal blocks; accent -50/-100/-200 tints become dark glass,
+-700/-800/-900 text lightened). Zero component sweep; the ~10 places where
+the role genuinely flips (light text on log blocks, white text on saturated
+buttons, decorative separators) were hand-fixed. Fonts: Space Grotesk (UI) +
+JetBrains Mono (terminal surfaces, section headers, wordmark) via next/font.
+One brand accent (teal phosphor) used only for selection, focus, the canvas
+glow, and the wordmark cursor. Alternatives: hand-editing every component
+(hundreds of class changes, drift forever) or CSS filter inversion (breaks
+images and shadows). The remap centralizes taste per the design-tokens rule.
+
+**Distillation loop closed (teacher -> data -> student).** llm-synthesize
+gained output_format=alpaca ({"instruction","input","output"} rows) and
+axolotl-finetune now mounts synthesized/ read-only at /data/synthesized, so
+the teacher's output trains the student with zero file shuffling. The whole
+walk (serve teacher, synthesize, LoRA fine-tune, use the adapter) is
+docs/distill-your-own-model.md, with honest costs and caveats (gated
+students need an HF token Manifold does not pass yet).
+
+**sglang-serve template.** SGLang is the other major OpenAI-compatible
+serving engine (LMSYS); its RadixAttention reuses shared prompt prefixes
+automatically, making it faster than vLLM for agent/RAG workloads that
+resend long system prompts (vLLM stays the default for one-off prompts and
+has the broader hardware support). Because both expose the same API, the
+template is a sibling of vllm-serve: same loopback-only publish, same HF
+cache mount, same ports block - so chat, the /v1 proxy, Autopilot, and
+llm-synthesize work against it unchanged (find_serving_task keys on
+ports + model_id, both present). Image + entrypoint verified against the
+registry (nvidia passthrough entrypoint; full launch command supplied).

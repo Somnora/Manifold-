@@ -171,7 +171,7 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
                 >
                   {crumb}
                 </button>
-                {i < crumbs.length - 1 && <span className="text-zinc-300">/</span>}
+                {i < crumbs.length - 1 && <span className="text-zinc-600">/</span>}
               </span>
             ))}
           </nav>
@@ -337,7 +337,7 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
           <span className="ml-2 inline-flex gap-2">
             <button
               onClick={() => doDelete(confirmDelete)}
-              className="rounded bg-red-600 px-2 py-0.5 font-medium text-white hover:bg-red-500"
+              className="rounded bg-red-600 px-2 py-0.5 font-medium text-zinc-900 hover:bg-red-500"
             >
               Delete
             </button>

@@ -82,7 +82,7 @@ export default function InstancesPage() {
           title="See the full spend history"
         >
           Total spend:{" "}
-          <span className="font-medium text-zinc-900 underline decoration-zinc-300 underline-offset-2">
+          <span className="font-medium text-zinc-900 underline decoration-zinc-500 underline-offset-2">
             {formatMoney(totalSpend)}
           </span>
         </Link>

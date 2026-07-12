@@ -31,6 +31,7 @@ DEFAULT_MINUTES: dict[str, float | None] = {
     "axolotl-finetune": 120,
     "tao-train": 120,
     "vllm-serve": None,        # a server: no fixed runtime, so no fixed cost
+    "sglang-serve": None,      # same: serves until stopped
 }
 
 # History rows needed before an estimate stops being "rough" and becomes

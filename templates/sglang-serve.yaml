@@ -1,0 +1,54 @@
+# Serve a model with SGLang's OpenAI-compatible server - a drop-in sibling
+# of vllm-serve (same API shape, same loopback-only publish, same chat and
+# proxy integration). SGLang's RadixAttention reuses shared prompt prefixes
+# across requests automatically, which makes it the faster engine for
+# agent/RAG-style workloads that resend long system prompts; vLLM remains
+# the default for one-off prompts. Image + entrypoint verified against the
+# registry 2026-07-12 (nvidia passthrough entrypoint, command supplied here).
+name: sglang-serve
+description: Serve a model with SGLang (OpenAI-compatible API on a loopback port). Faster than vLLM when requests share long prompt prefixes (agents, RAG). Standard HF Transformers repos only.
+image: lmsysorg/sglang:latest
+
+command: >
+  python3 -m sglang.launch_server
+  --model-path {{model_id}}
+  --context-length {{max_context}}
+  --port {{port}}
+  --host 0.0.0.0
+  --tp {{tensor_parallel}}
+
+parameters:
+  - name: model_id
+    type: string
+    description: HuggingFace model id to serve (e.g. Qwen/Qwen3-8B)
+  - name: max_context
+    type: integer
+    default: 8192
+    description: Maximum context length in tokens
+  - name: port
+    type: integer
+    default: 8080
+    description: Container port for the API server (loopback-only on the host)
+  - name: tensor_parallel
+    type: integer
+    default: 1
+    description: Shard the model across this many GPUs (set to 8 on an 8x cluster for big MoE models)
+
+volumes:
+  # HuggingFace cache on persistent storage: models survive the instance.
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+
+ports:
+  - host: 8080
+    container: 8080
+
+env:
+  HF_HOME: /root/.cache/huggingface
+
+gpu:
+  min_vram_gib: 24
+  recommended_types:
+    - gpu_1x_a10
+    - gpu_1x_h100_pcie
+    - gpu_1x_h100_sxm5

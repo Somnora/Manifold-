@@ -23,7 +23,7 @@ network: host
 # 2026-07-12 (env-script quoting).
 command: >
   bash -c 'exec python -c "$PYCODE" "$@"' manifold
-  {{input_path}} {{output_name}} {{instruction}} {{port}} {{limit}}
+  {{input_path}} {{output_name}} {{instruction}} {{port}} {{limit}} {{output_format}}
 
 parameters:
   - name: input_path
@@ -44,6 +44,10 @@ parameters:
     type: integer
     default: 0
     description: Max records to process (0 = all) — use a small number to test
+  - name: output_format
+    type: string
+    default: records
+    description: records = {record, synthesis} rows; alpaca = {instruction, input, output} rows that axolotl-finetune trains on directly (distillation)
 
 volumes:
   - host: "{persistent}"
@@ -54,6 +58,9 @@ env:
     import csv, json, os, sys, time, urllib.request
     inp, out_name, instruction, port, limit = (
         sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
+    out_format = sys.argv[6] if len(sys.argv) > 6 else "records"
+    if out_format not in ("records", "alpaca"):
+        sys.exit(f"output_format must be 'records' or 'alpaca', got {out_format!r}")
     base = f"http://127.0.0.1:{port}/v1"
     # Overridable so tests can fail fast; ops rarely needs to touch it.
     READY_TIMEOUT = int(os.environ.get("MANIFOLD_SYNTH_READY_TIMEOUT", "300"))
@@ -156,12 +163,20 @@ env:
                 continue
             try:
                 content = synthesize(record)
-                row = {"record": record, "synthesis": content}
-                points = as_points(content)
-                if points is not None:
-                    row["synthesis_json"] = points   # ready-to-use points
+                if out_format == "alpaca":
+                    # Distillation rows: exactly what axolotl's `type: alpaca`
+                    # trains on. instruction = the task, input = the raw
+                    # record, output = the teacher's reply.
+                    row = {"instruction": instruction,
+                           "input": json.dumps(record, ensure_ascii=False),
+                           "output": content}
                 else:
-                    row["parse_error"] = True         # model did not emit JSON
+                    row = {"record": record, "synthesis": content}
+                    points = as_points(content)
+                    if points is not None:
+                        row["synthesis_json"] = points   # ready-to-use points
+                    else:
+                        row["parse_error"] = True         # model did not emit JSON
                 out.write(json.dumps(row) + "\n")
                 out.flush()
                 done += 1
