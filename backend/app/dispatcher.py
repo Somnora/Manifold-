@@ -31,6 +31,7 @@ import time
 from .config import Settings
 from .connections import ConnectionState, ManagedConnection
 from .db import Database, utcnow
+from .image_checker import ImageChecker
 from .lambda_api import LambdaClient
 from .model_client import ModelClientError
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
@@ -174,6 +175,7 @@ class Dispatcher:
         db: Database,
         lambda_client: LambdaClient,
         *,
+        image_checker: ImageChecker | None = None,
         clock=time.monotonic,
     ):
         self.settings = settings
@@ -182,6 +184,8 @@ class Dispatcher:
         self.templates = templates
         self.db = db
         self.client = lambda_client
+        # Pre-launch image preflight (None = skip, images assumed fine).
+        self.image_checker = image_checker
         self._clock = clock
         self._loops: list[asyncio.Task] = []
         # Terminal activity is reported by the terminal WS handler (Phase 5);
@@ -294,6 +298,33 @@ class Dispatcher:
         self._readiness[task_id] = {**result, "checked_at": now}
         return result
 
+    # -- image preflight ---------------------------------------------------------------
+
+    async def _image_preflight(self, template: JobTemplate) -> str | None:
+        """Verify the template's image exists in its registry BEFORE spending
+        anything on it. Returns an error message when the image is
+        DEFINITIVELY missing; None to proceed.
+
+        Fail-open on anything undetermined (network blip, gated registry):
+        a flaky check must never become a wall in front of every launch. The
+        job then fails on the instance at `docker pull` — exactly what
+        happened before this preflight existed, no worse.
+        """
+        if self.image_checker is None:
+            return None
+        try:
+            check = await self.image_checker.image_exists(template.image)
+        except Exception:   # noqa: BLE001 - preflight must never crash a loop
+            logger.exception("image preflight errored for %s", template.image)
+            return None
+        if check.definitely_missing:
+            return (f"image not found: {template.image} ({check.detail}) — "
+                    f"fix the template's image before re-queueing")
+        if check.exists is None:
+            logger.warning("image preflight undetermined for %s: %s "
+                           "(proceeding)", template.image, check.detail)
+        return None
+
     # -- task loop -----------------------------------------------------------------
 
     def _pick_dispatchable(
@@ -377,6 +408,18 @@ class Dispatcher:
             self.queue.mark_finished(
                 task_id, exit_code=-1, output_paths=[], error=str(exc)
             )
+            return
+
+        # Image preflight: a definitively-missing image fails the job here,
+        # before any docker pull ever runs on the instance.
+        image_error = await self._image_preflight(template)
+        if image_error is not None:
+            self.queue.mark_finished(
+                task_id, exit_code=-1, output_paths=[], error=image_error
+            )
+            self.db.record_audit(
+                "backend", "task_image_missing",
+                f"{task_id} ({task['template']}): {image_error}")
             return
 
         docker_cmd = render_docker_command(
@@ -569,9 +612,12 @@ class Dispatcher:
             await self._auto_launch(job)
         elif lc == "launching":
             self._auto_check_boot(job)
-        elif lc == "ready":
-            return  # the task loop dispatches it; nothing to do here
-        elif lc == "running":
+        elif lc in ("ready", "running"):
+            # 'ready' normally just waits for the task loop to dispatch, but a
+            # dispatch-time failure (image missing, bad parameters) finishes
+            # the task WITHOUT ever reaching 'running' — the settled-check
+            # must still advance to syncing/terminating or the box would sit
+            # launched forever (the idle loop deliberately skips it).
             self._auto_check_run_done(job)
         elif lc == "syncing":
             await self._auto_sync(job)
@@ -617,6 +663,14 @@ class Dispatcher:
 
     async def _auto_launch(self, job: dict) -> None:
         """queued/waiting -> launching, through the guarded launch path."""
+        # Image preflight FIRST: never boot (and bill) a GPU to discover at
+        # docker-pull time that the template's image does not exist.
+        template = self.templates.get(job["template"])
+        if template is not None:
+            image_error = await self._image_preflight(template)
+            if image_error is not None:
+                self._fail(job, image_error)
+                return
         try:
             launch = await self.orchestrator.request_launch(
                 instance_type=job["gpu_type"], region=job["region"],

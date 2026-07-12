@@ -111,7 +111,7 @@ export function AutoManageControls({
   }, [value.region, fsInRegion]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const field =
-    "w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs";
+    "w-full min-w-0 max-w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs";
   const outOfCapacity =
     !!selectedType && selectedType.regions_with_capacity.length === 0;
   const noFs = value.region !== "" && fsInRegion.length === 0;
@@ -143,7 +143,7 @@ export function AutoManageControls({
             <p className="mt-2 text-xs text-red-700">{loadError}</p>
           )}
           <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-            <label className="block text-[11px] font-medium text-sky-900">
+            <label className="block min-w-0 text-[11px] font-medium text-sky-900">
               GPU
               <select
                 className={`${field} mt-0.5`}
@@ -159,7 +159,7 @@ export function AutoManageControls({
                 ))}
               </select>
             </label>
-            <label className="block text-[11px] font-medium text-sky-900">
+            <label className="block min-w-0 text-[11px] font-medium text-sky-900">
               Region
               <select
                 className={`${field} mt-0.5`}
@@ -178,7 +178,7 @@ export function AutoManageControls({
                 ))}
               </select>
             </label>
-            <label className="block text-[11px] font-medium text-sky-900">
+            <label className="block min-w-0 text-[11px] font-medium text-sky-900">
               Filesystem
               <select
                 className={`${field} mt-0.5`}

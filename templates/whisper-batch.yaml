@@ -1,19 +1,25 @@
-# Transcribe every audio/video file in a persistent input directory with
-# faster-whisper, writing .srt and .json next to each other in a persistent
-# output directory. Inputs and outputs both live on the filesystem, so
-# nothing is lost when the instance dies.
+# Batch-transcribe every audio/video file in a persistent input directory
+# with faster-whisper, writing .srt + .json next to each other in a
+# persistent output directory. Inputs and outputs both live on the
+# filesystem, so nothing is lost when the instance dies.
+#
+# The transcriber is a small script MANIFOLD OWNS (the PYCODE env below),
+# run on a plain official PyTorch+CUDA+cuDNN base with `pip install
+# faster-whisper` at start (~30s). No dependency on a third-party image's
+# internal scripts. cuDNN 9 in the base is what CTranslate2 (the
+# faster-whisper backend) needs for CUDA 12.
+#
+# Wiring note: the script lives in $PYCODE and parameters arrive as argv via
+# "$@" INSIDE a single-quoted `bash -c` — the host shell must NOT expand
+# $PYCODE (that would run empty), and params quoted at the top level reach
+# the container intact. See DECISIONS.md 2026-07-12 (env-script quoting).
 name: whisper-batch
-description: Batch-transcribe audio/video from persistent input to .srt + .json
-image: ghcr.io/speaches-ai/faster-whisper-server:latest-cuda
+description: Batch-transcribe audio/video from persistent input to .srt + .json (faster-whisper)
+image: pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
 
 command: >
-  python -m scripts.batch_transcribe
-  --input-dir /data/input
-  --output-dir /data/output
-  --model {{model_size}}
-  --language {{language}}
-  --compute-type float16
-  --output-formats srt,json
+  bash -c 'pip install --quiet --no-cache-dir faster-whisper &&
+  exec python -c "$PYCODE" "$@"' manifold {{model_size}} {{language}}
 
 parameters:
   - name: input_dir
@@ -37,6 +43,79 @@ volumes:
     container: /data/output
   - host: "{persistent}/cache/huggingface"
     container: /root/.cache/huggingface
+
+env:
+  HF_HOME: /root/.cache/huggingface
+  # Manifold-owned transcriber. argv[1]=model_size, argv[2]=language.
+  # Inputs at /data/input (ro), outputs at /data/output. Writes <name>.srt
+  # and <name>.json per file; per-file failures never kill the whole run.
+  PYCODE: |
+    import json, os, pathlib, sys
+    from faster_whisper import WhisperModel
+
+    model_size, language = sys.argv[1], sys.argv[2]
+    in_dir, out_dir = "/data/input", "/data/output"
+    os.makedirs(out_dir, exist_ok=True)
+    lang = None if language in ("", "auto") else language
+
+    AUDIO_VIDEO = {
+        ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma",
+        ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".mpg", ".mpeg",
+    }
+
+    def srt_time(seconds):
+        ms = int(round(seconds * 1000))
+        h, ms = divmod(ms, 3600_000)
+        m, ms = divmod(ms, 60_000)
+        s, ms = divmod(ms, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    files = sorted(p for p in pathlib.Path(in_dir).rglob("*")
+                   if p.is_file() and p.suffix.lower() in AUDIO_VIDEO)
+    if not files:
+        sys.exit(f"no audio/video files under {in_dir} "
+                 f"(looked for {', '.join(sorted(AUDIO_VIDEO))})")
+
+    print(f"loading faster-whisper '{model_size}' on CUDA (float16) ...",
+          flush=True)
+    model = WhisperModel(model_size, device="cuda", compute_type="float16")
+
+    ok = failed = 0
+    for f in files:
+        try:
+            print(f"transcribing {f.name} ...", flush=True)
+            segments, info = model.transcribe(str(f), language=lang,
+                                              vad_filter=True)
+            segs = list(segments)   # the API returns a generator
+            stem = f.stem
+            srt_path = pathlib.Path(out_dir) / f"{stem}.srt"
+            with open(srt_path, "w", encoding="utf-8") as w:
+                for i, seg in enumerate(segs, 1):
+                    w.write(f"{i}\n{srt_time(seg.start)} --> "
+                            f"{srt_time(seg.end)}\n{seg.text.strip()}\n\n")
+            json_path = pathlib.Path(out_dir) / f"{stem}.json"
+            with open(json_path, "w", encoding="utf-8") as w:
+                json.dump({
+                    "file": f.name,
+                    "language": info.language,
+                    "duration": info.duration,
+                    "text": " ".join(s.text.strip() for s in segs),
+                    "segments": [
+                        {"start": s.start, "end": s.end, "text": s.text}
+                        for s in segs
+                    ],
+                }, w, ensure_ascii=False, indent=2)
+            print(f"  wrote {srt_path.name} + {json_path.name} "
+                  f"({len(segs)} segments, detected {info.language})",
+                  flush=True)
+            ok += 1
+        except Exception as exc:
+            print(f"  FAILED {f.name}: {exc}", flush=True)
+            failed += 1
+
+    print(f"done: {ok} transcribed, {failed} failed -> {out_dir}", flush=True)
+    if ok == 0:
+        sys.exit("no files transcribed successfully")
 
 gpu:
   min_vram_gib: 10

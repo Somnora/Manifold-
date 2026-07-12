@@ -87,6 +87,7 @@ def mock_model():
 @pytest.fixture
 def client(settings, mock_client, mock_storage, mock_sidecar, mock_model):
     """TestClient over the real app wiring, with mocks injected."""
+    from app.image_checker import MockImageChecker
     app = create_app(
         settings,
         lambda_client=mock_client,
@@ -94,6 +95,7 @@ def client(settings, mock_client, mock_storage, mock_sidecar, mock_model):
         connect_fn=mock_connect_fn,
         sidecar_factory=lambda conn: mock_sidecar,
         model_client_factory=lambda conn: mock_model,
+        image_checker=MockImageChecker(),   # offline: no registry calls in tests
     )
     with TestClient(app) as test_client:
         yield test_client

@@ -191,7 +191,10 @@ async def test_worked_example_transcribe_inbox_then_shut_down(mcp_wired, mock_cl
         await asyncio.sleep(0.02)
     assert job_status["status"] == "succeeded"
     assert "/lambda/nfs/manifold-data/transcripts" in job_status["output_paths"]
-    logs = await mcp_server.get_job_logs(task_id, tail=50)
+    # tail wide enough to reach the dispatch banner: the whisper template's
+    # embedded transcriber script (~70 lines) is echoed back by the mock SSH,
+    # so the early "docker run" line sits further back than 50 lines now.
+    logs = await mcp_server.get_job_logs(task_id, tail=300)
     assert any("docker run" in l["line"] for l in logs["lines"])
 
     # Shut down: hook -> sync -> force. Instance ends terminated.

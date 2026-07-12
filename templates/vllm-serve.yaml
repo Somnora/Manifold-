@@ -5,8 +5,11 @@ name: vllm-serve
 description: Serve a model with vLLM (OpenAI-compatible API on a loopback port). Use a standard HF Transformers repo (e.g. Qwen/Qwen2.5-7B-Instruct); GGUF quant repos will not load.
 image: vllm/vllm-openai:latest
 
+# The image ENTRYPOINT is `vllm serve` (verified from the image config), so
+# the model is a POSITIONAL argument here, not `--model`. Passing `--model`
+# is what made this exit immediately after a successful pull.
 command: >
-  --model {{model_id}}
+  {{model_id}}
   --max-model-len {{max_context}}
   --port {{port}}
 

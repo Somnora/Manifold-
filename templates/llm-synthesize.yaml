@@ -15,8 +15,15 @@ description: Map an instruction over a JSONL/CSV dataset using the model served 
 image: python:3.11-slim
 network: host
 
+# $PYCODE must be expanded by the CONTAINER's shell, not the host: it is
+# referenced INSIDE a single-quoted `bash -c` (host leaves it literal), and
+# parameters arrive as positional args via "$@" (quoted at the top level,
+# so they reach the container intact). A bare `python -c "$PYCODE"` would be
+# expanded to empty by the instance shell and run nothing. See DECISIONS.md
+# 2026-07-12 (env-script quoting).
 command: >
-  python -c "$PYCODE" {{input_path}} {{output_name}} {{instruction}} {{port}} {{limit}}
+  bash -c 'exec python -c "$PYCODE" "$@"' manifold
+  {{input_path}} {{output_name}} {{instruction}} {{port}} {{limit}}
 
 parameters:
   - name: input_path

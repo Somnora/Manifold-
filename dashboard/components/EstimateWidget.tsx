@@ -63,27 +63,33 @@ export function EstimateWidget({
 
   return (
     <div className="rounded border border-indigo-100 bg-indigo-50/50 p-3 text-xs">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex min-w-0 items-center justify-between gap-2">
         <span className="font-medium text-indigo-900">Estimated cost</span>
-        {controlled ? (
-          <span className="text-indigo-800">
+        {controlled && (
+          <span className="min-w-0 truncate text-indigo-800">
             {gpu}
             {rate != null ? ` (${formatMoney(rate)}/hr)` : ""}
           </span>
-        ) : (
-          <select
-            className="rounded border border-indigo-200 bg-white px-1.5 py-0.5 text-xs"
-            value={gpu}
-            onChange={(e) => setPickedGpu(e.target.value)}
-          >
-            {options.map(([name, t]) => (
-              <option key={name} value={name}>
-                {name} ({formatMoney(t.price_usd_per_hour)}/hr)
-              </option>
-            ))}
-          </select>
         )}
       </div>
+      {/* The picker sits on its own full-width row BENEATH the label: a
+          closed <select> sizes itself to its widest option and would burst
+          out of the plate if it shared the header row. w-full + max-w-full
+          pins the closed control inside the plate; the opened dropdown and
+          the estimate line still show the full text. */}
+      {!controlled && (
+        <select
+          className="mt-1.5 block w-full min-w-0 max-w-full rounded border border-indigo-200 bg-white px-1.5 py-0.5 text-xs"
+          value={gpu}
+          onChange={(e) => setPickedGpu(e.target.value)}
+        >
+          {options.map(([name, t]) => (
+            <option key={name} value={name}>
+              {name} ({formatMoney(t.price_usd_per_hour)}/hr)
+            </option>
+          ))}
+        </select>
+      )}
 
       <div className="mt-1.5 text-indigo-900" title={est?.basis}>
         {loading || !est ? (

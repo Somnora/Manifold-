@@ -22,12 +22,13 @@ description: Run a Python script from <filesystem>/scripts with the filesystem m
 image: python:3.11-slim
 
 # The runner lives in an env var and receives script + args as real
-# positional parameters ($1, $2, $3). This keeps every substituted value at
-# the top level of the command where shlex-quoting is correct — putting them
-# inside a `bash -c '...'` wrapper collides the quotes (proven by the
-# execute-the-real-template test).
+# positional parameters ($1, $2, $3), kept at the top level so shlex-quoting
+# is correct. $RUNNER is referenced INSIDE a single-quoted `bash -c` and run
+# with `eval` so the CONTAINER's shell expands it (eval sees the positional
+# params) — a bare `bash -c "$RUNNER"` is expanded to empty by the instance
+# shell and runs nothing. See DECISIONS.md 2026-07-12 (env-script quoting).
 command: >
-  bash -c "$RUNNER" manifold {{script}} {{args}} {{env_file}}
+  bash -c 'eval "$RUNNER"' manifold {{script}} {{args}} {{env_file}}
 
 parameters:
   - name: script

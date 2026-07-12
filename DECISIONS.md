@@ -1367,3 +1367,136 @@ Implementing sharing on these answers still requires: a compatibility match in
 the dispatcher, an ownership flag + a drain/reference-count so teardown fires
 only after the LAST compatible job, and idle-loop reconciliation for the
 shared case. That is the "more than trivial work" that kept it out of v1.
+
+## 2026-07-12 — Template audit: verify every image against its registry, findings per template
+
+**Context (Phase 25):** whisper-batch failed live — `docker pull
+ghcr.io/speaches-ai/faster-whisper-server:latest-cuda` returned "denied"
+(exit 125), meaning the GPU booted and billed just to discover the image was
+gone. vllm-serve had also failed live (exit -1 AFTER a successful pull).
+James asked for a full audit of all 8 templates and a rewrite of anything
+unverifiable.
+
+**Method:** no docker daemon was available locally, so every image was
+checked against its registry's OCI/Docker v2 HTTP API (manifest GET with
+anonymous token exchange) — which is the stronger check anyway, because it
+verifies exactly what an instance's anonymous `docker pull` sees. For
+vllm-serve, the image's config blob was fetched to read its REAL entrypoint
+rather than guessing from docs.
+
+**Findings, per template (audited 2026-07-12):**
+- axolotl-finetune / `axolotlai/axolotl:main-latest` — EXISTS, kept.
+- gpu-smoke / `nvidia/cuda:12.4.1-base-ubuntu22.04` — EXISTS, kept.
+- llm-synthesize / `python:3.11-slim` — EXISTS; but the template had the
+  env-script expansion bug (next entry): it was a SILENT NO-OP.
+- script-run / `python:3.11-slim` — EXISTS; same silent no-op bug.
+- sdxl-generate / `huggingface/transformers-pytorch-gpu:latest` — EXISTS;
+  script survived but multi-word prompts were split apart (same entry).
+- tao-train / `nvcr.io/nvidia/tao/tao-toolkit:5.5.0-tf2.11.0` — MISSING
+  (nvcr 404). The live tag list shows the 5.5.0 TF2 image is `5.5.0-tf2`;
+  the `-tf2.11.0` naming stopped at 5.0.0. Fixed to `5.5.0-tf2` (verified).
+- vllm-serve / `vllm/vllm-openai:latest` — image EXISTS; the command was
+  wrong. The image config's entrypoint is `["vllm", "serve"]`, and
+  `vllm serve` takes the model as a POSITIONAL argument. The template passed
+  `--model <id>`, which the CLI rejects — hence exit -1 after a good pull.
+  Fixed: model is now positional; `--max-model-len/--port` stay as flags.
+- whisper-batch / `ghcr.io/speaches-ai/faster-whisper-server:latest-cuda` —
+  NOT ANONYMOUSLY PULLABLE (ghcr denied), matching the live failure, and its
+  `python -m scripts.batch_transcribe` entrypoint was never verifiable.
+  REWRITTEN (next-but-one entry).
+
+**Rule going forward:** never reference an image (or an image's internal
+script) that has not been verified against its registry. The backend now
+enforces the image half automatically (preflight entry below).
+
+## 2026-07-12 — Env-script templates: the host shell was eating $PYCODE/$RUNNER
+
+**Found during the audit (worse than the image bugs):** three templates ship
+their program in an env var and run it via the container shell. The rendered
+`docker run ... -e 'PYCODE=...' image python -c "$PYCODE" args` is executed
+by the INSTANCE's shell — where PYCODE is not set. The double-quoted
+`"$PYCODE"` was expanded to empty ON THE HOST, so:
+- llm-synthesize ran `python -c '' ...` — a SILENT NO-OP that exits 0 and
+  reports "succeeded" while synthesizing nothing;
+- script-run ran `bash -c '' ...` — same silent no-op;
+- sdxl-generate kept its script (it was inside single quotes) but had
+  `{{prompt}}` INSIDE those quotes, so a multi-word prompt was word-split
+  into separate argv entries (prompt "a red cat" generated images of "a").
+
+**Fix — one pattern for all env-script templates:**
+    command: bash -c '<script using $VAR and "$@">' argv0 {{param}} {{param}}
+The single quotes stop the host shell from touching `$VAR` (the container
+shell expands it, where the env IS set); parameters stay at the top level
+where the dispatcher's shlex-quoting is correct, and reach the script as
+intact positional args via `"$@"`. script-run uses `eval "$RUNNER"` inside
+the quotes (eval sees the same positional params).
+
+**Enforcement:** tests/test_template_quoting.py simulates the instance shell
+with a fake `docker` that records its argv, then asserts (a) the `-e VAR=`
+body is present, (b) the container command still contains the LITERAL $VAR
+(host did not expand it), and (c) a multi-word parameter arrives as ONE
+argument. Any regression to the unquoted form fails CI.
+
+**Why the old form looked fine:** the previous script-run comment claimed
+putting params inside `bash -c '...'` "collides the quotes" — true — but the
+"fix" moved the VAR reference outside the single quotes, which is exactly
+what handed it to the host shell. The empirical fake-docker simulation is
+what caught it; eyeballing quoting did not.
+
+## 2026-07-12 — whisper-batch rewritten: verified base + a transcriber Manifold owns
+
+**Decided:** whisper-batch now runs on
+`pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime` (manifest verified; cuDNN 9
+is what CTranslate2, faster-whisper's backend, needs on CUDA 12), does
+`pip install faster-whisper` at container start (~30s), and runs a ~65-line
+transcriber script that LIVES IN THE TEMPLATE (PYCODE env), not inside a
+third-party image. Same contract as before: reads /data/input, writes
+<name>.srt + <name>.json to /data/output (persistent transcripts/), HF cache
+on persistent storage, per-file failures logged but never fatal, exits
+nonzero if nothing transcribed.
+
+**Alternatives:** another prebuilt whisper image (same third-party risk that
+just burned us — the speaches image vanished/went private under ghcr);
+building and hosting our own image (infrastructure Manifold does not have);
+WhisperX (heavier deps for no requirement).
+
+**Why:** the base image is an official, verifiable artifact; the script is
+in-repo where it can be reviewed, tested (its syntax is ast-checked in CI
+via the quoting test loading the template) and fixed without waiting on
+anyone's registry. The ~30s pip install per run is the explicit price of
+owning the moving part; pin a custom image later if whisper becomes hot.
+
+## 2026-07-12 — Image preflight: never boot a GPU to discover a missing image
+
+**Decided:** before an auto-managed job launches (and before ANY job is
+dispatched), the backend verifies the template's image manifest exists in
+its registry (`app/image_checker.py`, Registry v2 API with anonymous token
+exchange — exactly what the instance's anonymous `docker pull` does). A
+definitively-missing image (404, or 403/denied where registries hide
+missing-vs-private) fails the job immediately as
+"image not found: <image>" with ZERO launches; the manual path fails it
+before any docker command reaches the instance, audited as
+`task_image_missing`.
+
+**Fail-open on anything undetermined** (network blip, a registry that will
+not answer anonymous existence queries): the job proceeds and, worst case,
+dies at docker pull on the instance — exactly the pre-preflight behavior, no
+worse. A flaky checker must never become a wall in front of every launch.
+Known limit: ghcr.io returns the same opaque denial for missing and private
+repos AND refuses anonymous token exchange for nonexistent ones, so ghcr
+images are usually "undetermined" (fail-open). docker.io and nvcr.io — every
+image the templates use today — give definitive answers. Results are cached
+5 minutes per image.
+
+**Wiring:** mock mode injects MockImageChecker (offline, approves everything,
+overridable per test); production wiring gets RealImageChecker; a test
+harness that injects a lambda_client without a checker gets preflight OFF so
+the suite can never touch the network by accident.
+
+**Also fixed while wiring:** a dispatch-time failure (missing image, bad
+parameters) finishes an auto-managed job's task WITHOUT it ever reaching
+'running'. The lifecycle previously idled at 'ready' waiting for dispatch —
+leaving the launched box up forever, and the idle loop deliberately skips
+auto-owned instances. 'ready' now runs the same settled-check as 'running',
+so the lifecycle still syncs and terminates the box (test:
+test_auto_job_torn_down_after_dispatch_time_failure).

@@ -11,9 +11,13 @@ name: sdxl-generate
 description: Generate images from a prompt with SDXL (diffusers)
 image: huggingface/transformers-pytorch-gpu:latest
 
+# Params go OUTSIDE the single quotes as positional args (reached via "$@"),
+# so a multi-word prompt is not split apart. Inside the quotes the host
+# shell leaves $PYCODE literal for the container to expand. See DECISIONS.md
+# 2026-07-12 (env-script quoting).
 command: >
   bash -c 'pip install -q diffusers accelerate safetensors &&
-  exec python -c "$PYCODE" {{prompt}} {{count}} {{steps}} {{run_name}}'
+  exec python -c "$PYCODE" "$@"' manifold {{prompt}} {{count}} {{steps}} {{run_name}}
 
 parameters:
   - name: prompt
