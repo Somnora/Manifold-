@@ -10,7 +10,7 @@
   </defs>
   <rect width="1024" height="1024" rx="224" fill="url(#tile)"/>
   <rect width="1024" height="1024" rx="224" fill="url(#glow)"/>
-  <g transform="translate(121.80 128.00) scale(12)">
-    <g transform="translate(8.500 52.0) scale(0.02679 -0.02679)"><path d="M86 1493H438L616 838L793 1493H1147V0H893V1196L735 543H500L340 1196V0H86Z" fill="#2dd4bf"/></g><rect x="44.23" y="9.0" width="10.0" height="46.0" fill="#2dd4bf"/>
+  <g transform="translate(128.00 128.00) scale(12)">
+    <g transform="translate(6.483 52.0) scale(0.02679 -0.02679)"><path d="M86 1493H438L616 838L793 1493H1147V0H893V1196L735 543H500L340 1196V0H86Z" fill="#2dd4bf"/></g><rect x="42.21" y="9.0" width="13.0" height="46.0" fill="#2dd4bf"/>
   </g>
 </svg>
