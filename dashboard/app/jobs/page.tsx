@@ -45,7 +45,7 @@ export default function JobsPage() {
   const [templateErrors, setTemplateErrors] = useState<Record<string, string>>({});
   const [presets, setPresets] = useState<ModelPreset[]>([]);
   const [selected, setSelected] = useState("");
-  const [seedModelId, setSeedModelId] = useState("");
+  const [seed, setSeed] = useState<{ model_id: string; parameters?: Record<string, unknown> } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [error, setError] = useState("");
@@ -160,7 +160,7 @@ export default function JobsPage() {
               value={selected}
               onChange={(e) => {
                 setSelected(e.target.value);
-                setSeedModelId("");
+                setSeed(null);
               }}
             >
               {templates.map((t) => (
@@ -207,9 +207,9 @@ export default function JobsPage() {
                         key={p.model_id}
                         type="button"
                         title={`${p.model_id} — ${p.note}`}
-                        onClick={() => setSeedModelId(p.model_id)}
+                        onClick={() => setSeed({ model_id: p.model_id, parameters: p.parameters })}
                         className={`rounded border px-2 py-1 text-left text-xs hover:bg-white ${
-                          seedModelId === p.model_id
+                          seed?.model_id === p.model_id
                             ? "border-zinc-900 bg-white"
                             : "border-zinc-300 bg-zinc-50"
                         }`}
@@ -225,12 +225,14 @@ export default function JobsPage() {
               )}
 
               <ParameterForm
-                key={`${template.name}:${seedModelId}`}
+                key={`${template.name}:${seed?.model_id ?? ""}`}
                 template={template}
                 onSubmit={enqueue}
                 submitting={submitting}
                 initialValues={
-                  isVllm && seedModelId ? { model_id: seedModelId } : undefined
+                  isVllm && seed
+                    ? { model_id: seed.model_id, ...seed.parameters }
+                    : undefined
                 }
               />
             </>

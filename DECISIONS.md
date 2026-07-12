@@ -1525,3 +1525,23 @@ token streaming. UI also gained: tool-call progress lines, a vertically
 resizable conversation area (CSS resize-y), and image attach via drag/drop
 or button — sent as OpenAI image_url content parts, which only vision models
 (e.g. Qwen2.5-VL) can read; the panel says so next to pending images.
+
+## 2026-07-12 — Model presets refreshed (July 2026) + tensor_parallel for cluster serves
+
+**Decided:** replaced the Qwen2.5-era preset catalog with current popular
+open-weight models, every repo id verified against the HF API on 2026-07-12
+(exists, gated=False, so vllm-openai pulls with no token): Qwen3-4B/8B/14B,
+openai/gpt-oss-20b/120b, Qwen3.6-27B (+FP8), Qwen3.6-35B-A3B-FP8,
+tencent/Hy3-FP8, zai-org/GLM-5.2-FP8. Tiers map to Lambda's actual GPUs:
+A10 24GB, A100 40GB, H100 80GB, 8x H100 (640GB), 8x B200 (1.4TB).
+
+**Sizing corrections vs the request:** Qwen3.6 does fit a single H100
+(27B bf16) and even an A100 40GB (27B-FP8) — as asked. But Hy3 is a 295B
+MoE: it does NOT fit one H100; the FP8 checkpoint (~300GB) needs the 8x H100
+cluster. GLM-5.2 is 744B (~750GB FP8): not one B200, the 8x B200 cluster.
+Presets say so in their tier/notes rather than offering a serve that OOMs.
+
+**Enabler:** vllm-serve gained a `tensor_parallel` parameter (default 1 —
+existing single-GPU serves unchanged) appended as --tensor-parallel-size;
+cluster presets carry {"tensor_parallel": 8} and the Jobs page seeds a
+preset's extra parameters into the form alongside the model id.
