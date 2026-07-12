@@ -1240,3 +1240,130 @@ skewed by stuck runs. (3) A single confidence-free number — rejected, it
 would present a 1-run guess and a 20-run median as equally trustworthy. (4)
 Auto-selecting the smaller GPU — rejected outright per the brief: recommend,
 never override.
+
+## 2026-07-12 — Queue-then-launch (auto-manage): v1 is sequential, sharing deferred
+
+**Context (Prompt B):** let a user queue a job with NO instance running and
+have Manifold own the whole lifecycle: wait for a slot, launch, run, sync
+outputs, terminate. The zero-waste headline: a GPU exists only while there is
+work for it.
+
+**Decided:** ship v1 as a **sequential per-job lifecycle**, and defer
+instance *sharing* (reusing one box across several compatible jobs) to a
+follow-up. Each auto-managed job drives its own instance through:
+
+    waiting -> launching -> ready -> running -> syncing -> terminating -> done
+
+At most one auto-managed job holds the single-instance slot at a time; the
+next waits its turn. A new dispatcher loop (`_auto_manage_loop`) advances one
+job per tick and is **stateless across ticks** (it reads the job's lifecycle
+from SQLite), so a backend restart resumes wherever the job left off.
+
+**No guard is duplicated or bypassed — the queued path calls the SAME
+functions the dashboard does.** Concretely:
+- launch = `orchestrator.request_launch(...)` (budget, concurrency,
+  region-filesystem match, capacity retry all apply, unchanged);
+- dispatch = the existing `_task_loop` / `_run_task` (the job binds to its own
+  instance, see below);
+- sync = `orchestrator.sync_ephemeral(...)`;
+- terminate = `orchestrator.terminate(..., force=False)` (the Phase 3 safety
+  hook still runs).
+The lifecycle loop is glue that sequences these; it contains no guard logic.
+
+**Wait-vs-fail without re-deriving the guards.** `LaunchRejected` now carries
+a `reason_code`. On a rejected launch the lifecycle classifies:
+- `concurrency` (the single slot is busy, e.g. a manual instance is up) ->
+  stay in `waiting`, retry next tick. Never fails the job.
+- `budget` / `validation` / `mode` -> can never be admitted -> fail the job
+  with the guard's own message (Gate B: an over-budget job is rejected with a
+  clear reason and NO instance is ever created).
+The classification reads only which check refused; it does not recompute the
+budget or concurrency math (single source of truth stays in the orchestrator).
+
+**Dispatch binding.** The dispatcher previously ran any queued task on the
+first connected instance. That is now `_pick_dispatchable`, which binds:
+- an auto-managed job runs ONLY on the instance its own lifecycle launched,
+  and only once that instance is `ready` (connected);
+- a manual job runs on any connected instance NOT owned by an auto-managed
+  lifecycle.
+So a manual job never lands on a box about to be torn down, and an
+auto-managed job never hijacks a manually launched box. Scanning (not just
+the oldest task) stops a waiting job of one kind from head-of-line-blocking a
+ready job of the other.
+
+**Every state transition is audited** with the job id and (once it exists) the
+instance id: `auto_manage_launching/ready/running/syncing/terminating/done`,
+plus `auto_manage_waiting`, `auto_manage_failed`, `auto_manage_cancelled`,
+`auto_manage_terminate_blocked`.
+
+**Alternatives:** concurrent tasks per instance (already rejected,
+DECISIONS.md 2026-07-11 "One task at a time"); a separate dispatch path for
+auto jobs (would duplicate the well-tested `_run_task`); failing a job the
+moment a slot is busy (wrong: the slot frees, so waiting is correct).
+
+**Why sequential first:** under `max_concurrent_instances = 1` the two
+existing invariants (one instance, one task at a time) already serialize
+everything. Sequential per-job lifecycle drops onto that cleanly and is
+provably safe. Sharing needs a compatibility + drain + ownership model and a
+few semantic calls (below), so it was split out deliberately (James approved
+this split).
+
+## 2026-07-12 — Auto-manage vs idle-termination and keep-alive: the lifecycle owns teardown
+
+**Decided:** an instance an in-flight auto-managed job owns is **exempt from
+the idle loop and the manual keep-alive switch**. `_check_idle` skips every
+instance in `db.auto_managed_instance_ids()` (jobs whose lifecycle is
+launching/ready/running/syncing/terminating), keep-alive or not.
+
+**Why:** the auto-manage lifecycle already owns teardown (sync -> terminate).
+If the idle loop also tried to terminate the box, the two would race during
+the windows where no task is "running" (between `ready` and dispatch, and
+during `syncing`/`terminating`). Skipping owned instances makes the lifecycle
+the single terminator. The idle loop remains the **backstop**: the moment a
+job reaches a terminal lifecycle it drops out of the owned set, so a box that
+somehow outlives its lifecycle still gets reaped by idle. Keep-alive stays a
+manual-instance concept; an ephemeral auto-managed box is not something you
+keep alive.
+
+**Termination blocked = surface, never force (differs from the idle flow).**
+The idle loop, being fully unattended, does sync-then-force. Auto-manage does
+NOT: per the brief, after the intended sync it calls `terminate(force=False)`,
+and if the safety hook still finds unpersisted files it **surfaces the block
+and leaves the box running for review** (audited as
+`auto_manage_terminate_blocked`), exactly like the manual flow. The lifecycle
+loop keeps retrying `force=False`, so the instant the user syncs/clears the
+files (or terminates manually) the job completes on its own. A false
+force-terminate here would be an unattended data-loss path, which is exactly
+what the hook exists to prevent.
+
+## 2026-07-12 — Recorded answers for the instance-SHARING follow-up (pending confirmation)
+
+The sharing optimization (reuse one box across compatible auto-managed jobs,
+terminate after the last) was deferred from v1. James asked to record the
+answers to the three semantic questions here so the follow-up has a spec.
+These are my recommended defaults, consistent with this codebase's
+conservative posture; confirm or amend before building sharing.
+
+- **(a) What is "compatible"?** Byte-identical: same instance_type AND region
+  AND filesystem. It is the only definition that is provably safe without a
+  GPU-substitutability matrix (is an A100 an acceptable stand-in for an A10
+  job? memory, price, and availability all differ). Looser matching can come
+  later; exact-match is the safe first step.
+- **(b) May auto-manage reuse or tear down a MANUALLY launched instance?**
+  No. An auto-managed job only ever reuses or terminates instances its own
+  lifecycle launched (ownership tracked on the launch row). Tearing down a
+  human's box would be surprising and destructive; silently commandeering one
+  blurs ownership. v1 already behaves this way (an auto job waits for a slot
+  rather than touching a manual box).
+- **(c) A compatible job arrives while the box is DRAINING toward teardown —
+  reclaim it?** Yes, but only in the narrow window before `terminate()` is
+  actually in flight: if a compatible job appears while the instance is still
+  up and teardown has not been called, cancel the teardown and reclaim the box
+  (that is the whole efficiency win). Once `terminate()` has been invoked, let
+  it complete and the new job launches fresh, rather than racing an in-flight
+  termination.
+
+Implementing sharing on these answers still requires: a compatibility match in
+the dispatcher, an ownership flag + a drain/reference-count so teardown fires
+only after the LAST compatible job, and idle-loop reconciliation for the
+shared case. That is the "more than trivial work" that kept it out of v1.

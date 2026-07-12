@@ -72,6 +72,14 @@ class LaunchRequest(BaseModel):
 class TaskRequest(BaseModel):
     template: str
     parameters: dict = Field(default_factory=dict)
+    # Auto-manage (Phase 24): when true, Manifold owns the whole instance
+    # lifecycle for this job (launch -> run -> sync -> terminate) using the
+    # GPU/region/filesystem below. When false, the job runs on whatever
+    # instance is already connected, exactly as before.
+    auto_manage: bool = False
+    gpu_type: str | None = None
+    region: str | None = None
+    filesystem: str | None = None
 
 
 class WatchRequest(BaseModel):
@@ -1035,9 +1043,52 @@ def create_app(
             coerce_parameters(template, req.parameters)
         except ParameterError as exc:
             raise HTTPException(422, str(exc))
-        task_id = queue.enqueue(template=req.template, parameters=req.parameters)
-        db.record_audit("api", "task_enqueue", f"{task_id} ({req.template})")
+
+        if req.auto_manage:
+            # Fail fast on a bad GPU/region/filesystem here; the guarded launch
+            # path validates again (and enforces budget/concurrency) when the
+            # lifecycle actually fires.
+            await _validate_auto_manage(req)
+            task_id = queue.enqueue(
+                template=req.template, parameters=req.parameters,
+                auto_manage=True, gpu_type=req.gpu_type, region=req.region,
+                filesystem=req.filesystem)
+            db.record_audit(
+                "api", "task_enqueue_auto",
+                f"{task_id} ({req.template}) auto-manage "
+                f"{req.gpu_type}/{req.region}/{req.filesystem}")
+        else:
+            task_id = queue.enqueue(template=req.template,
+                                    parameters=req.parameters)
+            db.record_audit("api", "task_enqueue", f"{task_id} ({req.template})")
         return {"task": queue.get(task_id)}
+
+    async def _validate_auto_manage(req: "TaskRequest") -> None:
+        if not (req.gpu_type and req.region and req.filesystem):
+            raise HTTPException(
+                422, "auto-manage needs gpu_type, region, and filesystem")
+        types = await lambda_client.list_instance_types()
+        if req.gpu_type not in types:
+            raise HTTPException(400, f"Unknown instance type '{req.gpu_type}'")
+        filesystems = {fs.name: fs for fs in await lambda_client.list_filesystems()}
+        fs = filesystems.get(req.filesystem)
+        if fs is None:
+            raise HTTPException(400, f"Unknown filesystem '{req.filesystem}'")
+        if fs.region != req.region:
+            raise HTTPException(
+                400,
+                f"Region mismatch: filesystem '{req.filesystem}' is in "
+                f"{fs.region}, not {req.region}. Lambda filesystems are "
+                f"region-locked; pick {fs.region}.")
+
+    @app.post("/tasks/{task_id}/cancel")
+    async def cancel_task(task_id: str):
+        """Cancel an auto-managed job that has not started running. Tears down
+        any instance its lifecycle already launched, through the guarded path."""
+        try:
+            return await dispatcher.cancel_auto_managed(task_id)
+        except LaunchRejected as exc:
+            raise HTTPException(exc.status_code, exc.detail)
 
     @app.get("/tasks")
     async def list_tasks():

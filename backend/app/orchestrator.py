@@ -54,12 +54,21 @@ logger = logging.getLogger("manifold.orchestrator")
 
 
 class LaunchRejected(Exception):
-    """A launch request refused before any Lambda API launch call."""
+    """A launch request refused before any Lambda API launch call.
 
-    def __init__(self, status_code: int, detail: str):
+    reason_code labels WHICH check refused, so callers can classify the
+    rejection without re-deriving the guard's math. The auto-manage lifecycle
+    uses it to tell a transient refusal (concurrency: the single slot is busy,
+    wait and retry) from a permanent one (budget/validation/mode: fail the
+    job). Values: "validation" | "mode" | "concurrency" | "budget".
+    """
+
+    def __init__(self, status_code: int, detail: str,
+                 reason_code: str = "validation"):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.reason_code = reason_code
 
 
 class TerminationBlocked(Exception):
@@ -202,6 +211,7 @@ class Orchestrator:
                 f"Concurrency guard: {len(running)} instance(s) already "
                 f"running, limit is {limit}. Terminate one first or raise "
                 f"guardrails.max_concurrent_instances in config.yaml.",
+                reason_code="concurrency",
             )
 
         current_spend = sum(i.hourly_rate_cents for i in running)
@@ -215,6 +225,7 @@ class Orchestrator:
                 f"${(current_spend + price) / 100:.2f}, over the "
                 f"${budget_cents / 100:.2f} limit "
                 f"(guardrails.max_hourly_spend_usd in config.yaml).",
+                reason_code="budget",
             )
 
         # Fallback types must exist and independently fit the budget;
@@ -425,12 +436,14 @@ class Orchestrator:
                 400,
                 f"Unknown connection mode '{mode}'. "
                 f"Valid modes: {', '.join(CONNECTION_MODES)}",
+                reason_code="mode",
             )
         if mode == "tailscale" and not self.settings.tailscale_authkey:
             raise LaunchRejected(
                 400,
                 "Connection mode 'tailscale' is unavailable: TAILSCALE_AUTHKEY "
                 "is not set in .env. Add one or use direct-ssh.",
+                reason_code="mode",
             )
 
     async def _run_launch(self, plan: LaunchPlan) -> None:

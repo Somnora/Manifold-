@@ -16,8 +16,15 @@ from .db import Database, utcnow
 
 class TaskQueue(abc.ABC):
     @abc.abstractmethod
-    def enqueue(self, *, template: str, parameters: dict) -> str:
-        """Add a task; returns its id."""
+    def enqueue(self, *, template: str, parameters: dict,
+                auto_manage: bool = False, gpu_type: str | None = None,
+                region: str | None = None,
+                filesystem: str | None = None) -> str:
+        """Add a task; returns its id.
+
+        When auto_manage is set, the dispatcher owns the instance lifecycle
+        for this job (launch -> run -> sync -> terminate) using the supplied
+        gpu_type/region/filesystem."""
 
     @abc.abstractmethod
     def next_queued(self) -> dict | None:
@@ -56,8 +63,13 @@ class SQLiteTaskQueue(TaskQueue):
     def __init__(self, db: Database):
         self._db = db
 
-    def enqueue(self, *, template: str, parameters: dict) -> str:
-        return self._db.create_task(template=template, parameters=parameters)
+    def enqueue(self, *, template: str, parameters: dict,
+                auto_manage: bool = False, gpu_type: str | None = None,
+                region: str | None = None,
+                filesystem: str | None = None) -> str:
+        return self._db.create_task(
+            template=template, parameters=parameters, auto_manage=auto_manage,
+            gpu_type=gpu_type, region=region, filesystem=filesystem)
 
     def next_queued(self) -> dict | None:
         return self._db.next_queued_task()

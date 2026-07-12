@@ -38,7 +38,7 @@ npm run dev     # then open http://localhost:3000
   - `model_client.py` — `ModelClient` interface: chat with a model served on the instance (vllm-serve) over the same forward pattern
   - `templates.py` — job-template registry; mount rules enforced at load
   - `task_queue.py` — `TaskQueue` interface + SQLite implementation
-  - `dispatcher.py` — task push over SSH, idle auto-termination, capacity watches, GPU telemetry sampling
+  - `dispatcher.py` — task push over SSH, idle auto-termination, capacity watches, GPU telemetry sampling, auto-manage lifecycle (queue-then-launch: launch → run → sync → terminate through the guarded paths)
   - `estimates.py` — pure cost/utilization functions: pre-launch estimate + post-run right-size hint (advisory only, off the launch path)
   - `agent.py` — Autopilot: agent loop driven by a model served on an instance; fixed action allowlist
   - `db.py` — SQLite schema and queries

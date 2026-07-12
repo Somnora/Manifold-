@@ -168,6 +168,18 @@ export type Template = {
   gpu: { min_vram_gib?: number; recommended_types?: string[] };
 };
 
+export type Lifecycle =
+  | "queued"
+  | "waiting"
+  | "launching"
+  | "ready"
+  | "running"
+  | "syncing"
+  | "terminating"
+  | "done"
+  | "failed"
+  | "cancelled";
+
 export type Task = {
   id: string;
   created_at: string;
@@ -180,6 +192,22 @@ export type Task = {
   exit_code: number | null;
   error: string | null;
   output_paths: string[];
+  // Auto-manage (Phase 24): Manifold owns this job's instance lifecycle.
+  auto_manage: boolean;
+  gpu_type: string | null;
+  region: string | null;
+  filesystem: string | null;
+  launch_id: string | null;
+  lifecycle: Lifecycle | null;
+  lifecycle_detail: string | null;
+  lifecycle_events: Record<string, string>;
+  launch_to_ready_seconds: number | null;
+};
+
+export type AutoManageConfig = {
+  gpu_type: string;
+  region: string;
+  filesystem: string;
 };
 
 export type Watch = {
@@ -295,11 +323,24 @@ export const api = {
 
   tasks: () => request<{ tasks: Task[] }>("/tasks").then((r) => r.tasks),
 
-  enqueueTask: (template: string, parameters: Record<string, unknown>) =>
+  enqueueTask: (
+    template: string,
+    parameters: Record<string, unknown>,
+    auto?: AutoManageConfig,
+  ) =>
     request<{ task: Task }>("/tasks", {
       method: "POST",
-      body: JSON.stringify({ template, parameters }),
+      body: JSON.stringify({
+        template,
+        parameters,
+        ...(auto ? { auto_manage: true, ...auto } : {}),
+      }),
     }).then((r) => r.task),
+
+  cancelTask: (taskId: string) =>
+    request<{ cancelled: string }>(`/tasks/${taskId}/cancel`, {
+      method: "POST",
+    }),
 
   taskLogs: (taskId: string, tail?: number) =>
     request<{ lines: { seq: number; at: string; line: string }[] }>(

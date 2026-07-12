@@ -12,6 +12,11 @@ import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import { ParameterForm } from "@/components/ParameterForm";
 import { EstimateWidget } from "@/components/EstimateWidget";
+import {
+  AutoManageControls,
+  type AutoManageState,
+} from "@/components/AutoManageControls";
+import { LifecyclePipeline } from "@/components/LifecyclePipeline";
 import { formatDate } from "@/lib/format";
 
 // Accept a pasted HuggingFace URL or a bare id, and trim stray whitespace /
@@ -23,7 +28,17 @@ function normalizeModelId(raw: string): string {
   return v.replace(/[;,\s/]+$/g, "");
 }
 
-const ACTIVE = new Set(["queued", "running"]);
+// A job is still "active" while its auto-managed lifecycle is in flight, even
+// after the container itself has exited (it is still syncing/terminating).
+const TERMINAL_LIFECYCLE = ["done", "failed", "cancelled"];
+function isActiveJob(t: Task): boolean {
+  if (t.status === "queued" || t.status === "running") return true;
+  return (
+    t.auto_manage &&
+    !!t.lifecycle &&
+    !TERMINAL_LIFECYCLE.includes(t.lifecycle)
+  );
+}
 
 export default function JobsPage() {
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -35,6 +50,12 @@ export default function JobsPage() {
   const [clearing, setClearing] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [auto, setAuto] = useState<AutoManageState>({
+    enabled: false,
+    gpu_type: "",
+    region: "",
+    filesystem: "",
+  });
 
   const { data: tasks, refresh } = usePolling(() => api.tasks(), 2000);
 
@@ -61,8 +82,25 @@ export default function JobsPage() {
       if (isVllm && typeof values.model_id === "string") {
         values = { ...values, model_id: normalizeModelId(values.model_id) };
       }
-      const task = await api.enqueueTask(selected, values);
-      setNotice(`Queued ${task.id} (${task.template})`);
+      const autoConfig =
+        auto.enabled && auto.gpu_type && auto.region && auto.filesystem
+          ? {
+              gpu_type: auto.gpu_type,
+              region: auto.region,
+              filesystem: auto.filesystem,
+            }
+          : undefined;
+      if (auto.enabled && !autoConfig) {
+        setError("Auto-manage needs a GPU, region, and filesystem.");
+        setSubmitting(false);
+        return;
+      }
+      const task = await api.enqueueTask(selected, values, autoConfig);
+      setNotice(
+        autoConfig
+          ? `Queued ${task.id} (${task.template}) — Manifold will rent a ${autoConfig.gpu_type} for it`
+          : `Queued ${task.id} (${task.template})`,
+      );
       refresh();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
@@ -95,8 +133,18 @@ export default function JobsPage() {
     }
   }
 
-  const active = (tasks ?? []).filter((t) => ACTIVE.has(t.status));
-  const history = (tasks ?? []).filter((t) => !ACTIVE.has(t.status));
+  async function cancelTask(id: string) {
+    setError("");
+    try {
+      await api.cancelTask(id);
+      refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
+
+  const active = (tasks ?? []).filter(isActiveJob);
+  const history = (tasks ?? []).filter((t) => !isActiveJob(t));
 
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(360px,460px)_1fr]">
@@ -135,9 +183,18 @@ export default function JobsPage() {
                 ) : null}
               </div>
 
+              {/* Rent a GPU just for this job (launch -> run -> sync ->
+                  terminate), or leave off to run on a connected instance. */}
+              <AutoManageControls value={auto} onChange={setAuto} />
+
               {/* Advisory pre-launch estimate: what a run of this template is
-                  likely to cost. Sharpens as run history accumulates. */}
-              <EstimateWidget template={template.name} />
+                  likely to cost. When auto-manage is on it follows that GPU. */}
+              <EstimateWidget
+                template={template.name}
+                instanceType={
+                  auto.enabled && auto.gpu_type ? auto.gpu_type : undefined
+                }
+              />
 
               {isVllm && presets.length > 0 && (
                 <div className="mb-4 rounded border border-zinc-100 bg-zinc-50 p-2.5">
@@ -195,7 +252,12 @@ export default function JobsPage() {
           </h2>
           <div className="space-y-3">
             {active.map((t) => (
-              <TaskCard key={t.id} task={t} onRemove={removeTask} />
+              <TaskCard
+                key={t.id}
+                task={t}
+                onRemove={removeTask}
+                onCancel={cancelTask}
+              />
             ))}
             {active.length === 0 && (
               <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
@@ -222,7 +284,12 @@ export default function JobsPage() {
           </div>
           <div className="space-y-3">
             {history.map((t) => (
-              <TaskCard key={t.id} task={t} onRemove={removeTask} />
+              <TaskCard
+                key={t.id}
+                task={t}
+                onRemove={removeTask}
+                onCancel={cancelTask}
+              />
             ))}
             {history.length === 0 && (
               <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
@@ -236,16 +303,27 @@ export default function JobsPage() {
   );
 }
 
+const CANCELLABLE = ["queued", "waiting", "launching", "ready"];
+
 function TaskCard({
   task,
   onRemove,
+  onCancel,
 }: {
   task: Task;
   onRemove: (id: string) => void;
+  onCancel: (id: string) => void;
 }) {
   const [showLogs, setShowLogs] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
   const [failTail, setFailTail] = useState<string[] | null>(null);
+
+  const auto = task.auto_manage;
+  const lc = task.lifecycle;
+  // In-flight auto-managed jobs must not be removed (their instance is still
+  // being managed); they can be cancelled instead while pre-run.
+  const inFlightAuto = auto && !!lc && !["done", "failed", "cancelled"].includes(lc);
+  const canCancel = auto && !!lc && CANCELLABLE.includes(lc);
 
   // A failed job must show WHY inline, not just "exit -1": pull the last 10
   // lines of its retained log automatically. The full "Logs" button still
@@ -296,6 +374,14 @@ function TaskCard({
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <StatusBadge status={task.status} />
+          {auto && (
+            <span
+              className="rounded bg-sky-100 px-1.5 py-0.5 text-[11px] font-medium text-sky-800"
+              title="Manifold rents and tears down a GPU just for this job"
+            >
+              auto-manage
+            </span>
+          )}
           <span className="text-sm font-medium">{task.template}</span>
           <span className="font-mono text-xs text-zinc-400">{task.id}</span>
         </div>
@@ -317,7 +403,16 @@ function TaskCard({
           >
             {showLogs ? "Hide logs" : "Logs"}
           </button>
-          {task.status !== "running" && (
+          {canCancel && (
+            <button
+              onClick={() => onCancel(task.id)}
+              title="Cancel and tear down any instance it launched"
+              className="rounded border border-amber-200 px-2 py-0.5 text-amber-700 hover:bg-amber-50"
+            >
+              Cancel
+            </button>
+          )}
+          {task.status !== "running" && !inFlightAuto && (
             <button
               onClick={() => onRemove(task.id)}
               title="Remove from history"
@@ -328,6 +423,8 @@ function TaskCard({
           )}
         </div>
       </div>
+
+      {auto && <LifecyclePipeline task={task} />}
 
       {Object.keys(task.parameters).length > 0 && (
         <p className="mt-1 font-mono text-xs text-zinc-500">

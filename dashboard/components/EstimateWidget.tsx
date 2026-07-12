@@ -7,11 +7,21 @@ import { formatMoney } from "@/lib/format";
 // Pre-launch cost/runtime estimate for a template on a chosen GPU. Advisory:
 // it never changes anything, it just tells you what a run is likely to cost.
 // The estimate sharpens as run history accumulates (measured vs rough).
-export function EstimateWidget({ template }: { template: string }) {
+// When `instanceType` is supplied (auto-manage picks the GPU), the widget
+// follows that choice and hides its own picker so there is one GPU control.
+export function EstimateWidget({
+  template,
+  instanceType,
+}: {
+  template: string;
+  instanceType?: string;
+}) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
-  const [gpu, setGpu] = useState("");
+  const [pickedGpu, setPickedGpu] = useState("");
   const [est, setEst] = useState<Estimate | null>(null);
   const [loading, setLoading] = useState(false);
+  const gpu = instanceType || pickedGpu;
+  const controlled = !!instanceType;
 
   useEffect(() => {
     api
@@ -21,9 +31,8 @@ export function EstimateWidget({ template }: { template: string }) {
         const withCap = Object.entries(t)
           .filter(([, i]) => i.regions_with_capacity.length > 0)
           .sort((a, b) => a[1].price_usd_per_hour - b[1].price_usd_per_hour);
-        setGpu(
-          (v) =>
-            v || withCap[0]?.[0] || Object.keys(t)[0] || "gpu_1x_a10",
+        setPickedGpu(
+          (v) => v || withCap[0]?.[0] || Object.keys(t)[0] || "gpu_1x_a10",
         );
       })
       .catch(() => {});
@@ -56,17 +65,24 @@ export function EstimateWidget({ template }: { template: string }) {
     <div className="rounded border border-indigo-100 bg-indigo-50/50 p-3 text-xs">
       <div className="flex items-center justify-between gap-2">
         <span className="font-medium text-indigo-900">Estimated cost</span>
-        <select
-          className="rounded border border-indigo-200 bg-white px-1.5 py-0.5 text-xs"
-          value={gpu}
-          onChange={(e) => setGpu(e.target.value)}
-        >
-          {options.map(([name, t]) => (
-            <option key={name} value={name}>
-              {name} ({formatMoney(t.price_usd_per_hour)}/hr)
-            </option>
-          ))}
-        </select>
+        {controlled ? (
+          <span className="text-indigo-800">
+            {gpu}
+            {rate != null ? ` (${formatMoney(rate)}/hr)` : ""}
+          </span>
+        ) : (
+          <select
+            className="rounded border border-indigo-200 bg-white px-1.5 py-0.5 text-xs"
+            value={gpu}
+            onChange={(e) => setPickedGpu(e.target.value)}
+          >
+            {options.map(([name, t]) => (
+              <option key={name} value={name}>
+                {name} ({formatMoney(t.price_usd_per_hour)}/hr)
+              </option>
+            ))}
+          </select>
+        )}
       </div>
 
       <div className="mt-1.5 text-indigo-900" title={est?.basis}>
