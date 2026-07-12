@@ -2,9 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { API_BASE } from "@/lib/backend";
 import { usePolling } from "@/lib/usePolling";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 // OpenAI content parts, so vision models can receive images.
 type ContentPart =

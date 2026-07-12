@@ -2,9 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
+import { wsBase } from "@/lib/backend";
 
-const WS_BASE = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000")
-  .replace(/^http/, "ws");
 
 // A real shell on the instance: xterm.js <-> backend WS <-> SSH session on
 // the managed connection. Nothing runs on the instance except sshd; closing
@@ -58,7 +57,7 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
         }
       };
 
-      const ws = new WebSocket(`${WS_BASE}/instances/${instanceId}/terminal`);
+      const ws = new WebSocket(`${wsBase()}/instances/${instanceId}/terminal`);
 
       ws.onopen = () => {
         setStatus("open");

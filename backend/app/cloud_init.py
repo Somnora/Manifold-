@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SIDECAR_PATH = Path(__file__).resolve().parent.parent.parent / "sidecar" / "manifold_sidecar.py"
+from .config import RESOURCE_ROOT
+
+SIDECAR_PATH = RESOURCE_ROOT / "sidecar" / "manifold_sidecar.py"
 
 _TEMPLATE = """#!/bin/bash
 # Manifold cloud-init: Docker + NVIDIA toolkit, sidecar (127.0.0.1 only),

@@ -1,7 +1,7 @@
 // Typed client for the local Manifold backend. The dashboard is a thin
 // consumer: no business logic here, just fetch + types + error surfacing.
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+import { API_BASE } from "./backend";
 
 export class ApiError extends Error {
   status: number;

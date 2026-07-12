@@ -10,6 +10,7 @@ Nothing in this module talks to the network or the database.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,6 +19,37 @@ from dotenv import load_dotenv
 
 # Repo root is one level above backend/.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Desktop packaging splits files by role (see docs/desktop-build.md):
+#
+# RESOURCE_ROOT - read-only assets shipped INSIDE the app: templates/,
+#   sidecar/, and the exported dashboard (ui/). In a PyInstaller bundle this
+#   is the unpack dir (sys._MEIPASS); in development it is the repo root.
+#
+# DATA_ROOT - mutable, user-owned state: .env, config.yaml, manifold.db,
+#   host_keys.json. A packaged app must never write inside its own bundle,
+#   so this goes to the platform's app-data dir. In development it stays
+#   the repo root, so nothing changes for `uv run uvicorn ...`.
+
+_FROZEN = bool(getattr(sys, "frozen", False))
+
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", REPO_ROOT)) if _FROZEN else REPO_ROOT
+
+
+def _default_data_root() -> Path:
+    override = os.environ.get("MANIFOLD_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    if not _FROZEN:
+        return REPO_ROOT
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Manifold"
+    if os.name == "nt":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Manifold"
+    return Path.home() / ".local" / "share" / "manifold"
+
+
+DATA_ROOT = _default_data_root()
 
 
 @dataclass(frozen=True)
@@ -118,7 +150,7 @@ class Settings:
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
     auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
     default_connection_mode: str = "direct-ssh"
-    db_path: str = str(REPO_ROOT / "manifold.db")
+    db_path: str = str(DATA_ROOT / "manifold.db")
 
 
 def update_env_file(path: Path, updates: dict[str, str]) -> None:
@@ -145,11 +177,19 @@ def update_env_file(path: Path, updates: dict[str, str]) -> None:
 def load_settings(
     config_path: Path | None = None, env_path: Path | None = None
 ) -> Settings:
-    """Build Settings from config.yaml + .env at the repo root."""
-    load_dotenv(env_path or REPO_ROOT / ".env")
+    """Build Settings from config.yaml + .env under DATA_ROOT (the repo
+    root in development, the platform app-data dir in the packaged app)."""
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    load_dotenv(env_path or DATA_ROOT / ".env")
 
     raw: dict = {}
-    path = config_path or REPO_ROOT / "config.yaml"
+    path = config_path or DATA_ROOT / "config.yaml"
+    if not path.exists() and _FROZEN:
+        # First run of the packaged app: seed the user's config from the
+        # bundled default so tunables are discoverable and editable.
+        bundled = RESOURCE_ROOT / "config.yaml"
+        if bundled.exists():
+            path.write_text(bundled.read_text())
     if path.exists():
         raw = yaml.safe_load(path.read_text()) or {}
 
@@ -167,7 +207,7 @@ def load_settings(
 
     db_path = database.get("path", "manifold.db")
     if not os.path.isabs(db_path):
-        db_path = str(REPO_ROOT / db_path)
+        db_path = str(DATA_ROOT / db_path)
 
     return Settings(
         lambda_api_key=os.environ.get("LAMBDA_API_KEY", ""),

@@ -44,10 +44,12 @@ npm run dev     # then open http://localhost:3000
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes
   - `mcp_server.py` — MCP stdio bridge; HTTP-only thin client (AST-enforced), run via `uv run manifold-mcp`
+- `backend/desktop.py` — desktop entrypoint (PyInstaller freezes this; serves the exported dashboard at `/`)
+- `desktop/` — Tauri v2 shell (.dmg/.msi): spawns the frozen backend as a sidecar, navigates a native window to it (see docs/desktop-build.md)
 - `backend/tests/` — pytest; everything runs against mocks
 - `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init (metrics, unpersisted/recent files, fs browse/usage/delete)
 - `templates/*.yaml` — job templates (vllm-serve, sglang-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, script-run, llm-synthesize, gpu-smoke)
-- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md)
+- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md, distill-your-own-model.md, desktop-build.md)
 - `config.yaml` — guardrails, retry policy, SSH settings, telemetry sample interval
 - `.env` — secrets only (gitignored; template in `.env.example`)
 - `DECISIONS.md` — every non-obvious choice gets an entry (what/alternatives/why)
