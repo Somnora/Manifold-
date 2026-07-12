@@ -109,6 +109,10 @@ class S3KeysRequest(BaseModel):
     secret_access_key: str = Field(min_length=8)
 
 
+class KeepAliveRequest(BaseModel):
+    enabled: bool
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -422,7 +426,21 @@ def create_app(
 
     @app.get("/instances")
     async def list_instances():
-        return {"instances": await orchestrator.instances_with_state()}
+        instances = await orchestrator.instances_with_state()
+        for inst in instances:
+            # Idle auto-termination countdown + keep-alive switch state, so
+            # the card can warn BEFORE the dispatcher acts (a live instance
+            # vanished mid-test-session with no warning; never again).
+            inst["idle"] = (
+                dispatcher.idle_status(inst["id"])
+                if inst["connection_state"] == "connected" else None
+            )
+        return {"instances": instances}
+
+    @app.post("/instances/{instance_id}/keep-alive")
+    async def set_keep_alive(instance_id: str, req: KeepAliveRequest):
+        """Switch idle auto-termination off (enabled=true) or back on."""
+        return dispatcher.set_keep_alive(instance_id, req.enabled)
 
     @app.delete("/instances/{instance_id}")
     async def terminate_instance(instance_id: str, force: bool = False):

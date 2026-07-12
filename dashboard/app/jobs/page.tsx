@@ -146,6 +146,18 @@ function TaskCard({ task }: { task: Task }) {
           <span className="font-mono text-xs text-zinc-400">{task.id}</span>
         </div>
         <div className="flex items-center gap-3 text-xs text-zinc-500">
+          {task.exit_code !== null &&
+            task.status !== "running" &&
+            task.status !== "queued" && (
+              <span
+                className={`font-mono ${
+                  task.exit_code === 0 ? "text-zinc-400" : "text-red-600"
+                }`}
+                title="Container exit code (the honest signal; see Logs)"
+              >
+                exit {task.exit_code}
+              </span>
+            )}
           <span>{formatDate(task.created_at)}</span>
           <button
             onClick={() => setShowLogs((s) => !s)}

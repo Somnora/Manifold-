@@ -43,7 +43,10 @@ tasks:
 idle:
   # No running job and no terminal activity for this long -> the backend
   # requests termination through the standard flow (safety hook included).
-  timeout_seconds: 300
+  # The instance card shows the countdown and a per-instance "Keep alive"
+  # switch. 300s proved brutal during interactive testing (it terminated
+  # an instance mid-session); 30 minutes is the interactive-friendly default.
+  timeout_seconds: 1800
   poll_seconds: 15
 
 autopilot:

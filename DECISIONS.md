@@ -860,3 +860,41 @@ executes the template's embedded Python for real against a stub OpenAI
 server (JSONL in, structured JSONL out, progress lines checked). The
 sdxl-generate lesson: a template whose script has never executed is a bug
 that ships silently.
+
+## 2026-07-11 — Job exit codes: `set -o pipefail` in the dispatch wrapper
+
+**Decided:** The remote command wrapper (`wrap_remote_command`) sets
+`set -o pipefail` before piping container output through `tee`.
+
+**Alternatives:** Drop the tee (lose the persistent on-instance log copy);
+capture `PIPESTATUS[0]` after the fact (bash-only anyway and more moving
+parts).
+
+**Why:** A pipeline's exit code is the LAST command's. Ours ended in `tee`,
+which always exits 0, so every job reported "succeeded" regardless of what
+the container did. Found at the first real-hardware gate: two vllm-serve
+jobs that crashed in seconds (GGUF repo, unsupported by vLLM) showed green,
+and the llm-synthesize that then had no model to call showed green too.
+Mock SSH always returns exit 0, which is exactly why the tests never caught
+it — so the regression test executes the real wrapper in a real bash
+(`test_wrap_remote_command_propagates_container_exit_code`), same lesson as
+the never-run-template guard.
+
+## 2026-07-11 — Idle auto-termination: 30 min default + per-instance switch
+
+**Decided:** `idle.timeout_seconds` default moves 300 -> 1800. The instance
+card shows the idle countdown, and a per-instance "Keep alive" switch
+(persisted on the launch row, `keep_alive` column) disables idle
+auto-termination entirely until switched back.
+
+**Alternatives:** Keep 300s (cheap but hostile to interactive sessions); a
+global on/off toggle (all-or-nothing loses the cost protection); pausing
+the timer on dashboard polling (would make merely LOOKING at the dashboard
+keep instances alive — too magical).
+
+**Why:** During live testing the 5-minute timeout terminated the instance
+mid-session between two manual steps; the user experienced it as data loss
+("the instance totally disappeared"). Cost protection stays on by default,
+but the user can now SEE the countdown before it acts and opt an instance
+out explicitly. Terminal and job activity still reset the clock; the audit
+log records both the switch and every idle termination.

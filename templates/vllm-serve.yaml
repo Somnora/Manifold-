@@ -2,7 +2,7 @@
 # The port is bound to 127.0.0.1 on the instance by the dispatcher; reach it
 # from your machine through the backend's SSH port forward.
 name: vllm-serve
-description: Serve a model with vLLM (OpenAI-compatible API on a loopback port)
+description: Serve a model with vLLM (OpenAI-compatible API on a loopback port). Use a standard HF Transformers repo (e.g. Qwen/Qwen2.5-7B-Instruct); GGUF quant repos will not load.
 image: vllm/vllm-openai:latest
 
 command: >

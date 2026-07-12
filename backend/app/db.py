@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS launches (
     lambda_instance_id  TEXT,
     launched_at         TEXT,                   -- when Lambda accepted the launch (billing starts)
     active_at           TEXT,                   -- when the instance reached "active"
-    terminated_at       TEXT
+    terminated_at       TEXT,
+    keep_alive          INTEGER NOT NULL DEFAULT 0   -- idle auto-termination switched off
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -113,7 +114,17 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        # Additive migrations for databases created before a column existed
+        # (CREATE TABLE IF NOT EXISTS does not alter existing tables).
+        self._ensure_column("launches", "keep_alive",
+                            "INTEGER NOT NULL DEFAULT 0")
         self._lock = threading.Lock()
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
+        if column not in cols:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -150,7 +161,7 @@ class Database:
         allowed = {
             "status", "attempts", "error", "lambda_instance_id",
             "launched_type", "hourly_rate_cents",
-            "launched_at", "active_at", "terminated_at",
+            "launched_at", "active_at", "terminated_at", "keep_alive",
         }
         unknown = set(fields) - allowed
         if unknown:

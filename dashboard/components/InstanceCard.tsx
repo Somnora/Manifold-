@@ -49,6 +49,16 @@ export function InstanceCard({
     }
   }
 
+  async function toggleKeepAlive() {
+    setError("");
+    try {
+      await api.setKeepAlive(instance.id, !instance.idle?.keep_alive);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
+
   async function syncThenTerminate() {
     setBusy("syncing");
     setError("");
@@ -178,6 +188,45 @@ export function InstanceCard({
           </dd>
         </div>
       </dl>
+
+      {instance.idle && instance.connection_state === "connected" && (
+        <div className="mt-2 flex items-center gap-2 text-xs">
+          {instance.idle.keep_alive ? (
+            <span className="text-emerald-700">
+              Idle auto-termination is off; this instance runs until you
+              terminate it.
+            </span>
+          ) : (
+            <span
+              className={
+                instance.idle.timeout_seconds - instance.idle.idle_seconds <
+                300
+                  ? "font-medium text-amber-700"
+                  : "text-zinc-500"
+              }
+            >
+              Idle {Math.floor(instance.idle.idle_seconds / 60)}m; auto
+              terminates after{" "}
+              {Math.round(instance.idle.timeout_seconds / 60)}m idle (
+              {Math.max(
+                0,
+                Math.ceil(
+                  (instance.idle.timeout_seconds -
+                    instance.idle.idle_seconds) /
+                    60,
+                ),
+              )}
+              m left)
+            </span>
+          )}
+          <button
+            onClick={toggleKeepAlive}
+            className="rounded border border-zinc-300 px-2 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
+          >
+            {instance.idle.keep_alive ? "Resume auto-off" : "Keep alive"}
+          </button>
+        </div>
+      )}
 
       {instance.connection_state === "connected" && (
         <TelemetryChart instanceId={instance.id} />
