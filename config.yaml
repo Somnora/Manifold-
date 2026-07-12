@@ -72,5 +72,12 @@ watches:
   # If false, a watch marked auto_launch only notifies; it never launches.
   auto_launch_enabled: false
 
+telemetry:
+  # How often the dispatcher records one GPU telemetry sample per connected
+  # instance (peak VRAM, avg util). Backs the post-run utilization verdict
+  # and right-size hint on the History page. Advisory only; reads the
+  # sidecar over the existing managed connection, never the launch path.
+  sample_seconds: 30
+
 database:
   path: manifold.db

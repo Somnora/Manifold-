@@ -194,6 +194,30 @@ export type Watch = {
   triggered_at: string | null;
 };
 
+export type Estimate = {
+  template: string;
+  instance_type: string;
+  minutes: number | null;
+  cost_usd: number | null;
+  confidence: "measured" | "rough" | "none";
+  basis: string;
+  sample_size: number;
+};
+
+export type Utilization = {
+  available: boolean;
+  reason?: string;
+  gpu_description?: string;
+  runtime_seconds?: number | null;
+  peak_vram_used_mib?: number;
+  vram_total_mib?: number;
+  avg_util_pct?: number;
+  sample_count?: number;
+  right_size_hint?: boolean;
+  verdict?: string;
+  hint?: string;
+};
+
 export type AgentRun = {
   id: string;
   created_at: string;
@@ -292,6 +316,15 @@ export const api = {
     request<{ presets: ModelPreset[] }>("/model-presets").then(
       (r) => r.presets,
     ),
+
+  estimate: (template: string, instanceType: string) =>
+    request<Estimate>(
+      `/estimate?template=${encodeURIComponent(template)}` +
+        `&instance_type=${encodeURIComponent(instanceType)}`,
+    ),
+
+  launchUtilization: (launchId: string) =>
+    request<Utilization>(`/launches/${launchId}/utilization`),
 
   settingsStatus: () =>
     request<{

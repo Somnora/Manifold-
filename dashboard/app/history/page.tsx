@@ -1,6 +1,7 @@
 "use client";
 
-import { api } from "@/lib/api";
+import { useState } from "react";
+import { api, type Launch, type Utilization } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import {
@@ -12,7 +13,8 @@ import {
 
 // Launch history straight from SQLite, with cost = rate x billable runtime.
 // Billing runs from launch acceptance to termination; running launches show
-// a live, still-growing cost.
+// a live, still-growing cost. Each row expands to a post-run utilization
+// verdict (peak VRAM, avg util) with an advisory right-size hint.
 export default function HistoryPage() {
   const { data: launches, error } = usePolling(() => api.launches(), 5000);
 
@@ -46,48 +48,9 @@ export default function HistoryPage() {
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100">
-            {rows.map((l) => {
-              const cost = launchCost(l);
-              const fellBack =
-                l.launched_type && l.launched_type !== l.requested_type;
-              return (
-                <tr key={l.id} title={l.error ?? undefined}>
-                  <td className="px-4 py-2 whitespace-nowrap text-zinc-600">
-                    {formatDate(l.created_at)}
-                  </td>
-                  <td className="px-4 py-2">
-                    {l.requested_type}
-                    {fellBack && (
-                      <span className="text-zinc-500">
-                        {" "}
-                        (launched {l.launched_type})
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-4 py-2 text-zinc-600">{l.region}</td>
-                  <td className="px-4 py-2 text-zinc-600">
-                    {l.connection_mode}
-                  </td>
-                  <td className="px-4 py-2">
-                    <StatusBadge status={l.status} />
-                  </td>
-                  <td className="px-4 py-2 text-right text-zinc-600">
-                    {l.attempts}
-                  </td>
-                  <td className="px-4 py-2 text-right text-zinc-600">
-                    {l.hourly_rate_cents != null
-                      ? `${formatMoney(l.hourly_rate_cents / 100)}/hr`
-                      : "-"}
-                  </td>
-                  <td className="px-4 py-2 text-right text-zinc-600">
-                    {cost ? formatDuration(cost.seconds) : "-"}
-                  </td>
-                  <td className="px-4 py-2 text-right font-medium">
-                    {cost ? formatMoney(cost.usd) : "-"}
-                  </td>
-                </tr>
-              );
-            })}
+            {rows.map((l) => (
+              <LaunchRow key={l.id} launch={l} />
+            ))}
             {rows.length === 0 && (
               <tr>
                 <td
@@ -104,6 +67,117 @@ export default function HistoryPage() {
 
       <p className="text-right text-sm text-zinc-600">
         Total spend shown: <span className="font-medium">{formatMoney(totalUsd)}</span>
+      </p>
+    </div>
+  );
+}
+
+function LaunchRow({ launch: l }: { launch: Launch }) {
+  const [open, setOpen] = useState(false);
+  const [util, setUtil] = useState<Utilization | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const cost = launchCost(l);
+  const fellBack = l.launched_type && l.launched_type !== l.requested_type;
+
+  function toggle() {
+    const next = !open;
+    setOpen(next);
+    // Fetch once, on first expand. Utilization only exists once a launch has
+    // recorded telemetry samples, so this is cheap and idempotent.
+    if (next && util === null && !loading) {
+      setLoading(true);
+      api
+        .launchUtilization(l.id)
+        .then(setUtil)
+        .catch(() => setUtil({ available: false, reason: "unavailable" }))
+        .finally(() => setLoading(false));
+    }
+  }
+
+  return (
+    <>
+      <tr
+        onClick={toggle}
+        title={l.error ?? "Click for utilization"}
+        className="cursor-pointer hover:bg-zinc-50"
+      >
+        <td className="px-4 py-2 whitespace-nowrap text-zinc-600">
+          <span className="mr-1.5 inline-block w-2 text-zinc-400">
+            {open ? "▾" : "▸"}
+          </span>
+          {formatDate(l.created_at)}
+        </td>
+        <td className="px-4 py-2">
+          {l.requested_type}
+          {fellBack && (
+            <span className="text-zinc-500"> (launched {l.launched_type})</span>
+          )}
+        </td>
+        <td className="px-4 py-2 text-zinc-600">{l.region}</td>
+        <td className="px-4 py-2 text-zinc-600">{l.connection_mode}</td>
+        <td className="px-4 py-2">
+          <StatusBadge status={l.status} />
+        </td>
+        <td className="px-4 py-2 text-right text-zinc-600">{l.attempts}</td>
+        <td className="px-4 py-2 text-right text-zinc-600">
+          {l.hourly_rate_cents != null
+            ? `${formatMoney(l.hourly_rate_cents / 100)}/hr`
+            : "-"}
+        </td>
+        <td className="px-4 py-2 text-right text-zinc-600">
+          {cost ? formatDuration(cost.seconds) : "-"}
+        </td>
+        <td className="px-4 py-2 text-right font-medium">
+          {cost ? formatMoney(cost.usd) : "-"}
+        </td>
+      </tr>
+      {open && (
+        <tr className="bg-zinc-50/60">
+          <td colSpan={9} className="px-4 py-3">
+            <UtilizationDetail loading={loading} util={util} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function UtilizationDetail({
+  loading,
+  util,
+}: {
+  loading: boolean;
+  util: Utilization | null;
+}) {
+  if (loading || util === null) {
+    return <p className="text-xs text-zinc-400">Loading utilization…</p>;
+  }
+  if (!util.available) {
+    return (
+      <p className="text-xs text-zinc-500">
+        No GPU telemetry recorded for this launch.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-1.5 text-xs">
+      <p className="font-medium text-zinc-700">{util.verdict}</p>
+      {util.hint && (
+        <p
+          className={
+            util.right_size_hint
+              ? "rounded bg-amber-50 px-2 py-1 text-amber-800"
+              : "text-zinc-500"
+          }
+        >
+          {util.right_size_hint ? "Right-size hint: " : ""}
+          {util.hint}
+        </p>
+      )}
+      <p className="text-[11px] text-zinc-400">
+        Advisory only, from {util.sample_count} telemetry sample(s). Manifold
+        never changes your GPU choice.
       </p>
     </div>
   );
