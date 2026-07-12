@@ -34,6 +34,10 @@ from .lambda_api import InstanceInfo
 
 CONNECTION_MODES = ("direct-ssh", "tailscale")
 
+# Sentinel for ManagedConnection.run(timeout=...): "use the configured
+# default". Distinct from None, which means "no timeout, wait forever".
+_USE_DEFAULT_TIMEOUT = object()
+
 
 class ConnectionState(str, enum.Enum):
     CONNECTING = "connecting"
@@ -171,6 +175,10 @@ class ManagedConnection:
                     if pinned else None
                 ),
                 connect_timeout=self._ssh.connect_timeout_seconds,
+                # Detect a silently-dead link in ~45s (3 x 15s) so the
+                # supervisor reconnects, instead of the OS taking ~15 min.
+                keepalive_interval=self._ssh.keepalive_interval_seconds,
+                keepalive_count_max=self._ssh.keepalive_count_max,
             )
         except asyncssh.HostKeyNotVerifiable as exc:
             raise ConnectionError(
@@ -231,17 +239,35 @@ class ManagedConnection:
             return None
         return self._conn
 
-    async def run(self, command: str) -> tuple[int, str, str]:
+    async def run(self, command: str, *,
+                  timeout: float | None = _USE_DEFAULT_TIMEOUT
+                  ) -> tuple[int, str, str]:
         """Run a command over the managed connection.
 
         Returns (exit_status, stdout, stderr). Raises ConnectionError when
-        the connection is not currently up — callers decide how to react.
+        the connection is not up, OR when the command exceeds `timeout`
+        seconds (default: ssh.command_timeout_seconds; pass None to wait
+        indefinitely — job dispatch streams for hours and does so). A
+        timeout fails only THIS command; the supervised connection stays up,
+        and a genuinely dead link is caught separately by keepalive.
         """
         if self.state != ConnectionState.CONNECTED or self._conn is None:
             raise ConnectionError(
                 f"no SSH connection to {self.host} (state: {self.state.value})"
             )
-        result = await self._conn.run(command)
+        if timeout is _USE_DEFAULT_TIMEOUT:
+            timeout = self._ssh.command_timeout_seconds
+        try:
+            if timeout:
+                result = await asyncio.wait_for(
+                    self._conn.run(command), timeout)
+            else:
+                result = await self._conn.run(command)
+        except asyncio.TimeoutError:
+            raise ConnectionError(
+                f"command timed out after {timeout:.0f}s on {self.host} "
+                f"(the connection or a remote mount may be stalled)"
+            )
         return result.exit_status, result.stdout or "", result.stderr or ""
 
     async def sftp_write(self, remote_path: str, chunks) -> int:

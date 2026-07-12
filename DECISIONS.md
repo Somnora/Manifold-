@@ -1068,3 +1068,46 @@ to the persistent filesystem via Browse and naming it keeps secrets on the
 instance's NFS, out of git and out of the job record, while the script reads
 them from the environment as usual. Verified by executing the real runner
 with a temp .env and asserting the variable reaches the script.
+
+## 2026-07-11 — Connection reliability: keepalive + per-command timeout
+
+**Decided:** The managed SSH connection sets `keepalive_interval=15s,
+keepalive_count_max=3` (drop a silent link in ~45s), and
+`ManagedConnection.run()` enforces `ssh.command_timeout_seconds` (default
+120s) via `asyncio.wait_for`, with sync/archive passing a longer 600s bound
+and job dispatch passing `timeout=None` (it streams for hours).
+
+**Alternatives:** Rely on the OS TCP timeout (~15 min to notice a dead
+path); no command ceiling (a stalled NFS mount wedges the request until the
+client aborts).
+
+**Why:** Best explanation for "backend errors appearing periodically" in
+live testing. Without keepalive, a silently-dropped TCP path leaves the
+supervisor showing CONNECTED for ~15 min while every sidecar/model/file call
+hangs then 30s-aborts on the dashboard. Keepalive turns that into a ~45s
+detect-and-reconnect. Separately, a command with no ceiling can hang
+forever on a stalled mount; a bounded run fails just that call and leaves
+the supervised connection up (a truly dead link is caught by keepalive, not
+by wedged commands). A timeout raises ConnectionError, which callers already
+handle as "couldn't run it."
+
+## 2026-07-11 — Short-TTL cache on list_instances, with a guard bypass
+
+**Decided:** `SwappableLambdaClient` caches `list_instances` for 2s,
+invalidated on any launch/terminate WE initiate and on credential swap. The
+concurrency/spend guard calls `list_instances(fresh=True)`, which always
+hits the API and refreshes the cache.
+
+**Alternatives:** No cache (every 2s dashboard poll — times N tabs, plus MCP
+and capacity watches — hits Lambda's rate-limited API, a plausible source of
+periodic 429s); cache without a guard bypass (two launches ~1s apart could
+both read a stale "0 running" and both pass, doubling spend under a
+max_concurrent=1 cap).
+
+**Why:** The read path (dashboard view, reconcile) tolerates ≤2s staleness —
+it already polls at that cadence — and invalidation-on-mutation means any
+action taken through Manifold shows up immediately; only out-of-band console
+changes wait out the TTL. The spend guard is the one caller where staleness
+costs money, so it bypasses the cache unconditionally. The bypass is a
+`fresh` kwarg on the LambdaClient interface (ignored by non-caching
+implementations), keeping the guard's data source explicit at the call site.

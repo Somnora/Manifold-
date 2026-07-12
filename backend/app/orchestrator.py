@@ -190,8 +190,11 @@ class Orchestrator:
             )
 
         # Guards run against LIVE state, not our database, so instances
-        # launched outside Manifold still count toward the limits.
-        running = [i for i in await self.client.list_instances() if i.is_running]
+        # launched outside Manifold still count toward the limits. fresh=True
+        # bypasses the list cache: a spend guard must never pass on a stale
+        # snapshot (two quick launches both seeing "0 running").
+        running = [i for i in await self.client.list_instances(fresh=True)
+                   if i.is_running]
         limit = self.settings.guardrails.max_concurrent_instances
         if len(running) + 1 > limit:
             raise LaunchRejected(
@@ -320,8 +323,11 @@ class Orchestrator:
                 409, f"no filesystem recorded for {instance_id}; cannot sync"
             )
         dest = f"/lambda/nfs/{filesystem}/ephemeral-backup/"
+        # rsync of scratch can legitimately move a lot of data; bound it
+        # generously (10 min) rather than at the default command timeout.
         exit_status, stdout, stderr = await conn.run(
-            f"mkdir -p {dest} && rsync -a --info=stats1 /workspace/ephemeral/ {dest}"
+            f"mkdir -p {dest} && rsync -a --info=stats1 /workspace/ephemeral/ {dest}",
+            timeout=600,
         )
         if exit_status != 0:
             raise LaunchRejected(

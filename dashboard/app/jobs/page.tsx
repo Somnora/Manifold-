@@ -240,9 +240,11 @@ function TaskCard({
   useEffect(() => {
     if (!showLogs) return;
     let cancelled = false;
+    // Tail the last 400 lines: a served-model job emits tens of thousands,
+    // and this refetches every 1.5s while running.
     const load = () =>
       api
-        .taskLogs(task.id)
+        .taskLogs(task.id, 400)
         .then((l) => {
           if (!cancelled) setLines(l.map((x) => x.line));
         })
