@@ -58,6 +58,29 @@ open http://127.0.0.1:8000.
 (windows-2022/x64) on every `v*` tag or manual dispatch, and uploads them
 as artifacts.
 
+## Sharing a build: GitHub Releases, not the git tree
+
+Never commit a `.dmg`/`.msi` into the repo - git isn't built for binary
+diffs, and every clone would carry that weight forever. Push a version tag
+and CI attaches both installers to a **GitHub Release** instead: a stable
+link at `https://github.com/<org>/<repo>/releases/latest` that anyone can
+open and download from, no GitHub login required (unlike the 90-day
+build-artifact uploads above, which do require one).
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That's it - the `release` job in the workflow waits for both platform
+builds, then publishes them together as one release. Share the
+`/releases/latest` URL (it always resolves to the newest tag) or the
+specific `/releases/tag/v0.1.0` link.
+
+Since the repo is public and the bundles are unsigned (below), anyone
+downloading will see a Gatekeeper/SmartScreen warning - the release notes
+say so.
+
 ## Signing - the honest part
 
 The bundles are **unsigned** until accounts exist:
