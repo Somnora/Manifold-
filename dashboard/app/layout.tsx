@@ -30,9 +30,28 @@ export default function RootLayout({
       <body className="min-h-screen bg-zinc-50 text-zinc-900 antialiased">
         <header className="sticky top-0 z-40 border-b border-zinc-200 bg-zinc-50/80 backdrop-blur">
           <div className="mx-auto flex max-w-6xl items-center gap-8 px-6 py-3">
-            <span className="flex items-baseline gap-0.5 font-mono text-sm font-semibold tracking-tight">
-              manifold
-              <span className="cursor-blink text-teal-400">▌</span>
+            <span className="flex items-center gap-2">
+              {/* Monogram: the heavy mono M, drawn as vector (no font
+                  dependency) - the same mark as the favicon and app icon. */}
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 64 64"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 52 V13 L32 34 L44 13 V52"
+                  stroke="#2dd4bf"
+                  strokeWidth="9"
+                  strokeLinejoin="miter"
+                  strokeMiterlimit="10"
+                />
+              </svg>
+              <span className="flex items-baseline gap-0.5 font-mono text-sm font-semibold tracking-tight">
+                manifold
+                <span className="cursor-blink text-teal-400">▌</span>
+              </span>
             </span>
             <Nav />
           </div>
