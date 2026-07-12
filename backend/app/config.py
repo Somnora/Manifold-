@@ -82,6 +82,13 @@ class AutopilotSettings:
 
 
 @dataclass(frozen=True)
+class TelemetrySettings:
+    # How often the dispatcher records a GPU telemetry sample per connected
+    # instance. Backs the post-run utilization verdict; advisory only.
+    sample_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class Settings:
     # Secrets (from .env). Empty string means "not configured".
     lambda_api_key: str = ""
@@ -99,6 +106,7 @@ class Settings:
     idle: IdleSettings = field(default_factory=IdleSettings)
     watches: WatchSettings = field(default_factory=WatchSettings)
     autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
+    telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
     default_connection_mode: str = "direct-ssh"
     db_path: str = str(REPO_ROOT / "manifold.db")
 
@@ -144,6 +152,7 @@ def load_settings(
     idle = raw.get("idle", {})
     watches = raw.get("watches", {})
     autopilot = raw.get("autopilot", {})
+    telemetry = raw.get("telemetry", {})
 
     db_path = database.get("path", "manifold.db")
     if not os.path.isabs(db_path):
@@ -183,6 +192,9 @@ def load_settings(
             max_steps_cap=int(autopilot.get("max_steps_cap", 50)),
             wait_cap_seconds=float(autopilot.get("wait_cap_seconds", 120)),
             chat_timeout_seconds=float(autopilot.get("chat_timeout_seconds", 300)),
+        ),
+        telemetry=TelemetrySettings(
+            sample_seconds=float(telemetry.get("sample_seconds", 30)),
         ),
         ssh=SSHSettings(
             key_name=str(ssh.get("key_name", "")),

@@ -1177,3 +1177,66 @@ row with a time range, so N restarts read as "reconnect_on_startup ×N,
 9:34–9:42", and (2) a note in CLAUDE.md that `--reload` restarts are
 expected during development. Behavior unchanged; only the display and the
 docs.
+
+## 2026-07-11 — Cost estimation + right-size hint: median history, VRAM-keyed threshold
+
+**Context (Prompt C):** show a pre-launch cost/runtime estimate for a job,
+and a post-run utilization verdict with an optional "you could use a smaller
+GPU" hint. Everything here is presentational and advisory: it reads existing
+SQLite (launches, tasks) plus a new lightweight telemetry table, and never
+touches the launch/termination path. It recommends; it never overrides a GPU
+choice.
+
+**Estimate — median of same template + same GPU type.** `estimate_job`
+(estimates.py, a pure function) takes the durations of past *succeeded* runs
+of this template on this instance type and reports the **median** minutes,
+priced at the type's hourly rate (`minutes/60 * rate`).
+
+- Median, not mean: run times are right-skewed (one stuck run at 4x the
+  norm shouldn't drag the estimate up). The median is robust to that.
+- Confidence tiers, surfaced in the UI so the number is never oversold:
+  - `>= 3` matching runs -> **measured** (`MEASURED_MIN_RUNS = 3`).
+  - `1-2` runs -> **rough** ("still learning"): real data, but too little
+    to trust as a median.
+  - `0` runs -> **rough**, falling back to a coarse per-template default
+    (`DEFAULT_MINUTES`) explicitly labeled "no history yet".
+  - Server templates (vllm-serve) have no fixed runtime -> **none**: we show
+    "runs until you stop it, $X/hr" instead of a fake total.
+- Timing is *already* persisted (task started_at/finished_at), so estimates
+  sharpen automatically as history accrues. Nothing new to record for this.
+
+**Right-size hint — keyed on PEAK VRAM, not average utilization.** The single
+most important safety property: **a false "downsize" that OOMs the next run
+destroys trust**, so the hint is deliberately hard to trigger.
+
+- We key on **peak VRAM used / total VRAM**, because VRAM is what actually
+  OOMs a job. Average SM utilization can look low on a memory-bound job that
+  still needs every GB, so utilization is *shown* but never gates the hint.
+- Threshold `RIGHT_SIZE_VRAM_FRACTION = 0.45`: the hint fires only if peak
+  VRAM stayed at or below 45% of the card. Rationale: at <=45% peak, the job
+  fits with room to spare on a card roughly half the size, so a smaller tier
+  is genuinely plausible. A **gray zone** of 0.45-0.65 says "some headroom"
+  but makes **no** downsize call, because a run peaking near 60% could exceed
+  a half-size card once inputs grow. Above 0.65 the card was well used and we
+  say nothing.
+- Minimum evidence `MIN_SAMPLES_FOR_HINT = 5`: with fewer than 5 telemetry
+  samples we refuse to call it ("limited telemetry"). A job could spike VRAM
+  in a window we didn't sample; a handful of readings can't rule that out.
+- The hint always names the observed peak and stays advisory ("you *could*
+  try a smaller GPU"), never an instruction. Manifold does not change the
+  selection.
+
+**Telemetry persistence.** The verdict needs history, and metrics were
+previously live-only. Added a `telemetry_samples` table and a dispatcher
+sampler loop that records one sample per connected instance every
+`telemetry.sample_seconds` (default 30s) by reading the existing sidecar over
+the managed SSH connection. This is additive and off the launch path: no
+guard, launch, or termination logic changed. Nothing new listens on the
+instance (still sidecar-on-loopback only).
+
+**Alternatives considered:** (1) gate the hint on average utilization —
+rejected, it OOMs memory-bound jobs. (2) Mean instead of median — rejected,
+skewed by stuck runs. (3) A single confidence-free number — rejected, it
+would present a 1-run guess and a 20-run median as equally trustworthy. (4)
+Auto-selecting the smaller GPU — rejected outright per the brief: recommend,
+never override.

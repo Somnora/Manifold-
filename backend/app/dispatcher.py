@@ -205,6 +205,7 @@ class Dispatcher:
             asyncio.create_task(self._task_loop()),
             asyncio.create_task(self._idle_loop()),
             asyncio.create_task(self._watch_loop()),
+            asyncio.create_task(self._telemetry_loop()),
         ]
 
     async def stop(self) -> None:
@@ -487,6 +488,45 @@ class Dispatcher:
                 except (LaunchRejected, TerminationBlocked) as sync_exc:
                     logger.warning("idle sync+terminate failed for %s: %s",
                                    instance_id, sync_exc)
+
+    # -- telemetry sampling loop -------------------------------------------------------
+
+    async def _telemetry_loop(self) -> None:
+        """Record one GPU telemetry sample per connected instance on a slow
+        cadence, so a post-run utilization verdict and right-size hint can be
+        computed from real data. Best-effort and fully off the launch path:
+        a probe failure just skips that tick."""
+        while True:
+            await asyncio.sleep(self.settings.telemetry.sample_seconds)
+            try:
+                await self._sample_telemetry_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("telemetry loop iteration failed")
+
+    async def _sample_telemetry_once(self) -> None:
+        for instance_id, conn in list(self.orchestrator.connections.items()):
+            if conn.state != ConnectionState.CONNECTED:
+                continue
+            sidecar = self.orchestrator.sidecar_for(instance_id)
+            if sidecar is None:
+                continue
+            try:
+                metrics = await sidecar.metrics()
+            except Exception:
+                continue   # sidecar not up yet / transient: skip this tick
+            gpus = metrics.get("gpus") if metrics.get("available") else None
+            if not gpus:
+                continue
+            g = gpus[0]
+            self.db.record_telemetry_sample(
+                instance_id,
+                gpu_name=g.get("name", ""),
+                vram_used_mib=int(g.get("vram_used_mib", 0)),
+                vram_total_mib=int(g.get("vram_total_mib", 0)),
+                util_pct=int(g.get("utilization_pct", 0)),
+            )
 
     # -- capacity watch loop ----------------------------------------------------------
 

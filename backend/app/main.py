@@ -1225,6 +1225,65 @@ def create_app(
             raise HTTPException(404, f"launch {launch_id} not found")
         return launch
 
+    # -- cost/utilization intelligence (read-only; advisory) -----------------------
+
+    @app.get("/estimate")
+    async def estimate_job_route(template: str, instance_type: str):
+        """Pre-launch estimate for `template` on `instance_type`, from this
+        pair's own run history (median) or a coarse default. Advisory."""
+        from .estimates import estimate_job
+        if template not in templates:
+            raise HTTPException(404, f"unknown template '{template}'")
+        durations = db.task_durations(template, instance_type)
+        rate_cents = None
+        try:
+            types = await lambda_client.list_instance_types()
+            info = types.get(instance_type)
+            if info is not None:
+                rate_cents = info.price_cents_per_hour
+        except Exception:
+            rate_cents = None   # unconfigured/unreachable: estimate time only
+        return estimate_job(
+            template, instance_type, durations, rate_cents
+        ).to_dict()
+
+    @app.get("/launches/{launch_id}/utilization")
+    async def launch_utilization(launch_id: str):
+        """Post-run utilization verdict + conservative right-size hint, from
+        telemetry sampled while the instance ran. Advisory only."""
+        from datetime import datetime
+        from .estimates import utilization_summary
+        launch = db.get_launch(launch_id)
+        if launch is None:
+            raise HTTPException(404, f"launch {launch_id} not found")
+        instance_id = launch.get("lambda_instance_id")
+        if not instance_id:
+            return {"available": False,
+                    "reason": "this launch never reached a running instance"}
+        summary = db.telemetry_summary(instance_id)
+
+        runtime_seconds = None
+        start = launch.get("launched_at")
+        end = launch.get("terminated_at") or utcnow()
+        if start:
+            try:
+                runtime_seconds = (
+                    datetime.fromisoformat(end) - datetime.fromisoformat(start)
+                ).total_seconds()
+            except (TypeError, ValueError):
+                runtime_seconds = None
+
+        gpu_desc = summary["gpu_name"] or launch.get("launched_type") or "GPU"
+        util = utilization_summary(
+            gpu_description=gpu_desc,
+            runtime_seconds=runtime_seconds,
+            peak_vram_used_mib=summary["peak_vram_used_mib"],
+            vram_total_mib=summary["vram_total_mib"],
+            avg_util_pct=summary["avg_util_pct"],
+            sample_count=summary["sample_count"],
+        )
+        return {"available": summary["sample_count"] > 0, **util.to_dict()}
+
     # -- filesystems & storage ------------------------------------------------------
 
     @app.get("/filesystems")

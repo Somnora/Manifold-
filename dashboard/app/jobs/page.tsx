@@ -11,6 +11,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import { ParameterForm } from "@/components/ParameterForm";
+import { EstimateWidget } from "@/components/EstimateWidget";
 import { formatDate } from "@/lib/format";
 
 // Accept a pasted HuggingFace URL or a bare id, and trim stray whitespace /
@@ -133,6 +134,10 @@ export default function JobsPage() {
                   </p>
                 ) : null}
               </div>
+
+              {/* Advisory pre-launch estimate: what a run of this template is
+                  likely to cost. Sharpens as run history accumulates. */}
+              <EstimateWidget template={template.name} />
 
               {isVllm && presets.length > 0 && (
                 <div className="mb-4 rounded border border-zinc-100 bg-zinc-50 p-2.5">

@@ -38,7 +38,8 @@ npm run dev     # then open http://localhost:3000
   - `model_client.py` — `ModelClient` interface: chat with a model served on the instance (vllm-serve) over the same forward pattern
   - `templates.py` — job-template registry; mount rules enforced at load
   - `task_queue.py` — `TaskQueue` interface + SQLite implementation
-  - `dispatcher.py` — task push over SSH, idle auto-termination, capacity watches
+  - `dispatcher.py` — task push over SSH, idle auto-termination, capacity watches, GPU telemetry sampling
+  - `estimates.py` — pure cost/utilization functions: pre-launch estimate + post-run right-size hint (advisory only, off the launch path)
   - `agent.py` — Autopilot: agent loop driven by a model served on an instance; fixed action allowlist
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes
@@ -47,7 +48,7 @@ npm run dev     # then open http://localhost:3000
 - `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init (metrics, unpersisted/recent files, fs browse/usage/delete)
 - `templates/*.yaml` — job templates (vllm-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, script-run, llm-synthesize, gpu-smoke)
 - `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md)
-- `config.yaml` — guardrails, retry policy, SSH settings
+- `config.yaml` — guardrails, retry policy, SSH settings, telemetry sample interval
 - `.env` — secrets only (gitignored; template in `.env.example`)
 - `DECISIONS.md` — every non-obvious choice gets an entry (what/alternatives/why)
 

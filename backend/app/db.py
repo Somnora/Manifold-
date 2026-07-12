@@ -101,6 +101,21 @@ CREATE TABLE IF NOT EXISTS watches (
     last_checked    TEXT,
     triggered_at    TEXT                -- when capacity was first seen
 );
+
+-- Periodic GPU telemetry, sampled by the dispatcher while an instance is
+-- connected. Backs the post-run utilization verdict and the right-size hint.
+-- Purely advisory; nothing on the launch path reads or writes this.
+CREATE TABLE IF NOT EXISTS telemetry_samples (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id     TEXT NOT NULL,
+    at              TEXT NOT NULL,
+    gpu_name        TEXT,
+    vram_used_mib   INTEGER,
+    vram_total_mib  INTEGER,
+    util_pct        INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_instance
+    ON telemetry_samples(instance_id);
 """
 
 
@@ -183,6 +198,69 @@ class Database:
             "SELECT * FROM launches ORDER BY created_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- cost/utilization intelligence (read-only; off the launch path) --------
+
+    def task_durations(self, template: str, gpu_type: str) -> list[float]:
+        """Runtimes (seconds) of PAST successful runs of `template` on
+        `gpu_type`, joining each task to the launch it ran on to recover the
+        GPU. Feeds the pre-launch estimate; grows more accurate as history
+        accumulates. Excludes rows without both timestamps."""
+        rows = self._execute(
+            """SELECT t.started_at AS s, t.finished_at AS f
+                 FROM tasks t
+                 JOIN launches l ON t.instance_id = l.lambda_instance_id
+                WHERE t.template = ?
+                  AND l.launched_type = ?
+                  AND t.status = 'succeeded'
+                  AND t.started_at IS NOT NULL
+                  AND t.finished_at IS NOT NULL""",
+            (template, gpu_type),
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                start = datetime.fromisoformat(r["s"])
+                finish = datetime.fromisoformat(r["f"])
+            except (TypeError, ValueError):
+                continue
+            secs = (finish - start).total_seconds()
+            if secs >= 0:
+                out.append(secs)
+        return out
+
+    def record_telemetry_sample(self, instance_id: str, *, gpu_name: str,
+                                vram_used_mib: int, vram_total_mib: int,
+                                util_pct: int) -> None:
+        self._execute(
+            """INSERT INTO telemetry_samples
+                   (instance_id, at, gpu_name, vram_used_mib,
+                    vram_total_mib, util_pct)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (instance_id, utcnow(), gpu_name, vram_used_mib,
+             vram_total_mib, util_pct),
+        )
+
+    def telemetry_summary(self, instance_id: str) -> dict:
+        """Aggregate an instance's samples: sample count, PEAK vram used, the
+        card's total vram, and average utilization. Peak (not average) vram is
+        the OOM-relevant figure the right-size hint keys on."""
+        row = self._execute(
+            """SELECT COUNT(*) AS n,
+                      MAX(vram_used_mib) AS peak_used,
+                      MAX(vram_total_mib) AS total,
+                      AVG(util_pct) AS avg_util,
+                      MAX(gpu_name) AS gpu_name
+                 FROM telemetry_samples WHERE instance_id = ?""",
+            (instance_id,),
+        ).fetchone()
+        return {
+            "sample_count": row["n"] or 0,
+            "peak_vram_used_mib": row["peak_used"] or 0,
+            "vram_total_mib": row["total"] or 0,
+            "avg_util_pct": float(row["avg_util"] or 0.0),
+            "gpu_name": row["gpu_name"] or "",
+        }
 
     def find_launch_by_instance(self, lambda_instance_id: str) -> dict | None:
         row = self._execute(
