@@ -10,16 +10,21 @@
 #                    (use shlex.split(sys.argv[1]) in your script if you
 #                    want word splitting — quoting is the injection guard)
 #
-# If <filesystem>/scripts/requirements.txt exists it is pip-installed first.
+# Preflight: if the named script is not under scripts/, the job fails fast
+# with a clear message instead of a confusing mid-container crash.
+# If <filesystem>/scripts/requirements.txt exists it is pip-installed first,
+# with wheels cached on persistent storage so re-runs do not re-download.
 name: script-run
 description: Run a Python script from <filesystem>/scripts with the filesystem mounted at /data
 image: python:3.11-slim
 
+# The runner lives in an env var and receives script + args as real
+# positional parameters ($1, $2). This keeps every substituted value at the
+# top level of the command where shlex-quoting is correct — putting them
+# inside a `bash -c '...'` wrapper collides the quotes (proven by the
+# execute-the-real-template test).
 command: >
-  bash -c 'cd /data &&
-  if [ -f /data/scripts/requirements.txt ]; then
-  pip install -q -r /data/scripts/requirements.txt; fi &&
-  python /data/scripts/{{script}} {{args}}'
+  bash -c "$RUNNER" manifold {{script}} {{args}}
 
 parameters:
   - name: script
@@ -29,6 +34,20 @@ parameters:
     type: string
     default: ""
     description: Arguments, passed to the script as a single string (argv[1])
+
+env:
+  RUNNER: |
+    set -e
+    s="/data/scripts/$1"
+    if [ ! -f "$s" ]; then
+      echo "manifold: script not found: $s (upload it under scripts/ via Browse first)" >&2
+      exit 2
+    fi
+    cd /data
+    if [ -f /data/scripts/requirements.txt ]; then
+      pip install -q --cache-dir /data/.cache/pip -r /data/scripts/requirements.txt
+    fi
+    python "$s" "$2"
 
 volumes:
   - host: "{persistent}"

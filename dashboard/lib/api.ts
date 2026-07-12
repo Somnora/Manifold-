@@ -74,6 +74,13 @@ export type InstanceTypeInfo = {
 
 export type Region = { code: string; name: string };
 
+export type SidecarDiagnosis = {
+  cause: string;
+  summary: string;
+  port: number;
+  checks: { label: string; command: string; output: string }[];
+};
+
 export type Filesystem = {
   name: string;
   region: string;
@@ -245,6 +252,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ enabled }),
     }),
+
+  diagnoseSidecar: (instanceId: string) =>
+    request<SidecarDiagnosis>(`/instances/${instanceId}/sidecar/diagnose`),
 
   templates: () =>
     request<{ templates: Template[]; errors: Record<string, string> }>(

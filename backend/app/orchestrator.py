@@ -249,6 +249,21 @@ class Orchestrator:
             return None
         return self._sidecar_factory(conn)
 
+    async def diagnose_sidecar(self, instance_id: str) -> dict:
+        """Ask the instance directly why its sidecar is not answering, over
+        the managed SSH connection (which is known-good when we get here)."""
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            raise LaunchRejected(409, f"no managed connection to {instance_id}")
+        if conn.state != ConnectionState.CONNECTED:
+            raise LaunchRejected(
+                409,
+                f"SSH is not connected to {instance_id} "
+                f"(state: {conn.state.value}); cannot probe the instance",
+            )
+        from .diagnostics import diagnose_sidecar as _diagnose
+        return await _diagnose(conn.run)
+
     def model_client_for(self, instance_id: str) -> ModelClient | None:
         conn = self.connections.get(instance_id)
         if conn is None:
