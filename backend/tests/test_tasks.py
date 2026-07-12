@@ -22,6 +22,7 @@ def test_coerce_applies_defaults_and_types():
         "model_id": "meta-llama/Llama-3.1-8B",
         "max_context": 8192,
         "port": 8080,
+        "tensor_parallel": 1,      # single GPU unless a preset says otherwise
     }
     # String numbers are coerced to their declared type.
     params = coerce_parameters(

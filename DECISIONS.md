@@ -1500,3 +1500,48 @@ leaving the launched box up forever, and the idle loop deliberately skips
 auto-owned instances. 'ready' now runs the same settled-check as 'running',
 so the lifecycle still syncs and terminates the box (test:
 test_auto_job_torn_down_after_dispatch_time_failure).
+
+## 2026-07-12 — Chat tools: the served model gets guarded arms
+
+**Context:** the in-dashboard chat relayed text only, so the model (which is
+stateless text-in/text-out) could not see the filesystem or start work —
+James expected "one synergetic system where the instance runs the model and
+the model can talk to the instance and filebase".
+
+**Decided:** the chat endpoint gains a tools mode (`tools: true`, the panel's
+default). The backend runs the loop, Autopilot-style: the model replies with
+one JSON action, the backend executes it through EXISTING guarded paths and
+feeds the observation back; plain text ends the loop as the final answer.
+Tool surface (chat_tools.py): list_files / read_file (sidecar + managed SSH,
+confined to the file-navigator roots, 16 KB head-read cap), list_templates /
+run_job (the same coerce + queue path as everyone else), get_job_status /
+get_job_logs. No shell, no HTTP, no launch/terminate from chat — that stays
+Autopilot's job with its run ledger and step caps. Every tool call is
+audited (actor "chat"). Max 8 tool calls per user message.
+
+**Trade-off:** tools mode answers arrive turn-at-once (the backend must see
+the full reply to detect a tool call); the Tools toggle off restores pure
+token streaming. UI also gained: tool-call progress lines, a vertically
+resizable conversation area (CSS resize-y), and image attach via drag/drop
+or button — sent as OpenAI image_url content parts, which only vision models
+(e.g. Qwen2.5-VL) can read; the panel says so next to pending images.
+
+## 2026-07-12 — Model presets refreshed (July 2026) + tensor_parallel for cluster serves
+
+**Decided:** replaced the Qwen2.5-era preset catalog with current popular
+open-weight models, every repo id verified against the HF API on 2026-07-12
+(exists, gated=False, so vllm-openai pulls with no token): Qwen3-4B/8B/14B,
+openai/gpt-oss-20b/120b, Qwen3.6-27B (+FP8), Qwen3.6-35B-A3B-FP8,
+tencent/Hy3-FP8, zai-org/GLM-5.2-FP8. Tiers map to Lambda's actual GPUs:
+A10 24GB, A100 40GB, H100 80GB, 8x H100 (640GB), 8x B200 (1.4TB).
+
+**Sizing corrections vs the request:** Qwen3.6 does fit a single H100
+(27B bf16) and even an A100 40GB (27B-FP8) — as asked. But Hy3 is a 295B
+MoE: it does NOT fit one H100; the FP8 checkpoint (~300GB) needs the 8x H100
+cluster. GLM-5.2 is 744B (~750GB FP8): not one B200, the 8x B200 cluster.
+Presets say so in their tier/notes rather than offering a serve that OOMs.
+
+**Enabler:** vllm-serve gained a `tensor_parallel` parameter (default 1 —
+existing single-GPU serves unchanged) appended as --tensor-parallel-size;
+cluster presets carry {"tensor_parallel": 8} and the Jobs page seeds a
+preset's extra parameters into the form alongside the model id.

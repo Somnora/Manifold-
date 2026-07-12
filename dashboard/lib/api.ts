@@ -80,6 +80,9 @@ export type ModelPreset = {
   vram_gib: number;
   tier: string;
   note: string;
+  // Extra vllm-serve parameters the preset needs (e.g. tensor_parallel: 8
+  // for models that shard across a whole 8-GPU cluster).
+  parameters?: Record<string, unknown>;
 };
 
 export type SidecarDiagnosis = {

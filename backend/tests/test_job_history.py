@@ -66,7 +66,7 @@ def test_model_presets_are_ungated_and_tiered(client):
     presets = resp.json()["presets"]
     assert len(presets) >= 3
     ids = [p["model_id"] for p in presets]
-    assert "Qwen/Qwen2.5-7B-Instruct" in ids
+    assert "Qwen/Qwen3-8B" in ids            # the A10-tier default
     for p in presets:
         assert {"label", "model_id", "vram_gib", "tier", "note"} <= set(p)
         # Ungated only: no known gated repos slip into the presets.
