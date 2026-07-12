@@ -921,3 +921,48 @@ double-encoded strings, breaks that. Every branch is covered by executing
 the REAL embedded script against a configurable stub vLLM (never-run-guard
 extended to eight cases: happy path, fenced JSON, prose, wait-for-ready,
 retry, malformed input, missing input, no-model-fail-fast).
+
+## 2026-07-11 — script-run: runner in an env var (fixes a quoting collision)
+
+**Decided:** script-run's logic moved into a RUNNER env var invoked as
+`bash -c "$RUNNER" manifold {{script}} {{args}}`, receiving script and args
+as positional params ($1, $2). It also preflights that the script exists
+(fail fast, exit 2, clear message) and caches pip downloads under
+/data/.cache/pip on persistent storage.
+
+**Alternatives:** Keep the inline `bash -c 'cd /data && ... python
+scripts/{{script}} {{args}}'` wrapper.
+
+**Why:** The inline wrapper was a latent bug. render_docker_command
+shlex-quotes each {{param}} for a TOP-LEVEL shell context, but the params
+were substituted INSIDE a single-quoted `bash -c '...'` string — so
+`{{args}}`'s own single quotes collided with the wrapper's, e.g.
+`bash -c '... python ... '--state TX''` fractures the argument. The mock SSH
+only echoes, so no test caught it; the moment a real scraper passed args
+with a space, argv would split wrong. The env-var/positional pattern (the
+same one llm-synthesize already uses for PYCODE) keeps every substituted
+value at the top level where shlex-quoting is correct. Caught by the new
+execute-the-real-runner test, which asserts args-with-spaces arrive as one
+argv[1]. Same never-run-template lesson, now applied to the scrape stage.
+
+## 2026-07-11 — Sidecar diagnosis over the SSH channel
+
+**Decided:** A read-only diagnostic (`app/diagnostics.py`,
+`GET /instances/{id}/sidecar/diagnose`, "Diagnose" button on the telemetry
+panel) probes the instance over the managed SSH connection when the sidecar
+HTTP is silent, and classifies the cause: cloud-init still running,
+cloud-init error, sidecar crashed (with the journal tail), sidecar starting
+(up but not yet listening on 9411), or a transient forward failure (healthy
+on the instance).
+
+**Alternatives:** Leave the dead-end "sidecar not reachable yet" message;
+add more retries to the forward (treats the symptom, not the cause).
+
+**Why:** At the first live gate telemetry showed "not reachable yet" 13
+minutes after boot with no way to tell whether cloud-init, the service, or
+the SSH forward was at fault. The managed SSH connection is known-good when
+this happens (the card shows "connected"), so the instance can be asked
+directly. The probe is pure and injectable — classification is unit-tested
+against canned probe outputs, so the logic is verified without hardware;
+the live session confirms the root cause. Read-only shell only; it opens no
+new listener and rides the one channel already trusted.

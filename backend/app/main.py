@@ -979,6 +979,12 @@ def create_app(
             raise HTTPException(409, f"no managed connection to {instance_id}")
         return await sidecar.recent_files(hours=hours, limit=limit)
 
+    @app.get("/instances/{instance_id}/sidecar/diagnose")
+    async def diagnose_sidecar(instance_id: str):
+        """Why is the sidecar not answering? Probe the instance over the
+        managed SSH connection and return an actionable cause + evidence."""
+        return await orchestrator.diagnose_sidecar(instance_id)
+
     @app.websocket("/instances/{instance_id}/metrics/stream")
     async def instance_metrics_stream(ws: WebSocket, instance_id: str):
         """Relay: sidecar (via SSH forward) -> this WS -> browser chart."""

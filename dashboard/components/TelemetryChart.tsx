@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { api, ApiError, type SidecarDiagnosis } from "@/lib/api";
 
 type GpuSample = {
   name: string;
@@ -26,6 +27,21 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
     "connecting",
   );
   const wsRef = useRef<WebSocket | null>(null);
+  const [diag, setDiag] = useState<SidecarDiagnosis | null>(null);
+  const [diagBusy, setDiagBusy] = useState(false);
+  const [diagErr, setDiagErr] = useState("");
+
+  async function runDiagnose() {
+    setDiagBusy(true);
+    setDiagErr("");
+    try {
+      setDiag(await api.diagnoseSidecar(instanceId));
+    } catch (e) {
+      setDiagErr(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setDiagBusy(false);
+    }
+  }
 
   useEffect(() => {
     let closed = false;
@@ -63,9 +79,39 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
 
   if (state === "unavailable") {
     return (
-      <p className="mt-3 text-xs text-zinc-400">
-        Telemetry unavailable (sidecar not reachable yet).
-      </p>
+      <div className="mt-3 text-xs text-zinc-400">
+        <div className="flex items-center gap-2">
+          <span>Telemetry unavailable (sidecar not reachable yet).</span>
+          <button
+            onClick={runDiagnose}
+            disabled={diagBusy}
+            className="rounded border border-zinc-300 px-2 py-0.5 text-zinc-600 hover:bg-zinc-50 disabled:opacity-50"
+          >
+            {diagBusy ? "Diagnosing..." : "Diagnose"}
+          </button>
+        </div>
+        {diagErr && <p className="mt-2 text-red-600">{diagErr}</p>}
+        {diag && (
+          <div className="mt-2 rounded border border-zinc-200 bg-zinc-50 p-3 text-zinc-700">
+            <p className="font-medium text-zinc-800">
+              {diag.summary}
+            </p>
+            <p className="mt-1 font-mono text-[11px] text-zinc-400">
+              cause: {diag.cause}
+            </p>
+            <div className="mt-2 space-y-2">
+              {diag.checks.map((c) => (
+                <div key={c.label}>
+                  <p className="font-medium text-zinc-600">{c.label}</p>
+                  <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap rounded bg-zinc-950 p-2 text-[11px] leading-relaxed text-zinc-100">
+                    {c.output || "(no output)"}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
     );
   }
 

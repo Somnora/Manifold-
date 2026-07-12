@@ -70,6 +70,60 @@ def test_script_run_renders_quoted_args():
     assert "--network host" not in cmd
 
 
+def test_script_run_caches_pip_on_persistent_storage():
+    """pip downloads cache under /data (persistent NFS) so re-runs and other
+    instances don't re-download the same wheels."""
+    t = TEMPLATES["script-run"]
+    cmd = render_docker_command(
+        t, coerce_parameters(t, {"script": "x.py"}),
+        filesystem="manifold-data", task_id="scr2")
+    assert "--cache-dir /data/.cache/pip" in cmd
+
+
+# -- script-run: execute the REAL runner against a temp filesystem ----------------
+#
+# The runner lives in the RUNNER env var and takes script + args as $1/$2,
+# exactly as the container invokes it. Run it verbatim (with /data pointed at
+# a temp dir) to prove the preflight fires, a present script runs, and args
+# with spaces survive as ONE argv[1] (the quoting bug the mock never caught).
+
+import subprocess
+
+
+def _run_runner(data, script, args):
+    runner = TEMPLATES["script-run"].env["RUNNER"].replace("/data", str(data))
+    return subprocess.run(
+        ["bash", "-c", runner, "manifold", script, args],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_script_run_preflights_missing_script(tmp_path):
+    """A typo'd script name fails fast (exit 2) with a clear message, instead
+    of a confusing crash inside the container — the reported symptom."""
+    data = tmp_path / "data"
+    (data / "scripts").mkdir(parents=True)
+    result = _run_runner(data, "typo.py", "")
+    assert result.returncode == 2
+    assert "script not found" in result.stderr
+    assert "typo.py" in result.stderr
+
+
+def test_script_run_executes_present_script(tmp_path):
+    """A present script runs and receives args-with-spaces as ONE argv[1]."""
+    data = tmp_path / "data"
+    (data / "scripts").mkdir(parents=True)
+    (data / "scripts" / "hello.py").write_text(
+        "import shlex, sys\n"
+        "print('argv1=' + repr(sys.argv[1]))\n"
+        "print('split=' + repr(shlex.split(sys.argv[1])))\n")
+    result = _run_runner(data, "hello.py", "--state TX --cycle 2026")
+    assert result.returncode == 0, result.stderr
+    # The whole args string arrives as a single argv[1], intact.
+    assert "argv1='--state TX --cycle 2026'" in result.stdout
+    assert "split=['--state', 'TX', '--cycle', '2026']" in result.stdout
+
+
 # -- llm-synthesize: execute the REAL embedded script against a stub vLLM ---------
 #
 # These run the template's PYCODE verbatim in a subprocess (the never-run
