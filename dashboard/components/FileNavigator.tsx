@@ -231,8 +231,8 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
       {notice && <p className="px-3 pt-2 text-xs text-emerald-700">{notice}</p>}
       {error && <p className="px-3 pt-2 text-xs text-red-700">{error}</p>}
 
-      {/* listing */}
-      <div className="max-h-96 overflow-y-auto">
+      {/* listing — drag the bottom edge to resize, like the terminal */}
+      <div className="h-96 min-h-40 max-h-[85vh] resize-y overflow-auto">
         {loading && entries.length === 0 ? (
           <p className="p-4 text-center text-xs text-zinc-400">Loading…</p>
         ) : rows.length === 0 ? (

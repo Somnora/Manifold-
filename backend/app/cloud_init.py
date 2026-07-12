@@ -29,6 +29,8 @@ export DEBIAN_FRONTEND=noninteractive
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh
 fi
+# The SSH user runs docker; ensure it can reach the daemon socket.
+usermod -aG docker ubuntu || true
 if ! command -v nvidia-ctk >/dev/null; then
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \\
     | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -37,8 +39,22 @@ if ! command -v nvidia-ctk >/dev/null; then
     > /etc/apt/sources.list.d/nvidia-container-toolkit.list
   apt-get update -qq
   apt-get install -y -qq nvidia-container-toolkit
-  nvidia-ctk runtime configure --runtime=docker
-  systemctl restart docker
+fi
+# Register the NVIDIA runtime with docker on EVERY boot, NOT only when the
+# toolkit was just installed. Lambda images ship the toolkit, so the guard
+# above is skipped and a freshly installed docker is never wired to the
+# runtime — making `docker run --gpus all` fail with an OCI error (exit 126)
+# on every GPU job. This was masked until job exit codes became honest.
+# Idempotent, so safe to run unconditionally.
+nvidia-ctk runtime configure --runtime=docker || echo "manifold: WARNING nvidia-ctk configure failed"
+systemctl restart docker || true
+# Boot-time proof that GPU containers work, recorded in this init log (view
+# it from the in-app Terminal: cat /var/log/manifold-init.log). Also warms
+# the base image gpu-smoke uses.
+if docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi -L; then
+  echo "manifold: docker --gpus all OK"
+else
+  echo "manifold: WARNING docker --gpus all FAILED (GPU jobs will fail)"
 fi
 
 # --- Workspace layout ------------------------------------------------------

@@ -14,17 +14,20 @@
 # with a clear message instead of a confusing mid-container crash.
 # If <filesystem>/scripts/requirements.txt exists it is pip-installed first,
 # with wheels cached on persistent storage so re-runs do not re-download.
+# API keys: upload a .env to the filesystem (e.g. research/.env) via Browse
+# and name it in `env_file`; it is sourced into the environment before your
+# script runs, so keys stay on the instance and never touch git.
 name: script-run
 description: Run a Python script from <filesystem>/scripts with the filesystem mounted at /data
 image: python:3.11-slim
 
 # The runner lives in an env var and receives script + args as real
-# positional parameters ($1, $2). This keeps every substituted value at the
-# top level of the command where shlex-quoting is correct — putting them
+# positional parameters ($1, $2, $3). This keeps every substituted value at
+# the top level of the command where shlex-quoting is correct — putting them
 # inside a `bash -c '...'` wrapper collides the quotes (proven by the
 # execute-the-real-template test).
 command: >
-  bash -c "$RUNNER" manifold {{script}} {{args}}
+  bash -c "$RUNNER" manifold {{script}} {{args}} {{env_file}}
 
 parameters:
   - name: script
@@ -34,6 +37,10 @@ parameters:
     type: string
     default: ""
     description: Arguments, passed to the script as a single string (argv[1])
+  - name: env_file
+    type: string
+    default: ""
+    description: Optional .env on the filesystem (e.g. research/.env), sourced for API keys
 
 env:
   RUNNER: |
@@ -44,6 +51,14 @@ env:
       exit 2
     fi
     cd /data
+    if [ -n "$3" ]; then
+      ef="/data/$3"
+      if [ ! -f "$ef" ]; then
+        echo "manifold: env file not found: $ef (path is relative to the filesystem root)" >&2
+        exit 2
+      fi
+      set -a; . "$ef"; set +a
+    fi
     if [ -f /data/scripts/requirements.txt ]; then
       pip install -q --cache-dir /data/.cache/pip -r /data/scripts/requirements.txt
     fi

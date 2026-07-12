@@ -42,3 +42,34 @@ def test_sidecar_binds_loopback_only():
     ud = build_user_data()
     # Belt-and-suspenders: the embedded sidecar still serves 127.0.0.1 only.
     assert '127.0.0.1", port=9411' in ud
+
+
+def test_nvidia_runtime_configured_unconditionally():
+    """The nvidia-ctk runtime configure + docker restart must run on EVERY
+    boot, not only when the toolkit was just installed — Lambda ships the
+    toolkit, so gating on its absence left `docker run --gpus all` broken
+    (exit 126) on every GPU job."""
+    ud = build_user_data()
+    lines = ud.splitlines()
+
+    def line_index(needle):
+        return next(i for i, l in enumerate(lines) if needle in l)
+
+    # The configure call sits AFTER the nvidia-ctk install block closes, so
+    # it is not gated by `if ! command -v nvidia-ctk`.
+    install_block_end = None
+    in_nvidia_block = False
+    for i, l in enumerate(lines):
+        if "command -v nvidia-ctk" in l:
+            in_nvidia_block = True
+        elif in_nvidia_block and l.strip() == "fi":
+            install_block_end = i
+            break
+    assert install_block_end is not None
+    configure_idx = line_index("nvidia-ctk runtime configure --runtime=docker")
+    assert configure_idx > install_block_end
+
+    # The SSH user can reach docker, and a boot self-test records the verdict.
+    assert "usermod -aG docker ubuntu" in ud
+    assert "docker run --rm --gpus all nvidia/cuda" in ud
+    assert "docker --gpus all OK" in ud

@@ -1030,3 +1030,41 @@ plausible failure modes at once. Cannot be exercised without live spend, so
 the guard is an invariant test: the fastapi install line must start with
 `/usr/bin/python3 -m pip` and never regress to a bare `python3`. The new
 Diagnose button confirms it on the next launch (service active + listening).
+
+## 2026-07-11 — NVIDIA runtime configured every boot (fixes 126 on all jobs)
+
+**Decided:** cloud-init runs `nvidia-ctk runtime configure --runtime=docker`
++ `systemctl restart docker` UNCONDITIONALLY (was gated inside
+`if ! command -v nvidia-ctk`), adds `ubuntu` to the docker group, and runs a
+boot self-test (`docker run --rm --gpus all nvidia/cuda ... nvidia-smi -L`)
+whose verdict lands in /var/log/manifold-init.log.
+
+**Alternatives:** Keep the gate (what shipped); configure the runtime at
+image-build time (we do not build the image).
+
+**Why:** Every job — even the trivial gpu-smoke — failed with exit 126
+("OCI runtime create failed") once exit codes became honest. Root cause: the
+runtime-configure step lived inside the toolkit-install guard, but Lambda
+images SHIP the toolkit, so the guard was skipped and a freshly
+get.docker.com-installed docker was never wired to the NVIDIA runtime;
+`docker run --gpus all` then failed on every GPU job. The pre-pipefail tee
+bug had masked this as "succeeded" since the beginning — GPU jobs never
+actually ran. Configure is idempotent, so running it unconditionally is
+safe; the boot self-test makes the next diagnosis instant (read the init log
+from the in-app Terminal).
+
+## 2026-07-11 — script-run env_file: API keys for scrapers
+
+**Decided:** script-run takes an optional `env_file` param (a path on the
+filesystem, e.g. `research/.env`); the runner sources it (`set -a; . "$ef";
+set +a`) before the script runs, failing fast if the named file is absent.
+
+**Alternatives:** Bake keys into the script (leaks into git); pass keys as
+job parameters (they would show in the audit log and job card); a secrets
+store (over-engineered for a single-user local tool).
+
+**Why:** Research scrapers need API keys (news, FEC, etc.). Uploading a .env
+to the persistent filesystem via Browse and naming it keeps secrets on the
+instance's NFS, out of git and out of the job record, while the script reads
+them from the environment as usual. Verified by executing the real runner
+with a temp .env and asserting the variable reaches the script.
