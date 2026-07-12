@@ -79,5 +79,12 @@ telemetry:
   # sidecar over the existing managed connection, never the launch path.
   sample_seconds: 30
 
+auto_manage:
+  # How often the auto-manage lifecycle loop advances a queued-then-launch job
+  # (launch -> run -> sync -> terminate). Modest by default: while a job waits
+  # for a free slot the only API call is the guarded request_launch; every
+  # other step is a local DB read.
+  poll_seconds: 5
+
 database:
   path: manifold.db

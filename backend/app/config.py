@@ -89,6 +89,15 @@ class TelemetrySettings:
 
 
 @dataclass(frozen=True)
+class AutoManageSettings:
+    # How often the auto-manage lifecycle loop advances a job (launch -> run
+    # -> sync -> terminate). Modest by default: the only API call it makes is
+    # request_launch while a job waits for a free slot; everything else is a
+    # local DB read.
+    poll_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
 class Settings:
     # Secrets (from .env). Empty string means "not configured".
     lambda_api_key: str = ""
@@ -107,6 +116,7 @@ class Settings:
     watches: WatchSettings = field(default_factory=WatchSettings)
     autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
+    auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
     default_connection_mode: str = "direct-ssh"
     db_path: str = str(REPO_ROOT / "manifold.db")
 
@@ -153,6 +163,7 @@ def load_settings(
     watches = raw.get("watches", {})
     autopilot = raw.get("autopilot", {})
     telemetry = raw.get("telemetry", {})
+    auto_manage = raw.get("auto_manage", {})
 
     db_path = database.get("path", "manifold.db")
     if not os.path.isabs(db_path):
@@ -195,6 +206,9 @@ def load_settings(
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
+        ),
+        auto_manage=AutoManageSettings(
+            poll_seconds=float(auto_manage.get("poll_seconds", 5)),
         ),
         ssh=SSHSettings(
             key_name=str(ssh.get("key_name", "")),

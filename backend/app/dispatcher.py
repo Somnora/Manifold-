@@ -206,6 +206,7 @@ class Dispatcher:
             asyncio.create_task(self._idle_loop()),
             asyncio.create_task(self._watch_loop()),
             asyncio.create_task(self._telemetry_loop()),
+            asyncio.create_task(self._auto_manage_loop()),
         ]
 
     async def stop(self) -> None:
@@ -295,10 +296,40 @@ class Dispatcher:
 
     # -- task loop -----------------------------------------------------------------
 
-    def _connected_instance(self) -> tuple[str, ManagedConnection] | None:
-        for instance_id, conn in self.orchestrator.connections.items():
-            if conn.state == ConnectionState.CONNECTED:
-                return instance_id, conn
+    def _pick_dispatchable(
+        self,
+    ) -> tuple[dict, str, ManagedConnection] | None:
+        """First queued task that has an eligible connected instance.
+
+        Binding keeps the two job kinds from stepping on each other:
+        - an auto-managed job runs ONLY on the instance its own lifecycle
+          launched, and only once that instance is 'ready' (connected);
+        - a manual job runs on any connected instance NOT owned by an
+          auto-managed lifecycle, so it never lands on a box about to be
+          torn down.
+        Scanning (rather than taking only the oldest) stops a waiting manual
+        job from blocking a ready auto-managed one, and vice versa.
+        """
+        connected = {
+            iid: conn
+            for iid, conn in self.orchestrator.connections.items()
+            if conn.state == ConnectionState.CONNECTED
+        }
+        if not connected:
+            return None
+        auto_owned = self.db.auto_managed_instance_ids()
+        for task in self.db.queued_tasks():
+            if task["auto_manage"]:
+                if task["lifecycle"] != "ready" or not task["launch_id"]:
+                    continue
+                launch = self.db.get_launch(task["launch_id"])
+                iid = launch["lambda_instance_id"] if launch else None
+                if iid and iid in connected:
+                    return task, iid, connected[iid]
+            else:
+                for iid, conn in connected.items():
+                    if iid not in auto_owned:
+                        return task, iid, conn
         return None
 
     async def _task_loop(self) -> None:
@@ -314,13 +345,10 @@ class Dispatcher:
     async def _dispatch_once(self) -> None:
         if self.queue.running_count() > 0:
             return  # one task at a time per instance; keep it simple
-        task = self.queue.next_queued()
-        if task is None:
-            return
-        target = self._connected_instance()
-        if target is None:
-            return  # stays queued until an instance is connected
-        instance_id, conn = target
+        pick = self._pick_dispatchable()
+        if pick is None:
+            return  # nothing queued, or no eligible instance yet
+        task, instance_id, conn = pick
         await self._run_task(task, instance_id, conn)
 
     async def _run_task(self, task: dict, instance_id: str,
@@ -357,6 +385,13 @@ class Dispatcher:
         outputs = output_paths_for(template, parameters, filesystem)
 
         self.queue.mark_running(task_id, instance_id)
+        if task.get("auto_manage"):
+            # The lifecycle loop launched this box and will sync+terminate it
+            # once the job settles; mark the running phase for the job card.
+            self.db.set_task_lifecycle(task_id, "running",
+                                       detail=f"running on {instance_id}")
+            self.db.record_audit("backend", "auto_manage_running",
+                                 f"job {task_id} instance {instance_id}: dispatched")
         self.touch_activity(instance_id)
         self.queue.append_log(task_id, f"[manifold] dispatching to {instance_id}")
         self.queue.append_log(task_id, f"[manifold] $ {docker_cmd}")
@@ -452,7 +487,15 @@ class Dispatcher:
             return
         now = self._clock()
         timeout = self.settings.idle.timeout_seconds
+        # Instances an auto-managed job owns are governed by that job's
+        # lifecycle, which owns teardown (sync -> terminate). The idle loop
+        # must not race it: skip them entirely, keep-alive or not. If the
+        # lifecycle is ever lost (its job reached a terminal state), the
+        # instance drops out of this set and the idle loop resumes as backstop.
+        auto_owned = self.db.auto_managed_instance_ids()
         for instance_id, conn in list(self.orchestrator.connections.items()):
+            if instance_id in auto_owned:
+                continue
             if conn.state != ConnectionState.CONNECTED:
                 # Not reachable: don't count unreachable time as idle.
                 self.last_activity.pop(instance_id, None)
@@ -488,6 +531,218 @@ class Dispatcher:
                 except (LaunchRejected, TerminationBlocked) as sync_exc:
                     logger.warning("idle sync+terminate failed for %s: %s",
                                    instance_id, sync_exc)
+
+    # -- auto-manage lifecycle loop -----------------------------------------------------
+
+    async def _auto_manage_loop(self) -> None:
+        """Drive auto-managed jobs through their whole instance lifecycle:
+
+            waiting -> launching -> ready -> running -> syncing -> terminating -> done
+
+        Sequential (v1): at most one auto-managed job holds the single-instance
+        slot at a time; the next waits its turn. Every guarded step routes
+        through the SAME orchestrator functions the dashboard uses
+        (request_launch, sync_ephemeral, terminate) — no guard is duplicated
+        or bypassed. The loop is stateless across ticks (it reads the job's
+        lifecycle from the DB each time), so a backend restart resumes wherever
+        the job left off.
+        """
+        while True:
+            await asyncio.sleep(self.settings.auto_manage.poll_seconds)
+            try:
+                await self._auto_manage_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("auto-manage loop iteration failed")
+
+    async def _auto_manage_once(self) -> None:
+        # One in-flight job at a time; only promote the next pending job when
+        # the slot is free (the current one reached a terminal state).
+        job = self.db.active_auto_managed_task()
+        if job is None:
+            job = self.db.next_pending_auto_managed_task()
+            if job is None:
+                return
+        lc = job["lifecycle"]
+        if lc in ("queued", "waiting"):
+            await self._auto_launch(job)
+        elif lc == "launching":
+            self._auto_check_boot(job)
+        elif lc == "ready":
+            return  # the task loop dispatches it; nothing to do here
+        elif lc == "running":
+            self._auto_check_run_done(job)
+        elif lc == "syncing":
+            await self._auto_sync(job)
+        elif lc == "terminating":
+            await self._auto_terminate(job)
+
+    def _job_instance_id(self, job: dict,
+                         launch_id: str | None = None) -> str | None:
+        lid = launch_id or job.get("launch_id")
+        if not lid:
+            return None
+        launch = self.db.get_launch(lid)
+        return launch["lambda_instance_id"] if launch else None
+
+    def _transition(self, job: dict, lifecycle: str, detail: str = "", *,
+                    launch_id: str | None = None,
+                    instance_id: str | None = None,
+                    audit_action: str | None = None) -> None:
+        """Move a job to a new lifecycle state and audit the change once.
+
+        Every transition writes an audit row carrying the job id and (when the
+        instance exists) the instance id, per the spec. Re-entering the same
+        state (e.g. staying in 'waiting') does not re-audit."""
+        changed = job.get("lifecycle") != lifecycle
+        self.db.set_task_lifecycle(job["id"], lifecycle, detail=detail or None,
+                                   launch_id=launch_id, stamp=changed)
+        if changed:
+            iid = instance_id or self._job_instance_id(job, launch_id)
+            loc = f"job {job['id']}" + (f" instance {iid}" if iid else "")
+            self.db.record_audit(
+                "backend", audit_action or f"auto_manage_{lifecycle}",
+                loc + (f": {detail}" if detail else ""))
+
+    def _fail(self, job: dict, reason: str) -> None:
+        task = self.queue.get(job["id"])
+        if task and task["status"] == "queued":
+            # Never dispatched (guard rejection or boot failure): close it out
+            # so it leaves the active list with the reason attached.
+            self.queue.mark_finished(job["id"], exit_code=-1, output_paths=[],
+                                     error=reason)
+        self._transition(job, "failed", detail=reason,
+                         audit_action="auto_manage_failed")
+
+    async def _auto_launch(self, job: dict) -> None:
+        """queued/waiting -> launching, through the guarded launch path."""
+        try:
+            launch = await self.orchestrator.request_launch(
+                instance_type=job["gpu_type"], region=job["region"],
+                filesystem=job["filesystem"])
+        except LaunchRejected as exc:
+            if exc.reason_code == "concurrency":
+                # The single slot is busy (a manual/external instance is up).
+                # Wait and retry next tick; do NOT fail the job.
+                self._transition(
+                    job, "waiting",
+                    detail=f"waiting for a free instance slot ({exc.detail})",
+                    audit_action="auto_manage_waiting")
+                return
+            # budget / validation / mode: can never admit -> fail with reason.
+            self._fail(job, exc.detail)
+            return
+        self._transition(job, "launching", launch_id=launch["id"],
+                         detail=f"launching {job['gpu_type']} in {job['region']}")
+
+    def _auto_check_boot(self, job: dict) -> None:
+        """launching -> ready once the launch is active and connected."""
+        launch = self.db.get_launch(job["launch_id"]) if job["launch_id"] else None
+        if launch is None:
+            self._fail(job, "launch record missing")
+            return
+        if launch["status"] == "failed":
+            self._fail(job, launch["error"] or "launch failed")
+            return
+        if launch["status"] == "active":
+            iid = launch["lambda_instance_id"]
+            conn = self.orchestrator.connections.get(iid) if iid else None
+            if iid and conn and conn.state == ConnectionState.CONNECTED:
+                self._transition(job, "ready", instance_id=iid,
+                                 detail="instance connected; ready to run")
+        # else still booting/retrying: wait for the next tick
+
+    def _auto_check_run_done(self, job: dict) -> None:
+        """running -> syncing once the dispatched task settles."""
+        task = self.queue.get(job["id"])
+        if task and task["status"] in ("succeeded", "failed"):
+            self._transition(
+                job, "syncing", instance_id=self._job_instance_id(job),
+                detail=f"job {task['status']}; syncing outputs to persistent")
+
+    async def _auto_sync(self, job: dict) -> None:
+        """syncing -> terminating. Always sync ephemeral scratch first."""
+        iid = self._job_instance_id(job)
+        if iid:
+            try:
+                await self.orchestrator.sync_ephemeral(iid)
+            except LaunchRejected as exc:
+                # Sync could not run (no connection, rsync error). Record it and
+                # still attempt the guarded terminate; the safety hook blocks
+                # below if data is genuinely at risk.
+                self.db.record_audit(
+                    "backend", "auto_manage_sync_failed",
+                    f"job {job['id']} instance {iid}: {exc.detail}")
+        self._transition(job, "terminating", instance_id=iid,
+                         detail="sync done; terminating (safety hook applies)")
+
+    async def _auto_terminate(self, job: dict) -> None:
+        """terminating -> done, via the guarded terminate. Never force."""
+        iid = self._job_instance_id(job)
+        launch = self.db.get_launch(job["launch_id"]) if job["launch_id"] else None
+        if not iid or (launch and launch["status"] == "terminated"):
+            # Already gone (user resolved a block, or reconcile closed it).
+            self._transition(job, "done", instance_id=iid,
+                             detail="instance terminated")
+            return
+        try:
+            await self.orchestrator.terminate(iid, force=False)
+            self._transition(job, "done", instance_id=iid,
+                             detail="synced and terminated")
+        except TerminationBlocked as exc:
+            # Spec: if files REMAIN after the intended sync, do NOT force.
+            # Surface it exactly like the manual flow and leave the box up for
+            # review. The loop keeps retrying force=False, so the moment the
+            # user syncs/clears the files (or terminates manually) the job
+            # completes on its own.
+            msg = (f"termination blocked: {len(exc.files)} unpersisted "
+                   f"file(s) remain after sync; instance {iid} left running "
+                   f"for review")
+            if job.get("lifecycle_detail") != msg:
+                self.db.set_task_lifecycle(job["id"], "terminating",
+                                           detail=msg, stamp=False)
+                self.db.record_audit(
+                    "backend", "auto_manage_terminate_blocked",
+                    f"job {job['id']} instance {iid}: {msg}")
+
+    async def cancel_auto_managed(self, task_id: str) -> dict:
+        """Cancel an auto-managed job that has not started running.
+
+        Allowed while queued/waiting/launching/ready. If a box was already
+        launched, tear it down through the guarded path (nothing ran, so the
+        hook passes; if it somehow blocks, surface rather than force). Running
+        or tearing-down jobs are left to finish."""
+        task = self.queue.get(task_id)
+        if task is None:
+            raise LaunchRejected(404, f"task {task_id} not found")
+        if not task["auto_manage"]:
+            raise LaunchRejected(400, f"task {task_id} is not auto-managed")
+        lc = task["lifecycle"]
+        if lc in ("done", "failed", "cancelled"):
+            raise LaunchRejected(409, f"job is already {lc}")
+        if lc in ("running", "syncing", "terminating"):
+            raise LaunchRejected(
+                409, f"cannot cancel a job that is {lc}; let it finish or "
+                f"terminate the instance from the instance card")
+        iid = self._job_instance_id(task)
+        if iid:
+            try:
+                await self.orchestrator.terminate(iid, force=False)
+            except TerminationBlocked as exc:
+                raise LaunchRejected(
+                    409, f"instance {iid} has {len(exc.files)} unpersisted "
+                    f"file(s); resolve them before cancelling")
+        self.db.set_task_lifecycle(task_id, "cancelled",
+                                   detail="cancelled by user")
+        if task["status"] == "queued":
+            self.queue.mark_finished(task_id, exit_code=-1, output_paths=[],
+                                     error="cancelled by user")
+        self.db.record_audit(
+            "backend", "auto_manage_cancelled",
+            f"job {task_id}" + (f" instance {iid}" if iid else "")
+            + ": cancelled by user")
+        return {"cancelled": task_id}
 
     # -- telemetry sampling loop -------------------------------------------------------
 

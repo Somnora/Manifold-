@@ -54,7 +54,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     finished_at     TEXT,
     exit_code       INTEGER,
     error           TEXT,               -- dispatcher-level error, if any
-    output_paths    TEXT                -- JSON list of persistent paths
+    output_paths    TEXT,               -- JSON list of persistent paths
+    -- Auto-manage (Phase 24): a job that owns its own instance lifecycle.
+    -- When auto_manage=1 the dispatcher launches a dedicated instance for
+    -- this job (gpu_type/region/filesystem), runs it, syncs, and terminates.
+    auto_manage     INTEGER NOT NULL DEFAULT 0,
+    gpu_type        TEXT,               -- requested instance type (auto-manage)
+    region          TEXT,
+    filesystem      TEXT,
+    launch_id       TEXT,               -- the launch this job's lifecycle created
+    lifecycle       TEXT,               -- queued|waiting|launching|ready|running|
+                                        -- syncing|terminating|done|failed|cancelled
+    lifecycle_detail TEXT,              -- human "why" for the current state
+    lifecycle_events TEXT               -- JSON {state: iso-ts}, one stamp per state
 );
 
 CREATE TABLE IF NOT EXISTS task_logs (
@@ -123,6 +135,17 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _interval(start_iso: str | None, end_iso: str | None) -> float | None:
+    """Seconds between two ISO timestamps, or None if either is missing."""
+    if not start_iso or not end_iso:
+        return None
+    try:
+        return (datetime.fromisoformat(end_iso)
+                - datetime.fromisoformat(start_iso)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
 class Database:
     def __init__(self, path: str):
         self._conn = sqlite3.connect(path, check_same_thread=False)
@@ -133,6 +156,16 @@ class Database:
         # (CREATE TABLE IF NOT EXISTS does not alter existing tables).
         self._ensure_column("launches", "keep_alive",
                             "INTEGER NOT NULL DEFAULT 0")
+        # Auto-manage columns (Phase 24) for databases created earlier.
+        self._ensure_column("tasks", "auto_manage",
+                            "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("tasks", "gpu_type", "TEXT")
+        self._ensure_column("tasks", "region", "TEXT")
+        self._ensure_column("tasks", "filesystem", "TEXT")
+        self._ensure_column("tasks", "launch_id", "TEXT")
+        self._ensure_column("tasks", "lifecycle", "TEXT")
+        self._ensure_column("tasks", "lifecycle_detail", "TEXT")
+        self._ensure_column("tasks", "lifecycle_events", "TEXT")
         self._lock = threading.Lock()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -292,12 +325,25 @@ class Database:
 
     # -- tasks -----------------------------------------------------------------
 
-    def create_task(self, *, template: str, parameters: dict) -> str:
+    def create_task(self, *, template: str, parameters: dict,
+                    auto_manage: bool = False, gpu_type: str | None = None,
+                    region: str | None = None,
+                    filesystem: str | None = None) -> str:
         task_id = uuid.uuid4().hex[:12]
+        # Auto-managed jobs start in lifecycle 'queued' with a first event
+        # stamp; manual jobs leave lifecycle NULL (the field is unused for
+        # them, so the dispatcher and UI treat them exactly as before).
+        lifecycle = "queued" if auto_manage else None
+        events = json.dumps({"queued": utcnow()}) if auto_manage else None
         self._execute(
-            """INSERT INTO tasks (id, created_at, template, parameters, status)
-               VALUES (?, ?, ?, ?, 'queued')""",
-            (task_id, utcnow(), template, json.dumps(parameters)),
+            """INSERT INTO tasks
+               (id, created_at, template, parameters, status,
+                auto_manage, gpu_type, region, filesystem,
+                lifecycle, lifecycle_events)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
+            (task_id, utcnow(), template, json.dumps(parameters),
+             1 if auto_manage else 0, gpu_type, region, filesystem,
+             lifecycle, events),
         )
         return task_id
 
@@ -314,11 +360,59 @@ class Database:
             f"UPDATE tasks SET {cols} WHERE id = ?", (*fields.values(), task_id)
         )
 
+    # Auto-manage lifecycle states that still hold the single-instance slot
+    # (the job is mid-flight). 'queued' is not-yet-started; the terminal
+    # states (done/failed/cancelled) release the slot.
+    ACTIVE_LIFECYCLE = ("waiting", "launching", "ready", "running",
+                        "syncing", "terminating")
+    # In-flight states that actually have an instance attached (excludes
+    # 'waiting', which is pre-launch). Used to find instances an auto-managed
+    # job owns.
+    _OWNING_LIFECYCLE = ("launching", "ready", "running",
+                         "syncing", "terminating")
+
+    def set_task_lifecycle(self, task_id: str, lifecycle: str, *,
+                           detail: str | None = None,
+                           launch_id: str | None = None,
+                           stamp: bool = True) -> None:
+        """Move an auto-managed task to a new lifecycle state.
+
+        Records a single timestamp per state in lifecycle_events (stamp=False
+        updates only the detail, e.g. re-describing a blocked termination
+        without re-stamping). Optionally attaches the launch this job created.
+        """
+        row = self._execute(
+            "SELECT lifecycle_events FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        events = json.loads(row["lifecycle_events"]) if row and row["lifecycle_events"] else {}
+        if stamp and lifecycle not in events:
+            events[lifecycle] = utcnow()
+        fields: dict[str, Any] = {
+            "lifecycle": lifecycle,
+            "lifecycle_events": json.dumps(events),
+        }
+        if detail is not None:
+            fields["lifecycle_detail"] = detail
+        if launch_id is not None:
+            fields["launch_id"] = launch_id
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        self._execute(
+            f"UPDATE tasks SET {cols} WHERE id = ?", (*fields.values(), task_id)
+        )
+
     @staticmethod
     def _task_row(row: sqlite3.Row) -> dict:
         task = dict(row)
         task["parameters"] = json.loads(task["parameters"])
         task["output_paths"] = json.loads(task["output_paths"] or "[]")
+        task["auto_manage"] = bool(task.get("auto_manage"))
+        events = json.loads(task["lifecycle_events"]) if task.get("lifecycle_events") else {}
+        task["lifecycle_events"] = events
+        # Launch-to-ready instrumentation: how long from kicking off the
+        # launch to a connected, ready-to-run GPU. The zero-waste headline
+        # number, surfaced on the job card.
+        task["launch_to_ready_seconds"] = _interval(
+            events.get("launching"), events.get("ready"))
         return task
 
     def get_task(self, task_id: str) -> dict | None:
@@ -338,6 +432,55 @@ class Database:
             "SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at, id LIMIT 1"
         ).fetchone()
         return self._task_row(row) if row else None
+
+    def queued_tasks(self) -> list[dict]:
+        """All queued tasks, oldest first. The dispatcher scans these to find
+        the first one with an eligible instance (auto-managed jobs bind to
+        their own launched instance; manual jobs take any free one)."""
+        rows = self._execute(
+            "SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at, id"
+        ).fetchall()
+        return [self._task_row(r) for r in rows]
+
+    # -- auto-manage lifecycle queries -----------------------------------------
+
+    def next_pending_auto_managed_task(self) -> dict | None:
+        """Oldest auto-managed job that has not started its lifecycle yet."""
+        row = self._execute(
+            """SELECT * FROM tasks
+                WHERE auto_manage = 1 AND lifecycle = 'queued'
+                ORDER BY created_at, id LIMIT 1"""
+        ).fetchone()
+        return self._task_row(row) if row else None
+
+    def active_auto_managed_task(self) -> dict | None:
+        """The auto-managed job currently holding the instance slot, if any.
+
+        v1 is sequential (one in flight at a time); if more than one ever
+        exists, the oldest is returned so it drains first."""
+        placeholders = ", ".join("?" for _ in self.ACTIVE_LIFECYCLE)
+        row = self._execute(
+            f"""SELECT * FROM tasks
+                 WHERE auto_manage = 1 AND lifecycle IN ({placeholders})
+                 ORDER BY created_at, id LIMIT 1""",
+            self.ACTIVE_LIFECYCLE,
+        ).fetchone()
+        return self._task_row(row) if row else None
+
+    def auto_managed_instance_ids(self) -> set[str]:
+        """Instance ids owned by an in-flight auto-managed job. The idle loop
+        skips these (their lifecycle owns teardown) and manual jobs never
+        dispatch onto them."""
+        placeholders = ", ".join("?" for _ in self._OWNING_LIFECYCLE)
+        rows = self._execute(
+            f"""SELECT DISTINCT l.lambda_instance_id AS iid
+                  FROM tasks t JOIN launches l ON t.launch_id = l.id
+                 WHERE t.auto_manage = 1
+                   AND t.lifecycle IN ({placeholders})
+                   AND l.lambda_instance_id IS NOT NULL""",
+            self._OWNING_LIFECYCLE,
+        ).fetchall()
+        return {r["iid"] for r in rows}
 
     def running_task_count(self) -> int:
         row = self._execute(
