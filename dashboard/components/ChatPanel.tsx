@@ -116,16 +116,19 @@ export function ChatPanel({ instanceId }: { instanceId: string }) {
 
   if (!model.ready) {
     return (
-      <div className="mt-3 flex items-center gap-3 rounded border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
-        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+      <div className="mt-3 flex items-start gap-3 rounded border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+        <span className="mt-1.5 h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500" />
         <span>
           <span className="font-mono">{model.model_id}</span> is loading on
-          this instance (downloading weights and warming up the GPU). This
-          takes a few minutes on first serve; chat opens automatically when
-          it is ready.
+          this instance: downloading the weights (a 7B model is ~15 GB on
+          first serve) and warming up the GPU. Chat opens automatically when
+          it is ready — this can take several minutes. Watch real progress in
+          the job&apos;s <span className="font-medium">Logs</span> on the Jobs
+          page (look for the model shards downloading).
           {model.status_detail ? (
             <span className="mt-1 block text-xs text-amber-700">
-              {model.status_detail}
+              Not answering yet — normal while it loads (probe:{" "}
+              {model.status_detail}).
             </span>
           ) : null}
         </span>

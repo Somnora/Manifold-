@@ -44,6 +44,15 @@ def test_sidecar_binds_loopback_only():
     assert '127.0.0.1", port=9411' in ud
 
 
+def test_claude_cli_on_path():
+    """The Claude CLI installs to ~/.local/bin but the installer does not put
+    it on PATH, so a fresh Open Terminal shell couldn't find `claude`. Ensure
+    both a login-shell profile.d entry and .bashrc get it."""
+    ud = build_user_data()
+    assert "/etc/profile.d/manifold-path.sh" in ud
+    assert ud.count('.local/bin:$PATH') >= 2   # profile.d AND .bashrc
+
+
 def test_nvidia_runtime_configured_unconditionally():
     """The nvidia-ctk runtime configure + docker restart must run on EVERY
     boot, not only when the toolkit was just installed — Lambda ships the

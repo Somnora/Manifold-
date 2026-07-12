@@ -98,6 +98,14 @@ systemctl enable --now manifold-sidecar
 # --- Claude Code CLI (auth is manual/interactive on first use) -------------
 curl -fsSL https://claude.ai/install.sh | HOME=/home/ubuntu bash || true
 chown -R ubuntu:ubuntu /home/ubuntu/.local || true
+# The installer drops the binary in ~/.local/bin but does not put it on PATH,
+# so a fresh Open Terminal shell can't find `claude`. Add it for every login
+# shell (profile.d) AND interactive bash (.bashrc), so it just works.
+echo 'export PATH="$HOME/.local/bin:$PATH"' > /etc/profile.d/manifold-path.sh
+chmod 644 /etc/profile.d/manifold-path.sh
+grep -q '.local/bin' /home/ubuntu/.bashrc 2>/dev/null \
+  || echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.bashrc
+chown ubuntu:ubuntu /home/ubuntu/.bashrc || true
 {tailscale_block}
 touch /var/run/manifold-init-done
 """
