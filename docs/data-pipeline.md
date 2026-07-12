@@ -57,16 +57,26 @@ Jobs → **llm-synthesize**:
 - `limit`: `5` first — check quality on a handful before burning GPU time
   on the whole dataset, then rerun with `0` (= all)
 
-The job auto-discovers the served model, maps your instruction over every
-record at temperature 0.1, and writes one line per record to
-`synthesized/<output_name>.jsonl`:
+The job first **waits** for the served model to actually answer (so it is
+safe to queue right after `vllm-serve`, before weights finish loading),
+then maps your instruction over every record at temperature 0.1 and writes
+one line per record to `synthesized/<output_name>.jsonl`:
 
 ```json
-{"record": {...raw scrape...}, "synthesis": "{\"name\": \"Jane Doe\", ...}"}
+{"record": {...raw scrape...},
+ "synthesis": "{\"name\": \"Jane Doe\", ...}",
+ "synthesis_json": {"name": "Jane Doe", ...}}
 ```
 
-Progress prints every 25 records; failures are counted and logged, never
-silently dropped.
+When the model returns JSON (including ```json fenced blocks), it is parsed
+into `synthesis_json` — your ready-to-use points. A non-JSON reply is kept
+verbatim in `synthesis` and flagged with `"parse_error": true` instead.
+
+Robustness built in: a transient model error is retried before a record is
+counted as failed; a malformed input line is skipped and logged, never
+fatal; a missing input path or an unreachable model fails immediately with
+an actionable message (not a Python traceback). Progress prints every 25
+records; failures are counted and logged, never silently dropped.
 
 ## 4. Pull the results down
 

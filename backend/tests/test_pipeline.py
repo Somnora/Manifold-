@@ -70,69 +70,213 @@ def test_script_run_renders_quoted_args():
     assert "--network host" not in cmd
 
 
-def test_llm_synthesize_pycode_actually_runs(tmp_path):
-    """Execute the template's embedded Python for real: a stub OpenAI server
-    stands in for vLLM, a JSONL input goes in, structured JSONL comes out.
-    This is the guard against shipping a never-executed script."""
-    import http.server
-    import json
-    import subprocess
-    import sys
-    import threading
+# -- llm-synthesize: execute the REAL embedded script against a stub vLLM ---------
+#
+# These run the template's PYCODE verbatim in a subprocess (the never-run
+# guard) and cover the Phase 17 hardening: preflight wait, transient retry,
+# malformed-input tolerance, JSON parsing, and clean failure messages.
 
-    class StubVLLM(http.server.BaseHTTPRequestHandler):
-        def _send(self, payload):
-            body = json.dumps(payload).encode()
-            self.send_response(200)
+import http.server
+import json as _json
+import subprocess
+import sys
+import threading
+
+
+def _make_stub(*, model_content, models_ready_after=0, chat_fail_once=()):
+    """Build a configurable stub vLLM handler class.
+
+    models_ready_after: return 503 on /v1/models this many times before the
+    model 'comes up' (exercises the readiness wait).
+    chat_fail_once: record names that should get one 500 before succeeding
+    (exercises the per-record retry).
+    """
+    state = {"models_calls": 0, "chat_fails": {}}
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, payload):
+            body = _json.dumps(payload).encode()
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
-            assert self.path == "/v1/models"
-            self._send({"data": [{"id": "stub/qwen-7b"}]})
+            state["models_calls"] += 1
+            if state["models_calls"] <= models_ready_after:
+                self._send(503, {"error": "loading"})
+            else:
+                self._send(200, {"data": [{"id": "stub/qwen-7b"}]})
 
         def do_POST(self):
-            req = json.loads(self.rfile.read(
+            req = _json.loads(self.rfile.read(
                 int(self.headers["Content-Length"])))
-            record = json.loads(req["messages"][1]["content"])
-            self._send({"choices": [{"message": {
-                "content": f"POINT: {record['name']} ({record['district']})"
-            }}]})
+            record = _json.loads(req["messages"][1]["content"])
+            name = record.get("name")
+            if name in chat_fail_once and not state["chat_fails"].get(name):
+                state["chat_fails"][name] = True
+                self._send(500, {"error": "transient"})
+                return
+            self._send(200, {"choices": [{"message": {
+                "content": model_content(record)}}]})
 
-        def log_message(self, *args):
+        def log_message(self, *a):
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), StubVLLM)
+    return Stub, state
+
+
+def _run_synthesize(tmp_path, records_text, *, model_content,
+                    models_ready_after=0, chat_fail_once=(),
+                    limit="0", input_name="research/raw.jsonl",
+                    ready_timeout=None, write_input=True):
+    """Run the template's PYCODE against a stub, return (result, data_dir)."""
+    handler, _state = _make_stub(
+        model_content=model_content,
+        models_ready_after=models_ready_after,
+        chat_fail_once=chat_fail_once,
+    )
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     data = tmp_path / "data"
-    (data / "research").mkdir(parents=True)
-    with open(data / "research" / "raw.jsonl", "w") as f:
-        f.write(json.dumps({"name": "Jane Doe", "district": "TX-07"}) + "\n")
-        f.write(json.dumps({"name": "Bob Roe", "district": "AZ-01"}) + "\n")
+    if write_input:
+        (data / input_name).parent.mkdir(parents=True, exist_ok=True)
+        (data / input_name).write_text(records_text)
+    else:
+        data.mkdir(parents=True, exist_ok=True)
 
     pycode = TEMPLATES["llm-synthesize"].env["PYCODE"]
     # The container mounts the filesystem at /data; locally we substitute
     # the temp dir. Everything else runs verbatim.
-    pycode = pycode.replace('"/data', f'"{data}').replace("f\"/data", f"f\"{data}")
-    result = subprocess.run(
-        [sys.executable, "-c", pycode, "research/raw.jsonl", "points",
-         "Extract name and district.", str(port), "0"],
-        capture_output=True, text=True, timeout=30,
+    pycode = pycode.replace('"/data', f'"{data}').replace('f"/data', f'f"{data}')
+    env = None
+    if ready_timeout is not None:
+        import os
+        env = {**os.environ, "MANIFOLD_SYNTH_READY_TIMEOUT": str(ready_timeout)}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", pycode, input_name, "points",
+             "Extract name and district as JSON.", str(port), limit],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+    finally:
+        server.shutdown()
+    return result, data
+
+
+def _output(data):
+    return [_json.loads(l) for l in
+            (data / "synthesized" / "points.jsonl").read_text().splitlines()]
+
+
+def test_llm_synthesize_pycode_actually_runs(tmp_path):
+    """Happy path: JSONL in, structured JSONL out. The model returns JSON,
+    which is parsed into ready-to-use points (synthesis_json)."""
+    rows = (_json.dumps({"name": "Jane Doe", "district": "TX-07"}) + "\n"
+            + _json.dumps({"name": "Bob Roe", "district": "AZ-01"}) + "\n")
+    result, data = _run_synthesize(
+        tmp_path, rows,
+        model_content=lambda r: _json.dumps(
+            {"name": r["name"], "district": r["district"]}),
     )
-    server.shutdown()
     assert result.returncode == 0, result.stderr
     assert "synthesizing with stub/qwen-7b" in result.stdout
     assert "2 synthesized, 0 failed" in result.stdout
+    out = _output(data)
+    assert out[0]["record"] == {"name": "Jane Doe", "district": "TX-07"}
+    # The JSON reply is parsed into usable points, not left double-encoded.
+    assert out[0]["synthesis_json"] == {"name": "Jane Doe", "district": "TX-07"}
+    assert out[1]["synthesis_json"]["district"] == "AZ-01"
 
-    lines = [json.loads(l) for l in
-             (data / "synthesized" / "points.jsonl").read_text().splitlines()]
-    assert lines[0]["record"] == {"name": "Jane Doe", "district": "TX-07"}
-    assert lines[0]["synthesis"] == "POINT: Jane Doe (TX-07)"
-    assert lines[1]["synthesis"] == "POINT: Bob Roe (AZ-01)"
+
+def test_llm_synthesize_parses_fenced_json(tmp_path):
+    """Models love ```json fences; those still parse into points."""
+    rows = _json.dumps({"name": "Jane", "district": "TX-07"}) + "\n"
+    result, data = _run_synthesize(
+        tmp_path, rows,
+        model_content=lambda r: f"```json\n{_json.dumps({'d': r['district']})}\n```",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _output(data)[0]["synthesis_json"] == {"d": "TX-07"}
+
+
+def test_llm_synthesize_marks_non_json_output(tmp_path):
+    """A prose reply is kept verbatim and flagged, never silently dropped."""
+    rows = _json.dumps({"name": "Jane", "district": "TX-07"}) + "\n"
+    result, data = _run_synthesize(
+        tmp_path, rows, model_content=lambda r: "Jane represents TX-07.")
+    assert result.returncode == 0, result.stderr
+    row = _output(data)[0]
+    assert row["synthesis"] == "Jane represents TX-07."
+    assert row["parse_error"] is True
+    assert "synthesis_json" not in row
+
+
+def test_llm_synthesize_waits_for_model(tmp_path):
+    """If synthesize starts before vLLM is ready, it waits and then runs —
+    instead of crashing on the first /v1/models call (the live-test bug)."""
+    rows = _json.dumps({"name": "Jane", "district": "TX-07"}) + "\n"
+    result, data = _run_synthesize(
+        tmp_path, rows,
+        model_content=lambda r: _json.dumps({"d": r["district"]}),
+        models_ready_after=1,   # 503 once, then ready
+    )
+    assert result.returncode == 0, result.stderr
+    assert "waiting for a model" in result.stdout
+    assert "1 synthesized, 0 failed" in result.stdout
+
+
+def test_llm_synthesize_retries_transient_errors(tmp_path):
+    """One transient 500 on a record is retried, not counted as a loss."""
+    rows = _json.dumps({"name": "Jane", "district": "TX-07"}) + "\n"
+    result, data = _run_synthesize(
+        tmp_path, rows,
+        model_content=lambda r: _json.dumps({"d": r["district"]}),
+        chat_fail_once=("Jane",),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "1 synthesized, 0 failed" in result.stdout
+    assert _output(data)[0]["synthesis_json"] == {"d": "TX-07"}
+
+
+def test_llm_synthesize_skips_malformed_input(tmp_path):
+    """A broken JSONL line is skipped (counted failed); the run continues."""
+    rows = ("{not valid json\n"
+            + _json.dumps({"name": "Bob", "district": "AZ-01"}) + "\n")
+    result, data = _run_synthesize(
+        tmp_path, rows,
+        model_content=lambda r: _json.dumps({"d": r["district"]}),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "skipped malformed input" in result.stdout
+    assert "1 synthesized, 1 failed" in result.stdout
+    assert _output(data)[0]["record"] == {"name": "Bob", "district": "AZ-01"}
+
+
+def test_llm_synthesize_missing_input_fails_clearly(tmp_path):
+    """A typo'd input path fails with the path, not a Python traceback."""
+    result, _ = _run_synthesize(
+        tmp_path, "", model_content=lambda r: "x", write_input=False)
+    assert result.returncode != 0
+    assert "input file not found" in result.stderr
+
+
+def test_llm_synthesize_fails_fast_when_no_model(tmp_path):
+    """If no model ever answers, the job fails with an actionable message
+    (bounded by the readiness timeout, not hung forever)."""
+    rows = _json.dumps({"name": "Jane", "district": "TX-07"}) + "\n"
+    result, _ = _run_synthesize(
+        tmp_path, rows, model_content=lambda r: "x",
+        models_ready_after=10_000,   # never becomes ready
+        ready_timeout=1,
+    )
+    assert result.returncode != 0
+    assert "did not become ready" not in result.stderr  # message is precise
+    assert "no model answered" in result.stderr
+    assert "vllm-serve" in result.stderr
 
 
 def test_script_run_end_to_end_over_http(client):
