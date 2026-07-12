@@ -53,3 +53,26 @@ jobs:
           path: |
             desktop/src-tauri/target/release/bundle/dmg/*.dmg
             desktop/src-tauri/target/release/bundle/msi/*.msi
+
+  # Only on a version tag (not workflow_dispatch): publish both platform
+  # builds as ONE public GitHub Release with a stable, shareable link -
+  # https://github.com/<org>/<repo>/releases/latest - instead of the
+  # login-gated, 90-day-expiring build artifacts above.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/manifold-macos-14/*.dmg \
+            dist/manifold-windows-2022/*.msi \
+            --repo "${{ github.repository }}" \
+            --title "Manifold ${{ github.ref_name }}" \
+            --notes "Unsigned builds: macOS shows an \"unidentified developer\" warning (right-click the app -> Open); Windows shows a SmartScreen warning (More info -> Run anyway). See docs/desktop-build.md."

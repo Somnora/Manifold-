@@ -1634,3 +1634,24 @@ Authenticode accounts exist - Gatekeeper/SmartScreen will warn; the
 workflow has the hook points. No auto-updater until signing lands (unsigned
 updates are unsafe). Windows build is CI-defined but untested on real
 hardware. MCP stays a dev-checkout feature for now.
+
+## 2026-07-12 — Sharing the desktop app: GitHub Releases on a version tag, not a committed binary
+
+**Decided:** the `.dmg`/`.msi` are shared via a GitHub Release (a new
+`release` job in `.github/workflows/desktop.yml`, gated on `refs/tags/v*`
+and running after both platform builds), not by committing them into the
+repo. Pushing a tag (`git tag v0.1.0 && git push origin v0.1.0`) makes CI
+attach both installers to one Release, giving a stable public URL
+(`/releases/latest`) that needs no GitHub login - unlike the existing
+`upload-artifact` step, which is login-gated and expires in 90 days.
+
+**Why not commit the binaries:** git tracks line diffs; a 40MB+ binary has
+none, so every commit that touches it (and every future clone of the repo)
+carries the full weight forever, with no way to shrink history later
+short of a rewrite. Releases are the purpose-built mechanism - versioned,
+downloadable, outside the tree that `git clone` pulls by default.
+
+**Repo visibility check (2026-07-12):** confirmed `Somnora/Manifold-` is
+already public, and confirmed no secret ever entered git history — `.env`,
+`manifold.db`, `host_keys.json` are gitignored and were never tracked.
+Sharing the repo link was already safe before this change.
