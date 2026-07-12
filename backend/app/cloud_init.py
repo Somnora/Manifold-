@@ -46,7 +46,17 @@ mkdir -p /workspace/ephemeral
 chown ubuntu:ubuntu /workspace/ephemeral
 
 # --- Sidecar: single file, loopback only, systemd-supervised ---------------
-python3 -m pip install --quiet 'fastapi>=0.115' 'uvicorn>=0.30' pynvml
+# Install deps into the SAME interpreter systemd runs (/usr/bin/python3).
+# On Lambda ML images `python3` in root's PATH is often conda's, so a bare
+# `python3 -m pip install` lands the packages where /usr/bin/python3 cannot
+# import them and the service crash-loops on every boot ("sidecar not
+# reachable"). --break-system-packages covers PEP 668 (Ubuntu 23.04+); the
+# bare-retry covers older pip that rejects the flag. Non-fatal: a telemetry
+# sidecar that fails to install must not brick an otherwise usable GPU box.
+apt-get install -y -qq python3-pip || /usr/bin/python3 -m ensurepip || true
+/usr/bin/python3 -m pip install --quiet --break-system-packages 'fastapi>=0.115' 'uvicorn>=0.30' pynvml \
+  || /usr/bin/python3 -m pip install --quiet 'fastapi>=0.115' 'uvicorn>=0.30' pynvml \
+  || echo "WARNING: sidecar deps failed to install; telemetry/files disabled"
 install -d /opt/manifold
 cat > /opt/manifold/manifold_sidecar.py <<'MANIFOLD_SIDECAR_EOF'
 {sidecar_source}
