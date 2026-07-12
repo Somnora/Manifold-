@@ -898,3 +898,26 @@ mid-session between two manual steps; the user experienced it as data loss
 but the user can now SEE the countdown before it acts and opt an instance
 out explicitly. Terminal and job activity still reset the clock; the audit
 log records both the switch and every idle termination.
+
+## 2026-07-11 — llm-synthesize: preflight wait + resilient mapping (Phase 17)
+
+**Decided:** The synthesize script (a) validates the input path up front,
+(b) polls /v1/models until the served model actually answers (bounded by
+MANIFOLD_SYNTH_READY_TIMEOUT, default 300s) instead of calling it once, (c)
+retries a transient per-record error twice, (d) tolerates a malformed input
+line by skipping+counting it rather than dying, and (e) parses JSON replies
+(including ```json fences) into a `synthesis_json` field, flagging non-JSON
+with `parse_error`.
+
+**Alternatives:** Keep the thin one-shot script and rely on the operator to
+sequence serve→ready→synthesize perfectly by hand (this is exactly what
+failed at the first live gate — synthesize was queued against a model that
+had crashed, and it died on a raw urllib traceback); parse JSON downstream
+on the user's machine (defeats "synthesize into usable points seamlessly").
+
+**Why:** The pipeline's value is that a cloud GPU feels self-sufficient; a
+stage that crashes the instant timing is imperfect, or that hands back
+double-encoded strings, breaks that. Every branch is covered by executing
+the REAL embedded script against a configurable stub vLLM (never-run-guard
+extended to eight cases: happy path, fenced JSON, prose, wait-for-ready,
+retry, malformed input, missing input, no-model-fail-fast).

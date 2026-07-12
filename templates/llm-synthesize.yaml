@@ -44,41 +44,67 @@ volumes:
 
 env:
   PYCODE: |
-    import csv, json, sys, urllib.request
+    import csv, json, os, sys, time, urllib.request
     inp, out_name, instruction, port, limit = (
         sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
     base = f"http://127.0.0.1:{port}/v1"
+    # Overridable so tests can fail fast; ops rarely needs to touch it.
+    READY_TIMEOUT = int(os.environ.get("MANIFOLD_SYNTH_READY_TIMEOUT", "300"))
 
-    def api(path, payload=None):
+    def api(path, payload=None, timeout=600):
         req = urllib.request.Request(
             base + path,
             data=json.dumps(payload).encode() if payload else None,
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=600) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)
 
-    model = api("/models")["data"][0]["id"]
+    # Preflight 1: the input must exist. Fail with a path, not a traceback.
+    in_path = "/data/" + inp
+    if not os.path.exists(in_path):
+        sys.exit(f"input file not found: {in_path} "
+                 f"(path is relative to the filesystem root)")
+
+    # Preflight 2: WAIT for the served model to actually answer, instead of
+    # crashing if synthesize was queued before vllm-serve finished loading.
+    print(f"waiting for a model on 127.0.0.1:{port} "
+          f"(up to {READY_TIMEOUT}s) ...", flush=True)
+    model = None
+    deadline = time.time() + READY_TIMEOUT
+    while True:
+        try:
+            model = api("/models", timeout=10)["data"][0]["id"]
+            break
+        except Exception as exc:
+            if time.time() >= deadline:
+                sys.exit(f"no model answered on :{port} within {READY_TIMEOUT}s "
+                         f"— is a vllm-serve job running and finished loading? "
+                         f"({exc})")
+            time.sleep(2)
     print(f"synthesizing with {model}", flush=True)
 
     def records():
-        path = "/data/" + inp
-        if path.endswith(".csv"):
-            with open(path, newline="") as f:
-                yield from csv.DictReader(f)
+        # Yields (index, record_or_error). Malformed input lines are surfaced
+        # as failures, never allowed to kill the whole run.
+        if in_path.endswith(".csv"):
+            with open(in_path, newline="") as f:
+                for i, row in enumerate(csv.DictReader(f), 1):
+                    yield i, row, None
         else:
-            with open(path) as f:
-                for line in f:
+            with open(in_path) as f:
+                for i, line in enumerate(f, 1):
                     line = line.strip()
-                    if line:
-                        yield json.loads(line)
+                    if not line:
+                        continue
+                    try:
+                        yield i, json.loads(line), None
+                    except json.JSONDecodeError as exc:
+                        yield i, None, f"line {i}: {exc}"
 
-    out_path = f"/data/synthesized/{out_name}.jsonl"
-    import os; os.makedirs("/data/synthesized", exist_ok=True)
-    done = failed = 0
-    with open(out_path, "w") as out:
-        for record in records():
-            if limit and done + failed >= limit:
-                break
+    def synthesize(record):
+        # Retry transient model errors so a single blip never drops a record.
+        last = None
+        for attempt in range(3):
             try:
                 reply = api("/chat/completions", {
                     "model": model,
@@ -88,14 +114,53 @@ env:
                         {"role": "user", "content": json.dumps(record)},
                     ],
                 })
-                synthesis = reply["choices"][0]["message"]["content"]
-                out.write(json.dumps({"record": record,
-                                      "synthesis": synthesis}) + "\n")
+                return reply["choices"][0]["message"]["content"]
+            except Exception as exc:
+                last = exc
+                time.sleep(1 + attempt)
+        raise last
+
+    def as_points(content):
+        # Turn the model's reply into usable structured points when it is
+        # JSON — including the ```json fenced form models love to emit.
+        s = content.strip()
+        if s.startswith("```"):
+            s = s[3:]
+            if s[:4].lower() == "json":
+                s = s[4:]
+            if s.endswith("```"):
+                s = s[:-3]
+            s = s.strip()
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+
+    out_path = f"/data/synthesized/{out_name}.jsonl"
+    os.makedirs("/data/synthesized", exist_ok=True)
+    done = failed = 0
+    with open(out_path, "w") as out:
+        for i, record, parse_error in records():
+            if limit and done + failed >= limit:
+                break
+            if parse_error:
+                failed += 1
+                print(f"skipped malformed input {parse_error}", flush=True)
+                continue
+            try:
+                content = synthesize(record)
+                row = {"record": record, "synthesis": content}
+                points = as_points(content)
+                if points is not None:
+                    row["synthesis_json"] = points   # ready-to-use points
+                else:
+                    row["parse_error"] = True         # model did not emit JSON
+                out.write(json.dumps(row) + "\n")
                 out.flush()
                 done += 1
             except Exception as exc:
                 failed += 1
-                print(f"record {done + failed} failed: {exc}", flush=True)
+                print(f"record {i} failed after retries: {exc}", flush=True)
             if (done + failed) % 25 == 0:
                 print(f"progress: {done} ok, {failed} failed", flush=True)
     print(f"finished: {done} synthesized, {failed} failed -> {out_path}",
