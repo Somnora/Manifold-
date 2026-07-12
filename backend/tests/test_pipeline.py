@@ -90,10 +90,10 @@ def test_script_run_caches_pip_on_persistent_storage():
 import subprocess
 
 
-def _run_runner(data, script, args):
+def _run_runner(data, script, args, env_file=""):
     runner = TEMPLATES["script-run"].env["RUNNER"].replace("/data", str(data))
     return subprocess.run(
-        ["bash", "-c", runner, "manifold", script, args],
+        ["bash", "-c", runner, "manifold", script, args, env_file],
         capture_output=True, text=True, timeout=30,
     )
 
@@ -122,6 +122,30 @@ def test_script_run_executes_present_script(tmp_path):
     # The whole args string arrives as a single argv[1], intact.
     assert "argv1='--state TX --cycle 2026'" in result.stdout
     assert "split=['--state', 'TX', '--cycle', '2026']" in result.stdout
+
+
+def test_script_run_sources_env_file(tmp_path):
+    """An uploaded .env is sourced so a scraper sees its API keys as env
+    vars, without the keys ever touching git."""
+    data = tmp_path / "data"
+    (data / "scripts").mkdir(parents=True)
+    (data / "research").mkdir(parents=True)
+    (data / "scripts" / "show.py").write_text(
+        "import os; print('KEY=' + os.environ.get('MY_API_KEY', 'MISSING'))\n")
+    (data / "research" / ".env").write_text("MY_API_KEY=secret-123\n")
+
+    result = _run_runner(data, "show.py", "", "research/.env")
+    assert result.returncode == 0, result.stderr
+    assert "KEY=secret-123" in result.stdout
+
+
+def test_script_run_missing_env_file_fails_clearly(tmp_path):
+    data = tmp_path / "data"
+    (data / "scripts").mkdir(parents=True)
+    (data / "scripts" / "show.py").write_text("print('hi')\n")
+    result = _run_runner(data, "show.py", "", "research/nope.env")
+    assert result.returncode == 2
+    assert "env file not found" in result.stderr
 
 
 # -- llm-synthesize: execute the REAL embedded script against a stub vLLM ---------
