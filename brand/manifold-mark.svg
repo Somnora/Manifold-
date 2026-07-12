@@ -1,0 +1,6 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Manifold">
+  <!-- "Prompt" mark: a heavy monospace M and the terminal cursor block,
+       drawn as vector (no font dependency) so it stays sharp everywhere. -->
+  <path d="M15 52 V13 L27 34 L39 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10" stroke-linecap="butt"/>
+  <rect x="48" y="15" width="6" height="37" fill="#2dd4bf"/>
+</svg>

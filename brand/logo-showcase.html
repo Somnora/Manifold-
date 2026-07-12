@@ -1,0 +1,207 @@
+<style>
+  :root {
+    --canvas: #0b0b0e;
+    --surface: #121217;
+    --line: #24242c;
+    --ink: #f6f6f9;
+    --muted: #9494a3;
+    --faint: #5c5c68;
+    --accent: #2dd4bf;
+    --mono: "JetBrains Mono", Menlo, ui-monospace, "SF Mono", monospace;
+    --sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--canvas);
+    background-image: radial-gradient(52rem 20rem at 50% -6rem, rgba(45,212,191,0.08), transparent 70%);
+    background-repeat: no-repeat;
+    color: var(--ink);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.55;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 72px 28px 96px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 14px;
+  }
+  h1 { font-size: 30px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 10px; text-wrap: balance; }
+  .lede { color: var(--muted); max-width: 60ch; margin: 0 0 56px; font-size: 15px; }
+
+  /* hero */
+  .hero {
+    display: flex; align-items: center; gap: 40px;
+    padding: 48px 44px;
+    border: 1px solid var(--line); border-radius: 16px;
+    background:
+      radial-gradient(30rem 14rem at 22% 0%, rgba(45,212,191,0.10), transparent 65%),
+      var(--surface);
+    margin-bottom: 20px;
+  }
+  .hero .mark { width: 132px; height: 132px; flex: none; }
+  .lockup { display: flex; align-items: baseline; gap: 2px; }
+  .lockup .word { font-family: var(--mono); font-size: 42px; font-weight: 600; letter-spacing: -0.02em; color: var(--ink); }
+  .lockup .cursor { font-family: var(--mono); font-size: 42px; color: var(--accent); animation: blink 1.2s steps(1) infinite; }
+  .hero .tag { font-family: var(--mono); font-size: 12.5px; color: var(--faint); letter-spacing: 0.04em; margin-top: 8px; }
+  @keyframes blink { 0%,55%{opacity:1} 56%,100%{opacity:0} }
+  @media (prefers-reduced-motion: reduce) { .lockup .cursor { animation: none; } }
+
+  /* section heads */
+  h2 {
+    font-family: var(--mono);
+    font-size: 12px; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--muted);
+    margin: 56px 0 18px;
+  }
+
+  /* concept trio */
+  .trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .concept {
+    border: 1px solid var(--line); border-radius: 14px; background: var(--surface);
+    padding: 30px 24px 22px; display: flex; flex-direction: column; gap: 18px;
+  }
+  .concept.pick { border-color: rgba(45,212,191,0.45); box-shadow: 0 0 0 1px rgba(45,212,191,0.12), 0 0 40px -12px rgba(45,212,191,0.25); }
+  .stage {
+    aspect-ratio: 1 / 1; border-radius: 10px; background: #060608;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid #1b1b22;
+  }
+  .stage svg, .stage .glyph { width: 68%; height: 68%; }
+  .glyph { display: flex; align-items: center; justify-content: center; }
+  .glyph .m { font-family: var(--mono); font-weight: 700; font-size: 84px; color: var(--accent); line-height: 1; }
+  .glyph .blk { width: 20px; height: 66px; background: var(--accent); margin-left: 6px; border-radius: 2px; }
+  .cname { display: flex; align-items: baseline; justify-content: space-between; }
+  .cname b { font-size: 15px; font-weight: 600; }
+  .cname .n { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+  .cdesc { color: var(--muted); font-size: 13px; margin: 0; }
+  .badge { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); border: 1px solid rgba(45,212,191,0.4); border-radius: 999px; padding: 2px 8px; }
+
+  /* contexts */
+  .ctx { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .card { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 18px; display: flex; flex-direction: column; gap: 14px; align-items: center; }
+  .card .label { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; color: var(--faint); text-transform: uppercase; }
+  .swatch-light { background: #f6f6f4; border-color: #e4e4dc; }
+  .favi { display: flex; align-items: flex-end; gap: 10px; height: 64px; }
+  .favi svg { display: block; }
+  /* fake browser tab */
+  .tab { display: flex; align-items: center; gap: 8px; background: #060608; border: 1px solid #1b1b22; border-radius: 8px 8px 0 0; padding: 8px 12px; width: 100%; }
+  .tab svg { width: 16px; height: 16px; }
+  .tab span { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  /* fake app titlebar */
+  .titlebar { width: 100%; border: 1px solid #1b1b22; border-radius: 8px; overflow: hidden; background: #060608; }
+  .titlebar .bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #1b1b22; }
+  .titlebar .dots { display: flex; gap: 5px; }
+  .titlebar .dots i { width: 9px; height: 9px; border-radius: 50%; background: #2b2b33; display: block; }
+  .titlebar .bar svg { width: 15px; height: 15px; }
+  .titlebar .bar b { font-family: var(--mono); font-size: 11.5px; font-weight: 500; color: var(--ink); }
+  .titlebar .body { height: 40px; background: radial-gradient(20rem 8rem at 50% -2rem, rgba(45,212,191,0.06), transparent); }
+
+  .note { margin-top: 40px; border: 1px solid var(--line); border-left: 2px solid var(--accent); border-radius: 0 12px 12px 0; background: var(--surface); padding: 20px 24px; color: var(--muted); font-size: 14px; }
+  .note b { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); font-size: 12.5px; color: var(--accent); background: rgba(45,212,191,0.08); padding: 1px 6px; border-radius: 5px; }
+  @media (max-width: 720px) {
+    .trio, .ctx { grid-template-columns: 1fr 1fr; }
+    .hero { flex-direction: column; text-align: center; align-items: center; }
+  }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Manifold · visual identity</p>
+  <h1>The prompt M</h1>
+  <p class="lede">You picked Prompt: a heavy monospace M and the blinking cursor block, in the app’s teal phosphor. It is the wordmark made into a monogram — pure terminal, and drawn as vector so it stays razor-crisp from a 16px favicon to the app icon.</p>
+
+  <!-- HERO -->
+  <div class="hero">
+    <svg class="mark" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15 52 V13 L27 34 L39 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10"/><rect x="48" y="15" width="6" height="37" fill="#2dd4bf"/></svg>
+    <div>
+      <div class="lockup"><span class="word">manifold</span><span class="cursor">▌</span></div>
+      <div class="tag">local orchestrator for lambda cloud gpus</div>
+    </div>
+  </div>
+
+  <!-- CONCEPTS -->
+  <h2>Three directions</h2>
+  <div class="trio">
+    <div class="concept">
+      <div class="stage">
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Fold concept">
+          <path d="M12 52 L20 14 L32 40 L44 14 L52 52" stroke="#0b3b36" stroke-width="13" stroke-linejoin="miter" stroke-miterlimit="8"/>
+          <path d="M12 52 L20 14" stroke="#5eead4" stroke-width="9"/>
+          <path d="M20 14 L32 40" stroke="#2dd4bf" stroke-width="9"/>
+          <path d="M32 40 L44 14" stroke="#14b8a6" stroke-width="9"/>
+          <path d="M44 14 L52 52" stroke="#0d9488" stroke-width="9"/>
+        </svg>
+      </div>
+      <div class="cname"><b>Fold</b><span class="n">◆</span></div>
+      <p class="cdesc">The origami M. Four folded facets, lit top-left, seamed with a deep crease — a physical object rendered in your one accent.</p>
+    </div>
+
+    <div class="concept pick">
+      <div class="stage">
+        <span class="glyph"><span class="m">M</span><span class="blk"></span></span>
+      </div>
+      <div class="cname"><b>Prompt</b><span class="badge">chosen</span></div>
+      <p class="cdesc">The most literal extension of the wordmark: a heavy mono M and the blinking cursor block. Pure terminal, zero abstraction.</p>
+    </div>
+
+    <div class="concept">
+      <div class="stage">
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Surface concept">
+          <!-- a single sheet folded along a ridge: two facets of a manifold -->
+          <path d="M10 48 L32 16 L54 48" stroke="#0b3b36" stroke-width="13" stroke-linejoin="miter" stroke-miterlimit="8"/>
+          <path d="M10 48 L32 16" stroke="#5eead4" stroke-width="9"/>
+          <path d="M32 16 L54 48" stroke="#0d9488" stroke-width="9"/>
+          <path d="M32 16 L32 40" stroke="#0b3b36" stroke-width="3"/>
+        </svg>
+      </div>
+      <div class="cname"><b>Surface</b><span class="n">∧</span></div>
+      <p class="cdesc">Abstract: one folded ridge, the simplest manifold. Reads as a mathematical surface first, an M second — the most restrained mark.</p>
+    </div>
+  </div>
+
+  <!-- CONTEXTS -->
+  <h2>The mark, in context</h2>
+  <div class="ctx">
+    <div class="card">
+      <div class="favi">
+        <svg width="16" height="16" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M20 52 V13 L32 34 L44 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10"/></svg>
+        <svg width="32" height="32" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15 52 V13 L27 34 L39 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10"/><rect x="48" y="15" width="6" height="37" fill="#2dd4bf"/></svg>
+        <svg width="48" height="48" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15 52 V13 L27 34 L39 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10"/><rect x="48" y="15" width="6" height="37" fill="#2dd4bf"/></svg>
+      </div>
+      <span class="label">favicon 16 / 32 / 48</span>
+    </div>
+    <div class="card">
+      <div class="tab">
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M20 52 V13 L32 34 L44 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10"/></svg>
+        <span>Manifold</span>
+      </div>
+      <span class="label">browser tab</span>
+    </div>
+    <div class="card">
+      <div class="titlebar">
+        <div class="bar">
+          <div class="dots"><i></i><i></i><i></i></div>
+          <span style="margin-left:4px"><svg width="15" height="15" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15 52 V13 L27 34 L39 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10"/><rect x="48" y="15" width="6" height="37" fill="#2dd4bf"/></svg></span>
+          <b>Manifold</b>
+        </div>
+        <div class="body"></div>
+      </div>
+      <span class="label">app window</span>
+    </div>
+    <div class="card swatch-light">
+      <div class="favi" style="align-items:center">
+        <svg width="44" height="44" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15 52 V13 L27 34 L39 13 V52" stroke="#0f766e" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10"/><rect x="48" y="15" width="6" height="37" fill="#0f766e"/></svg>
+      </div>
+      <span class="label" style="color:#8a8a80">on light ground</span>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>Wired in.</b> The Prompt mark is now the app favicon (<code>dashboard/app/icon.svg</code>), the header monogram, and the macOS/Windows app icon (regenerated for every size). Source files live in <code>brand/</code>: <code>manifold-mark.svg</code> (M + cursor), <code>manifold-mark-mono.svg</code> (M only, for the smallest favicons), and <code>app-icon.svg</code> (the dark tile). Fold and Surface remain here as the record of what was considered.
+  </div>
+</div>

@@ -1,0 +1,5 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Manifold">
+  <!-- Just the M, centered - for the smallest favicons where the cursor
+       block becomes noise. -->
+  <path d="M20 52 V13 L32 34 L44 13 V52" stroke="#2dd4bf" stroke-width="9" stroke-linejoin="miter" stroke-miterlimit="10" stroke-linecap="butt"/>
+</svg>
