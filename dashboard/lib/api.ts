@@ -12,15 +12,39 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Requests that ride the SSH connection to an instance (sidecar calls,
+// file listings) can be slow when the instance is struggling; a timeout
+// turns a silent hang into an honest error that names the real culprit.
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+async function request<T>(
+  path: string,
+  init?: RequestInit & { timeoutMs?: number },
+): Promise<T> {
+  const timeoutMs = init?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let resp: Response;
   try {
     resp = await fetch(`${API_BASE}${path}`, {
       ...init,
+      signal: ctrl.signal,
       headers: { "content-type": "application/json", ...init?.headers },
     });
   } catch {
+    if (ctrl.signal.aborted) {
+      // The backend accepted the connection but did not answer in time:
+      // usually the instance/sidecar side of the call, not the backend.
+      throw new ApiError(
+        0,
+        `No answer after ${Math.round(timeoutMs / 1000)}s (${path}). ` +
+          "The backend is likely up but the instance or its sidecar is " +
+          "slow or unreachable.",
+      );
+    }
     throw new ApiError(0, "Backend unreachable. Is it running on :8000?");
+  } finally {
+    clearTimeout(timer);
   }
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) {
@@ -72,6 +96,11 @@ export type Instance = {
   connection_state: string;
   connection_error: string;
   launch_id: string | null;
+  idle: {
+    idle_seconds: number;
+    timeout_seconds: number;
+    keep_alive: boolean;
+  } | null;
 };
 
 export type Launch = {
@@ -209,6 +238,12 @@ export const api = {
   syncEphemeral: (instanceId: string) =>
     request<{ synced_to: string }>(`/instances/${instanceId}/sync`, {
       method: "POST",
+    }),
+
+  setKeepAlive: (instanceId: string, enabled: boolean) =>
+    request<{ keep_alive: boolean }>(`/instances/${instanceId}/keep-alive`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
     }),
 
   templates: () =>

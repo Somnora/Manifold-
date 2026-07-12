@@ -104,7 +104,8 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
     <div className="mt-3 overflow-hidden rounded border border-zinc-700 bg-[#09090b]">
       <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-1.5">
         <span className="text-xs text-zinc-400">
-          Terminal — SSH via backend (managed connection)
+          Terminal (SSH via the managed connection) · drag the bottom-right
+          corner to resize
         </span>
         <span
           className={`text-xs ${
@@ -119,8 +120,9 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
         </span>
       </div>
       {/* Padding is on THIS wrapper; the xterm host below fills it exactly
-          so FitAddon measures a clean, padding-free box. */}
-      <div className="h-80 p-2">
+          so FitAddon measures a clean, padding-free box. resize-y gives a
+          native drag handle; the ResizeObserver refits rows on every drag. */}
+      <div className="h-80 min-h-40 max-h-[85vh] resize-y overflow-hidden p-2">
         <div ref={containerRef} className="h-full w-full" />
       </div>
     </div>

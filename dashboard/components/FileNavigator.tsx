@@ -37,12 +37,18 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
     [rootName, path],
   );
 
+  // The last path that listed successfully: when a navigation lands on a
+  // missing path (stale rows clicked mid-load once stacked the folder name
+  // three deep), we bounce back here instead of stranding the user.
+  const lastGood = useRef("");
+
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
       const listing = await api.listDir(instanceId, rootName, path);
       setEntries(listing.entries);
+      lastGood.current = path;
       if (mode === "sizes") {
         const u = await api.dirUsage(instanceId, rootName, path);
         setUsage(u.children);
@@ -51,11 +57,31 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
         setUsage(null);
       }
     } catch (err) {
+      if (
+        err instanceof ApiError &&
+        err.status === 404 &&
+        path !== lastGood.current
+      ) {
+        setNotice(
+          `Path not found; returned to /${lastGood.current || ""}`,
+        );
+        setPath(lastGood.current);
+        return;
+      }
       setError(err instanceof ApiError ? err.message : String(err));
     } finally {
       setLoading(false);
     }
   }, [instanceId, rootName, path, mode]);
+
+  async function copyPath(abs: string) {
+    try {
+      await navigator.clipboard.writeText(abs);
+      setNotice(`Copied ${abs}`);
+    } catch {
+      setError("Could not access the clipboard");
+    }
+  }
 
   useEffect(() => {
     load();
@@ -125,6 +151,14 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
             <option value="persistent">persistent (/lambda/nfs)</option>
             <option value="ephemeral">ephemeral (/workspace)</option>
           </select>
+          <button
+            onClick={() => setPath(crumbs.slice(0, -1).join("/"))}
+            disabled={!path || loading}
+            className="rounded border border-zinc-300 px-2 py-0.5 text-zinc-600 hover:bg-zinc-50 disabled:opacity-40"
+            title="Up one folder"
+          >
+            Up
+          </button>
           <nav className="flex items-center gap-1 font-mono">
             <button className="text-zinc-500 hover:underline" onClick={() => setPath("")}>
               /
@@ -163,6 +197,13 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
             className="hidden"
             onChange={(e) => onUpload(e.target.files)}
           />
+          <button
+            onClick={() => copyPath(absolute())}
+            className="rounded border border-zinc-300 px-2 py-1 text-xs hover:bg-zinc-50"
+            title="Copy this folder's absolute path"
+          >
+            Copy path
+          </button>
           <button
             onClick={() => fileInput.current?.click()}
             disabled={uploading}
@@ -206,10 +247,17 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
                     <td className="px-3 py-1.5">
                       {entry.is_dir ? (
                         <button
-                          className="font-mono font-medium text-zinc-800 hover:underline"
-                          onClick={() =>
-                            setPath([path, entry.name].filter(Boolean).join("/"))
-                          }
+                          className="font-mono font-medium text-zinc-800 hover:underline disabled:opacity-40"
+                          disabled={loading}
+                          onClick={() => {
+                            // Ignore clicks while a listing is in flight:
+                            // stale rows once let repeat-clicks stack the
+                            // folder name onto the path multiple times.
+                            if (loading) return;
+                            setPath(
+                              [path, entry.name].filter(Boolean).join("/"),
+                            );
+                          }}
                         >
                           {entry.name}/
                         </button>
@@ -231,6 +279,13 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
                     </td>
                     <td className="whitespace-nowrap px-3 py-1.5 text-right">
                       <span className="invisible flex justify-end gap-1 group-hover:visible">
+                        <button
+                          onClick={() => copyPath(absolute(entry.name))}
+                          className="rounded border border-zinc-300 px-1.5 py-0.5 text-zinc-600 hover:bg-zinc-100"
+                          title="Copy absolute path"
+                        >
+                          Copy path
+                        </button>
                         {!entry.is_dir && (
                           <a
                             href={api.downloadUrl(instanceId, absolute(entry.name))}

@@ -129,6 +129,24 @@ def render_docker_command(
     return " ".join(parts)
 
 
+def wrap_remote_command(docker_cmd: str, remote_log: str, *,
+                        ensure_dirs: list[str]) -> str:
+    """Wrap a docker command for remote dispatch: create the dirs it needs,
+    tee all output to a persistent log, and — critically — propagate the
+    CONTAINER's exit code through the pipe.
+
+    Without `set -o pipefail` a pipeline's exit code is the LAST command's
+    (tee, which always exits 0), so every job would report "succeeded" no
+    matter what the container did. Found on real hardware at the Phase 15
+    gate: two crashed vllm-serve jobs showed green.
+    """
+    mkdirs = " ".join(shlex.quote(d) for d in ensure_dirs)
+    return (
+        f"mkdir -p {mkdirs} && set -o pipefail && "
+        f"({docker_cmd}) 2>&1 | tee {shlex.quote(remote_log)}"
+    )
+
+
 def output_paths_for(template: JobTemplate, parameters: dict,
                      filesystem: str) -> list[str]:
     """The persistent host paths a task writes to (its writable mounts)."""
@@ -169,6 +187,9 @@ class Dispatcher:
         # Terminal activity is reported by the terminal WS handler (Phase 5);
         # jobs update it too, so "idle" means neither jobs nor shells.
         self.last_activity: dict[str, float] = {}
+        # Instances whose idle auto-termination the user switched off; also
+        # persisted on the launch row (see keep_alive_enabled).
+        self._keep_alive_mem: set[str] = set()
         self.on_capacity_available = None   # hook for notifications (set by app)
         # Model-readiness cache: task_id -> {ready, error, checked_at}. A
         # served model's task goes 'running' the instant its container is
@@ -199,6 +220,42 @@ class Dispatcher:
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
         self.last_activity[instance_id] = self._clock()
+
+    # -- idle keep-alive ---------------------------------------------------------------
+
+    def keep_alive_enabled(self, instance_id: str) -> bool:
+        """Whether the user has switched idle auto-termination off for this
+        instance. Persisted on the launch row when one exists, so it survives
+        a backend restart; in-memory otherwise (adopted external instances)."""
+        if instance_id in self._keep_alive_mem:
+            return True
+        launch = self.db.find_launch_by_instance(instance_id)
+        return bool(launch and launch.get("keep_alive"))
+
+    def set_keep_alive(self, instance_id: str, enabled: bool) -> dict:
+        if enabled:
+            self._keep_alive_mem.add(instance_id)
+        else:
+            self._keep_alive_mem.discard(instance_id)
+        launch = self.db.find_launch_by_instance(instance_id)
+        if launch:
+            self.db.update_launch(launch["id"], keep_alive=1 if enabled else 0)
+        self.db.record_audit(
+            "dashboard", "keep_alive",
+            f"{instance_id} idle auto-termination {'off' if enabled else 'on'}",
+        )
+        return {"instance_id": instance_id, "keep_alive": enabled}
+
+    def idle_status(self, instance_id: str) -> dict:
+        """Idle countdown info for the instance card. idle_seconds counts
+        from the last job/terminal activity (0 if none recorded yet)."""
+        last = self.last_activity.get(instance_id)
+        idle = max(0.0, self._clock() - last) if last is not None else 0.0
+        return {
+            "idle_seconds": round(idle),
+            "timeout_seconds": round(self.settings.idle.timeout_seconds),
+            "keep_alive": self.keep_alive_enabled(instance_id),
+        }
 
     # -- model readiness ---------------------------------------------------------------
 
@@ -307,9 +364,10 @@ class Dispatcher:
 
         # Also keep a persistent copy of the log on the filesystem.
         remote_log = f"/lambda/nfs/{filesystem}/task-logs/{task_id}.log"
-        wrapped = (
-            f"mkdir -p /workspace/ephemeral /lambda/nfs/{filesystem}/task-logs && "
-            f"({docker_cmd}) 2>&1 | tee {shlex.quote(remote_log)}"
+        wrapped = wrap_remote_command(
+            docker_cmd, remote_log,
+            ensure_dirs=["/workspace/ephemeral",
+                         f"/lambda/nfs/{filesystem}/task-logs"],
         )
 
         try:
@@ -397,6 +455,8 @@ class Dispatcher:
             if conn.state != ConnectionState.CONNECTED:
                 # Not reachable: don't count unreachable time as idle.
                 self.last_activity.pop(instance_id, None)
+                continue
+            if self.keep_alive_enabled(instance_id):
                 continue
             last = self.last_activity.setdefault(instance_id, now)
             if now - last < timeout:
