@@ -117,3 +117,17 @@ def test_task_logs_tail(db):
     tail = queue.get_logs(task_id, tail=3)
     assert [l["line"] for l in tail] == ["line 7", "line 8", "line 9"]
     assert [l["seq"] for l in tail] == [7, 8, 9]
+
+
+def test_task_logs_tail_over_http(client):
+    """The failed-job card fetches GET /tasks/{id}/logs?tail=10 to show WHY a
+    job failed inline. The endpoint must return exactly the LAST N lines."""
+    db = client.app.state.orchestrator.db
+    task_id = db.create_task(template="gpu-smoke", parameters={"note": "x"})
+    for i in range(1, 26):
+        db.append_task_log(task_id, f"line {i}")
+    db.update_task(task_id, status="failed", exit_code=126,
+                   error="container exited 126")
+    lines = [l["line"] for l in
+             client.get(f"/tasks/{task_id}/logs?tail=10").json()["lines"]]
+    assert lines == [f"line {i}" for i in range(16, 26)]

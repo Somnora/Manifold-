@@ -76,12 +76,16 @@ export default function InstancesPage() {
             {formatMoney(hourlyBurn)}/hr
           </span>
         </span>
-        <span className="text-zinc-500">
+        <Link
+          href="/history"
+          className="text-zinc-500 hover:text-zinc-900"
+          title="See the full spend history"
+        >
           Total spend:{" "}
-          <span className="font-medium text-zinc-900">
+          <span className="font-medium text-zinc-900 underline decoration-zinc-300 underline-offset-2">
             {formatMoney(totalSpend)}
           </span>
-        </span>
+        </Link>
       </div>
 
       <section>

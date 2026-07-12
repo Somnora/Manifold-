@@ -165,22 +165,29 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       onSubmit={submit}
       className="rounded-lg border border-zinc-200 bg-white p-4"
     >
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        <label className="block text-xs font-medium text-zinc-600">
-          1. GPU
-          <select
-            className={`${field} mt-1`}
-            value={instanceType}
-            onChange={(e) => setInstanceType(e.target.value)}
-          >
-            {typeOptions.map(({ name, t, available }) => (
-              <option key={name} value={name} disabled={!available}>
-                {t.description} ({formatMoney(t.price_usd_per_hour)}/hr)
-                {available ? "" : " — out of capacity"}
-              </option>
-            ))}
-          </select>
-        </label>
+      {/* GPU gets its own full-width row: price is the primary decision
+          variable and must never be truncated. Each option LEADS with the
+          full $/hr, then the GPU name + VRAM, so even a narrow closed control
+          shows the price first. */}
+      <label className="block text-xs font-medium text-zinc-600">
+        1. GPU
+        <select
+          className={`${field} mt-1`}
+          value={instanceType}
+          onChange={(e) => setInstanceType(e.target.value)}
+        >
+          {typeOptions.map(({ name, t, available }) => (
+            <option key={name} value={name} disabled={!available}>
+              {formatMoney(t.price_usd_per_hour)}/hr ·{" "}
+              {t.gpu_description || t.description}
+              {t.specs.gpus > 1 ? ` · ${t.specs.gpus}x` : ""}
+              {available ? "" : " · out of capacity"}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
         <label className="block text-xs font-medium text-zinc-600">
           2. Region
           <select
@@ -261,8 +268,14 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
               or pick a region where you already have one.
             </span>
           ) : selectedType ? (
-            `${selectedType.description}: ${selectedType.specs.gpus} GPU, ` +
-            `${selectedType.specs.vcpus} vCPU, ${selectedType.specs.memory_gib} GiB RAM`
+            <span>
+              <span className="font-medium text-zinc-700">
+                {formatMoney(selectedType.price_usd_per_hour)}/hr
+              </span>{" "}
+              — {selectedType.gpu_description || selectedType.description}:{" "}
+              {selectedType.specs.gpus} GPU, {selectedType.specs.vcpus} vCPU,{" "}
+              {selectedType.specs.memory_gib} GiB RAM
+            </span>
           ) : (
             ""
           )}

@@ -1149,3 +1149,31 @@ fixes, not behavior changes: PATH makes the pre-installed tool usable, and
 the copy tells the user what's actually happening instead of alarming them.
 (Interactive Claude sign-in on a headless box remains manual — that is
 inherent, not something cloud-init can pre-solve.)
+
+## 2026-07-11 — Finding: reconnect_on_startup is genuine restarts, not over-logging
+
+**Investigated (Prompt A):** Agent Activity showed dozens of near-identical
+`reconnect_on_startup` rows, ~one per minute.
+
+**Finding:** NOT over-logging. The event is emitted in exactly one place —
+`Orchestrator.adopt_running_instances()` (orchestrator.py), guarded by
+`if adopted:` — and that method is called from exactly one place: the
+FastAPI `lifespan` startup handler (main.py), once per process start. There
+is no loop and no repeated call; grep confirms a single call site. Each row
+therefore corresponds to a real backend restart that genuinely re-adopted a
+running instance.
+
+**Root cause of the frequency:** the dev server runs with `--reload` (see
+CLAUDE.md). During active development every save to a `backend/app/*.py`
+file restarts the process, and each restart legitimately re-adopts the
+still-running instance and writes exactly one audit row. With a live
+instance and a burst of edits (shipping several phases), that is dozens of
+honest restarts. In production (no `--reload`) it fires once per real start.
+
+**Decision:** do NOT change the emit — it is correct (once per actual
+startup, only when something was adopted). Two changes instead: (1) the
+Agent Activity UI collapses consecutive identical events into one counted
+row with a time range, so N restarts read as "reconnect_on_startup ×N,
+9:34–9:42", and (2) a note in CLAUDE.md that `--reload` restarts are
+expected during development. Behavior unchanged; only the display and the
+docs.

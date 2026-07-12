@@ -98,12 +98,12 @@ export default function JobsPage() {
   const history = (tasks ?? []).filter((t) => !ACTIVE.has(t.status));
 
   return (
-    <div className="grid gap-6 md:grid-cols-[minmax(280px,360px)_1fr]">
+    <div className="grid gap-6 lg:grid-cols-[minmax(360px,460px)_1fr]">
       <section>
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
           Queue a job
         </h2>
-        <div className="rounded-lg border border-zinc-200 bg-white p-4">
+        <div className="space-y-4 rounded-lg border border-zinc-200 bg-white p-5">
           <label className="block text-xs font-medium text-zinc-600">
             Template
             <select
@@ -123,12 +123,16 @@ export default function JobsPage() {
           </label>
           {template && (
             <>
-              <p className="mt-2 mb-3 text-xs text-zinc-500">
-                {template.description}
-                {template.gpu?.min_vram_gib
-                  ? ` · needs ≥${template.gpu.min_vram_gib} GiB VRAM`
-                  : ""}
-              </p>
+              {/* The launch decision is made here: what this job does and
+                  what GPU it needs, in a callout right under the picker. */}
+              <div className="rounded border border-zinc-200 bg-zinc-50 p-3 text-xs text-zinc-600">
+                <p>{template.description}</p>
+                {template.gpu?.min_vram_gib ? (
+                  <p className="mt-1 font-medium text-zinc-700">
+                    Needs a GPU with ≥{template.gpu.min_vram_gib} GiB VRAM.
+                  </p>
+                ) : null}
+              </div>
 
               {isVllm && presets.length > 0 && (
                 <div className="mb-4 rounded border border-zinc-100 bg-zinc-50 p-2.5">
@@ -236,6 +240,26 @@ function TaskCard({
 }) {
   const [showLogs, setShowLogs] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
+  const [failTail, setFailTail] = useState<string[] | null>(null);
+
+  // A failed job must show WHY inline, not just "exit -1": pull the last 10
+  // lines of its retained log automatically. The full "Logs" button still
+  // shows everything.
+  useEffect(() => {
+    if (task.status !== "failed") return;
+    let cancelled = false;
+    api
+      .taskLogs(task.id, 10)
+      .then((l) => {
+        if (!cancelled) setFailTail(l.map((x) => x.line));
+      })
+      .catch(() => {
+        if (!cancelled) setFailTail([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [task.id, task.status]);
 
   useEffect(() => {
     if (!showLogs) return;
@@ -308,6 +332,22 @@ function TaskCard({
         </p>
       )}
       {task.error && <p className="mt-2 text-xs text-red-700">{task.error}</p>}
+      {task.status === "failed" && failTail !== null && (
+        <div className="mt-2">
+          <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-zinc-400">
+            Last log lines
+          </p>
+          {failTail.length > 0 ? (
+            <pre className="max-h-40 overflow-auto rounded bg-zinc-950 p-2.5 text-[11px] leading-relaxed text-zinc-100">
+              {failTail.join("\n")}
+            </pre>
+          ) : (
+            <p className="text-xs text-zinc-500">
+              No log output was captured for this job.
+            </p>
+          )}
+        </div>
+      )}
       {task.status === "succeeded" && task.output_paths.length > 0 && (
         <p className="mt-2 text-xs text-zinc-500">
           Outputs:{" "}
