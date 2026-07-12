@@ -1,17 +1,37 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, ApiError, type Task, type Template } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  type ModelPreset,
+  type Task,
+  type Template,
+} from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import { ParameterForm } from "@/components/ParameterForm";
 import { formatDate } from "@/lib/format";
 
+// Accept a pasted HuggingFace URL or a bare id, and trim stray whitespace /
+// trailing punctuation (a trailing ";" once caused a serve failure).
+function normalizeModelId(raw: string): string {
+  let v = raw.trim();
+  const m = v.match(/huggingface\.co\/([^/\s]+\/[^/\s?#]+)/i);
+  if (m) v = m[1];
+  return v.replace(/[;,\s/]+$/g, "");
+}
+
+const ACTIVE = new Set(["queued", "running"]);
+
 export default function JobsPage() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templateErrors, setTemplateErrors] = useState<Record<string, string>>({});
+  const [presets, setPresets] = useState<ModelPreset[]>([]);
   const [selected, setSelected] = useState("");
+  const [seedModelId, setSeedModelId] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -26,15 +46,20 @@ export default function JobsPage() {
         if (r.templates.length > 0) setSelected((v) => v || r.templates[0].name);
       })
       .catch((e) => setError(e.message));
+    api.modelPresets().then(setPresets).catch(() => {});
   }, []);
 
   const template = templates.find((t) => t.name === selected);
+  const isVllm = selected === "vllm-serve";
 
   async function enqueue(values: Record<string, unknown>) {
     setSubmitting(true);
     setError("");
     setNotice("");
     try {
+      if (isVllm && typeof values.model_id === "string") {
+        values = { ...values, model_id: normalizeModelId(values.model_id) };
+      }
       const task = await api.enqueueTask(selected, values);
       setNotice(`Queued ${task.id} (${task.template})`);
       refresh();
@@ -44,6 +69,33 @@ export default function JobsPage() {
       setSubmitting(false);
     }
   }
+
+  async function clearHistory() {
+    setClearing(true);
+    setError("");
+    try {
+      const { cleared } = await api.clearFinishedTasks();
+      setNotice(`Cleared ${cleared} finished job(s)`);
+      refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  async function removeTask(id: string) {
+    setError("");
+    try {
+      await api.deleteTask(id);
+      refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
+
+  const active = (tasks ?? []).filter((t) => ACTIVE.has(t.status));
+  const history = (tasks ?? []).filter((t) => !ACTIVE.has(t.status));
 
   return (
     <div className="grid gap-6 md:grid-cols-[minmax(280px,360px)_1fr]">
@@ -57,7 +109,10 @@ export default function JobsPage() {
             <select
               className="mt-1 w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
               value={selected}
-              onChange={(e) => setSelected(e.target.value)}
+              onChange={(e) => {
+                setSelected(e.target.value);
+                setSeedModelId("");
+              }}
             >
               {templates.map((t) => (
                 <option key={t.name} value={t.name}>
@@ -68,17 +123,49 @@ export default function JobsPage() {
           </label>
           {template && (
             <>
-              <p className="mt-2 mb-4 text-xs text-zinc-500">
+              <p className="mt-2 mb-3 text-xs text-zinc-500">
                 {template.description}
                 {template.gpu?.min_vram_gib
                   ? ` · needs ≥${template.gpu.min_vram_gib} GiB VRAM`
                   : ""}
               </p>
+
+              {isVllm && presets.length > 0 && (
+                <div className="mb-4 rounded border border-zinc-100 bg-zinc-50 p-2.5">
+                  <p className="mb-2 text-xs font-medium text-zinc-600">
+                    Presets (click to fill · ungated, no token needed)
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {presets.map((p) => (
+                      <button
+                        key={p.model_id}
+                        type="button"
+                        title={`${p.model_id} — ${p.note}`}
+                        onClick={() => setSeedModelId(p.model_id)}
+                        className={`rounded border px-2 py-1 text-left text-xs hover:bg-white ${
+                          seedModelId === p.model_id
+                            ? "border-zinc-900 bg-white"
+                            : "border-zinc-300 bg-zinc-50"
+                        }`}
+                      >
+                        <span className="font-medium text-zinc-800">
+                          {p.label}
+                        </span>
+                        <span className="ml-1.5 text-zinc-400">{p.tier}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <ParameterForm
-                key={template.name}
+                key={`${template.name}:${seedModelId}`}
                 template={template}
                 onSubmit={enqueue}
                 submitting={submitting}
+                initialValues={
+                  isVllm && seedModelId ? { model_id: seedModelId } : undefined
+                }
               />
             </>
           )}
@@ -92,26 +179,61 @@ export default function JobsPage() {
         </div>
       </section>
 
-      <section>
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
-          Queue
-        </h2>
-        <div className="space-y-3">
-          {(tasks ?? []).map((t) => (
-            <TaskCard key={t.id} task={t} />
-          ))}
-          {(tasks ?? []).length === 0 && (
-            <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
-              No jobs yet.
-            </p>
-          )}
+      <section className="space-y-6">
+        <div>
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
+            Active {active.length > 0 && `(${active.length})`}
+          </h2>
+          <div className="space-y-3">
+            {active.map((t) => (
+              <TaskCard key={t.id} task={t} onRemove={removeTask} />
+            ))}
+            {active.length === 0 && (
+              <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
+                No active jobs.
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
+              History {history.length > 0 && `(${history.length})`}
+            </h2>
+            {history.length > 0 && (
+              <button
+                onClick={clearHistory}
+                disabled={clearing}
+                className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-50 disabled:opacity-50"
+              >
+                {clearing ? "Clearing..." : "Clear history"}
+              </button>
+            )}
+          </div>
+          <div className="space-y-3">
+            {history.map((t) => (
+              <TaskCard key={t.id} task={t} onRemove={removeTask} />
+            ))}
+            {history.length === 0 && (
+              <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
+                No finished jobs yet.
+              </p>
+            )}
+          </div>
         </div>
       </section>
     </div>
   );
 }
 
-function TaskCard({ task }: { task: Task }) {
+function TaskCard({
+  task,
+  onRemove,
+}: {
+  task: Task;
+  onRemove: (id: string) => void;
+}) {
   const [showLogs, setShowLogs] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
 
@@ -126,7 +248,6 @@ function TaskCard({ task }: { task: Task }) {
         })
         .catch(() => {});
     load();
-    // Live-tail while the task is active.
     const id =
       task.status === "running" || task.status === "queued"
         ? setInterval(load, 1500)
@@ -137,6 +258,8 @@ function TaskCard({ task }: { task: Task }) {
     };
   }, [showLogs, task.id, task.status]);
 
+  const finished = task.status !== "running" && task.status !== "queued";
+
   return (
     <div className="rounded-lg border border-zinc-200 bg-white p-4">
       <div className="flex items-center justify-between gap-3">
@@ -146,18 +269,16 @@ function TaskCard({ task }: { task: Task }) {
           <span className="font-mono text-xs text-zinc-400">{task.id}</span>
         </div>
         <div className="flex items-center gap-3 text-xs text-zinc-500">
-          {task.exit_code !== null &&
-            task.status !== "running" &&
-            task.status !== "queued" && (
-              <span
-                className={`font-mono ${
-                  task.exit_code === 0 ? "text-zinc-400" : "text-red-600"
-                }`}
-                title="Container exit code (the honest signal; see Logs)"
-              >
-                exit {task.exit_code}
-              </span>
-            )}
+          {task.exit_code !== null && finished && (
+            <span
+              className={`font-mono ${
+                task.exit_code === 0 ? "text-zinc-400" : "text-red-600"
+              }`}
+              title="Container exit code (the honest signal; see Logs)"
+            >
+              exit {task.exit_code}
+            </span>
+          )}
           <span>{formatDate(task.created_at)}</span>
           <button
             onClick={() => setShowLogs((s) => !s)}
@@ -165,6 +286,15 @@ function TaskCard({ task }: { task: Task }) {
           >
             {showLogs ? "Hide logs" : "Logs"}
           </button>
+          {task.status !== "running" && (
+            <button
+              onClick={() => onRemove(task.id)}
+              title="Remove from history"
+              className="rounded border border-zinc-200 px-2 py-0.5 text-zinc-400 hover:bg-red-50 hover:text-red-600"
+            >
+              Remove
+            </button>
+          )}
         </div>
       </div>
 
@@ -175,9 +305,7 @@ function TaskCard({ task }: { task: Task }) {
             .join("  ")}
         </p>
       )}
-      {task.error && (
-        <p className="mt-2 text-xs text-red-700">{task.error}</p>
-      )}
+      {task.error && <p className="mt-2 text-xs text-red-700">{task.error}</p>}
       {task.status === "succeeded" && task.output_paths.length > 0 && (
         <p className="mt-2 text-xs text-zinc-500">
           Outputs:{" "}

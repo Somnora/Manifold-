@@ -74,6 +74,14 @@ export type InstanceTypeInfo = {
 
 export type Region = { code: string; name: string };
 
+export type ModelPreset = {
+  label: string;
+  model_id: string;
+  vram_gib: number;
+  tier: string;
+  note: string;
+};
+
 export type SidecarDiagnosis = {
   cause: string;
   summary: string;
@@ -273,6 +281,17 @@ export const api = {
     request<{ lines: { seq: number; at: string; line: string }[] }>(
       `/tasks/${taskId}/logs${tail ? `?tail=${tail}` : ""}`,
     ).then((r) => r.lines),
+
+  deleteTask: (taskId: string) =>
+    request<{ deleted: string }>(`/tasks/${taskId}`, { method: "DELETE" }),
+
+  clearFinishedTasks: () =>
+    request<{ cleared: number }>("/tasks/finished", { method: "DELETE" }),
+
+  modelPresets: () =>
+    request<{ presets: ModelPreset[] }>("/model-presets").then(
+      (r) => r.presets,
+    ),
 
   settingsStatus: () =>
     request<{
