@@ -201,6 +201,7 @@ export type Task = {
   region: string | null;
   filesystem: string | null;
   launch_id: string | null;
+  target_instance_id: string | null;
   lifecycle: Lifecycle | null;
   lifecycle_detail: string | null;
   lifecycle_events: Record<string, string>;
@@ -330,6 +331,7 @@ export const api = {
     template: string,
     parameters: Record<string, unknown>,
     auto?: AutoManageConfig,
+    targetInstanceId?: string,
   ) =>
     request<{ task: Task }>("/tasks", {
       method: "POST",
@@ -337,6 +339,9 @@ export const api = {
         template,
         parameters,
         ...(auto ? { auto_manage: true, ...auto } : {}),
+        ...(!auto && targetInstanceId
+          ? { target_instance_id: targetInstanceId }
+          : {}),
       }),
     }).then((r) => r.task),
 

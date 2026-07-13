@@ -188,6 +188,10 @@ class Dispatcher:
         self.image_checker = image_checker
         self._clock = clock
         self._loops: list[asyncio.Task] = []
+        # In-flight dispatched jobs: task id -> the asyncio task running it.
+        # Guards the queued->running gap against double-dispatch and lets
+        # stop() cancel work in progress.
+        self._dispatching: dict[str, asyncio.Task] = {}
         # Terminal activity is reported by the terminal WS handler (Phase 5);
         # jobs update it too, so "idle" means neither jobs nor shells.
         self.last_activity: dict[str, float] = {}
@@ -216,12 +220,15 @@ class Dispatcher:
     async def stop(self) -> None:
         for loop in self._loops:
             loop.cancel()
-        for loop in self._loops:
+        for fut in self._dispatching.values():
+            fut.cancel()
+        for fut in list(self._loops) + list(self._dispatching.values()):
             try:
-                await loop
+                await fut
             except asyncio.CancelledError:
                 pass
         self._loops = []
+        self._dispatching = {}
 
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
@@ -327,19 +334,44 @@ class Dispatcher:
 
     # -- task loop -----------------------------------------------------------------
 
-    def _pick_dispatchable(
-        self,
-    ) -> tuple[dict, str, ManagedConnection] | None:
-        """First queued task that has an eligible connected instance.
+    def _is_server(self, template_name: str) -> bool:
+        """Server templates publish ports and stream for their lifetime
+        (vllm-serve, sglang-serve); batch templates run to completion."""
+        template = self.templates.get(template_name)
+        return bool(template is not None and template.ports)
 
-        Binding keeps the two job kinds from stepping on each other:
+    def _busy_map(self) -> tuple[set[str], set[str]]:
+        """Per-instance busy state from RUNNING tasks: (batch, server).
+
+        The concurrency rule per instance: one batch task at a time (GPU
+        contention), one server at a time (its port), but a server and a
+        batch task COEXIST - that is the documented serve+synthesize
+        pipeline. Instances are independent of each other."""
+        busy_batch: set[str] = set()
+        busy_server: set[str] = set()
+        for task in self.db.running_tasks():
+            iid = task.get("instance_id")
+            if not iid:
+                continue
+            if self._is_server(task["template"]):
+                busy_server.add(iid)
+            else:
+                busy_batch.add(iid)
+        return busy_batch, busy_server
+
+    def _pick_dispatchable(self) -> list[tuple[dict, str, ManagedConnection]]:
+        """Every queued task that has an eligible connected instance RIGHT
+        NOW, each bound to its instance. One pass can dispatch to several
+        instances at once - each GPU runs its own work independently.
+
+        Binding rules:
         - an auto-managed job runs ONLY on the instance its own lifecycle
-          launched, and only once that instance is 'ready' (connected);
-        - a manual job runs on any connected instance NOT owned by an
-          auto-managed lifecycle, so it never lands on a box about to be
-          torn down.
-        Scanning (rather than taking only the oldest) stops a waiting manual
-        job from blocking a ready auto-managed one, and vice versa.
+          launched, once that instance is 'ready' (connected);
+        - a manual job with target_instance_id runs only there (and never
+          on an auto-owned box); untargeted manual jobs take the first free
+          non-auto-owned instance;
+        - per instance: one batch task at a time, one server at a time,
+          server+batch coexist (see _busy_map).
         """
         connected = {
             iid: conn
@@ -347,40 +379,78 @@ class Dispatcher:
             if conn.state == ConnectionState.CONNECTED
         }
         if not connected:
-            return None
+            return []
         auto_owned = self.db.auto_managed_instance_ids()
+        busy_batch, busy_server = self._busy_map()
+        picks: list[tuple[dict, str, ManagedConnection]] = []
+
+        def free(iid: str, server: bool) -> bool:
+            return iid not in (busy_server if server else busy_batch)
+
+        def take(task: dict, iid: str) -> None:
+            picks.append((task, iid, connected[iid]))
+            (busy_server if self._is_server(task["template"])
+             else busy_batch).add(iid)
+
         for task in self.db.queued_tasks():
+            if task["id"] in self._dispatching:
+                continue   # picked on a previous tick, not yet marked running
+            server = self._is_server(task["template"])
             if task["auto_manage"]:
                 if task["lifecycle"] != "ready" or not task["launch_id"]:
                     continue
                 launch = self.db.get_launch(task["launch_id"])
                 iid = launch["lambda_instance_id"] if launch else None
-                if iid and iid in connected:
-                    return task, iid, connected[iid]
+                if iid and iid in connected and free(iid, server):
+                    take(task, iid)
             else:
-                for iid, conn in connected.items():
-                    if iid not in auto_owned:
-                        return task, iid, conn
-        return None
+                target = task.get("target_instance_id")
+                candidates = [target] if target else [
+                    iid for iid in connected if iid not in auto_owned]
+                for iid in candidates:
+                    if (iid in connected and iid not in auto_owned
+                            and free(iid, server)):
+                        take(task, iid)
+                        break
+        return picks
 
     async def _task_loop(self) -> None:
         while True:
             try:
-                await self._dispatch_once()
+                self._dispatch_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("task loop iteration failed")
             await asyncio.sleep(self.settings.tasks.poll_seconds)
 
-    async def _dispatch_once(self) -> None:
-        if self.queue.running_count() > 0:
-            return  # one task at a time per instance; keep it simple
-        pick = self._pick_dispatchable()
-        if pick is None:
-            return  # nothing queued, or no eligible instance yet
-        task, instance_id, conn = pick
-        await self._run_task(task, instance_id, conn)
+    def _dispatch_once(self) -> None:
+        """Spawn every dispatchable task as its own asyncio task.
+
+        Dispatch must NOT await a job inline: a server job (vllm-serve)
+        streams for hours, and awaiting it would freeze every other
+        instance's queue - the exact bug found at the Phase 35 test pass."""
+        for task_id in [t for t, fut in self._dispatching.items() if fut.done()]:
+            self._dispatching.pop(task_id)
+        for task, instance_id, conn in self._pick_dispatchable():
+            self._dispatching[task["id"]] = asyncio.create_task(
+                self._run_task_guarded(task, instance_id, conn))
+
+    async def _run_task_guarded(self, task: dict, instance_id: str,
+                                conn: ManagedConnection) -> None:
+        """_run_task with a crash net: a spawned task's exception would
+        otherwise vanish, leaving the job stuck 'running' forever."""
+        try:
+            await self._run_task(task, instance_id, conn)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("dispatched task %s crashed", task["id"])
+            current = self.queue.get(task["id"])
+            if current and current["status"] in ("queued", "running"):
+                self.queue.mark_finished(
+                    task["id"], exit_code=-1, output_paths=[],
+                    error=f"internal dispatch error: {exc}")
 
     async def _run_task(self, task: dict, instance_id: str,
                         conn: ManagedConnection) -> None:
@@ -524,10 +594,6 @@ class Dispatcher:
         up (we seed last_activity then), so a freshly booted instance gets a
         full quiet period before it is eligible.
         """
-        if self.queue.running_count() > 0:
-            # A running job keeps every instance alive (single-instance
-            # guardrail today; revisit when concurrency > 1).
-            return
         now = self._clock()
         timeout = self.settings.idle.timeout_seconds
         # Instances an auto-managed job owns are governed by that job's
@@ -536,8 +602,12 @@ class Dispatcher:
         # lifecycle is ever lost (its job reached a terminal state), the
         # instance drops out of this set and the idle loop resumes as backstop.
         auto_owned = self.db.auto_managed_instance_ids()
+        # A running task pins ITS OWN instance only (Phase 35): with several
+        # GPUs up, a job on box A must not keep an idle box B billing.
+        pinned = {t["instance_id"] for t in self.db.running_tasks()
+                  if t.get("instance_id")}
         for instance_id, conn in list(self.orchestrator.connections.items()):
-            if instance_id in auto_owned:
+            if instance_id in auto_owned or instance_id in pinned:
                 continue
             if conn.state != ConnectionState.CONNECTED:
                 # Not reachable: don't count unreachable time as idle.

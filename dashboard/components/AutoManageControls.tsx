@@ -130,9 +130,9 @@ export function AutoManageControls({
             Auto-manage the instance for this job
           </span>
           <span className="mt-0.5 block text-sky-800/80">
-            Rent a GPU only while this job runs: Manifold launches it, runs the
-            job, syncs outputs, then terminates it. No instance needs to be
-            running first.
+            On: rent a NEW GPU just for this job - Manifold launches it, runs
+            the job, syncs outputs, then terminates it. Off: the job queues
+            onto an instance you already have running.
           </span>
         </span>
       </label>

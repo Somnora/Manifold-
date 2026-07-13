@@ -1655,3 +1655,44 @@ downloadable, outside the tree that `git clone` pulls by default.
 already public, and confirmed no secret ever entered git history — `.env`,
 `manifold.db`, `host_keys.json` are gitignored and were never tracked.
 Sharing the repo link was already safe before this change.
+
+## 2026-07-13 — Per-instance parallel dispatch (supersedes "one task at a time")
+
+**Found at James's mock test pass.** Three compounding problems: (1) the
+dispatcher awaited each job INLINE and refused to dispatch while anything
+was running — so a server job (vllm-serve streams for its lifetime) froze
+every other job forever, contradicting the documented serve+synthesize
+pipeline; (2) with several GPUs there was no way to say which box a job
+should run on; (3) the mock SSH process exited instantly for server jobs, so
+vllm-serve went 'succeeded' in a second and chat/autopilot had no brain to
+find — masking bug (1) in every demo and test.
+
+**Decided:**
+- Dispatch spawns each job as its own asyncio task (`_dispatching` map
+  guards the queued->running gap and lets stop() cancel). Instances run
+  their work independently.
+- Per-instance concurrency rule: one BATCH task at a time (GPU contention),
+  one SERVER at a time (its port), but server+batch coexist — that is the
+  sanctioned pipeline. The 2026-07-11 "one task at a time" entry is
+  superseded; its rationale (serialized batch work per GPU) survives as the
+  per-instance batch rule.
+- Manual jobs accept `target_instance_id` (Jobs page "Run on" picker);
+  untargeted jobs take the first free non-auto-owned instance. Auto-managed
+  jobs still bind only to their own launched box.
+- Idle: a running task pins ITS OWN instance only — a job on box A no
+  longer keeps an idle box B billing (previously any running task blocked
+  ALL idle termination). Auto-owned instances stay lifecycle-governed.
+- Mock fidelity: mock server processes (commands publishing ports) stay
+  RUNNING until the connection closes (`MockSSHConnection.close()` now EOFs
+  open streams so nothing hangs); and mock mode always forces its own
+  registered ssh key — a real key name in config.yaml made every
+  auto-manage launch fail in the packaged demo.
+
+**Multi-GPU how-to:** raise `guardrails.max_concurrent_instances` (and mind
+`max_hourly_spend_usd`) in config.yaml; the guard stays deliberate.
+
+**Known mock-demo quirk (spec-correct):** the demo sidecar reports two
+canned unpersisted files, so an auto-manage teardown parks at 'terminating'
+with the reason on the job card — the safety hook doing exactly what
+Prompt B specified (never force). Resolve from the instance card (sync /
+terminate) and the job completes.

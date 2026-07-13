@@ -81,6 +81,9 @@ class TaskRequest(BaseModel):
     gpu_type: str | None = None
     region: str | None = None
     filesystem: str | None = None
+    # Pin a manual job to a specific connected instance (multi-GPU). Omit
+    # to take the first free instance. Ignored when auto_manage is set.
+    target_instance_id: str | None = None
 
 
 class WatchRequest(BaseModel):
@@ -171,11 +174,13 @@ def create_app(
             async def _mock_dial():
                 return MockSSHConnection()
             connect_fn = lambda host: _mock_dial  # noqa: E731
-        if not settings.ssh.key_name:
-            # Mock mode must work without any real configuration.
-            settings = replace(
-                settings, ssh=replace(settings.ssh, key_name="mock-key")
-            )
+        # Mock mode must work with ANY configuration: the mock catalog only
+        # registers mock keys, so a real key name from config.yaml (e.g.
+        # lambda-burst-ed25519) would fail every default-key launch - the
+        # auto-manage path hit exactly this at the Phase 35 test pass.
+        settings = replace(
+            settings, ssh=replace(settings.ssh, key_name="mock-key")
+        )
     elif lambda_client is None:
         # Real mode: never crash on a missing key. Start with a placeholder
         # that returns a clear "configure me" error on every call; the
@@ -1143,8 +1148,13 @@ def create_app(
                 f"{req.gpu_type}/{req.region}/{req.filesystem}")
         else:
             task_id = queue.enqueue(template=req.template,
-                                    parameters=req.parameters)
-            db.record_audit("api", "task_enqueue", f"{task_id} ({req.template})")
+                                    parameters=req.parameters,
+                                    target_instance_id=req.target_instance_id)
+            db.record_audit(
+                "api", "task_enqueue",
+                f"{task_id} ({req.template})"
+                + (f" -> {req.target_instance_id}"
+                   if req.target_instance_id else ""))
         return {"task": queue.get(task_id)}
 
     async def _validate_auto_manage(req: "TaskRequest") -> None:

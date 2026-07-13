@@ -166,6 +166,8 @@ class Database:
         self._ensure_column("tasks", "lifecycle", "TEXT")
         self._ensure_column("tasks", "lifecycle_detail", "TEXT")
         self._ensure_column("tasks", "lifecycle_events", "TEXT")
+        # Phase 35: pin a manual job to a specific instance (multi-GPU).
+        self._ensure_column("tasks", "target_instance_id", "TEXT")
         self._lock = threading.Lock()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -328,7 +330,8 @@ class Database:
     def create_task(self, *, template: str, parameters: dict,
                     auto_manage: bool = False, gpu_type: str | None = None,
                     region: str | None = None,
-                    filesystem: str | None = None) -> str:
+                    filesystem: str | None = None,
+                    target_instance_id: str | None = None) -> str:
         task_id = uuid.uuid4().hex[:12]
         # Auto-managed jobs start in lifecycle 'queued' with a first event
         # stamp; manual jobs leave lifecycle NULL (the field is unused for
@@ -339,11 +342,11 @@ class Database:
             """INSERT INTO tasks
                (id, created_at, template, parameters, status,
                 auto_manage, gpu_type, region, filesystem,
-                lifecycle, lifecycle_events)
-               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
+                lifecycle, lifecycle_events, target_instance_id)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, utcnow(), template, json.dumps(parameters),
              1 if auto_manage else 0, gpu_type, region, filesystem,
-             lifecycle, events),
+             lifecycle, events, target_instance_id),
         )
         return task_id
 
@@ -481,6 +484,14 @@ class Database:
             self._OWNING_LIFECYCLE,
         ).fetchall()
         return {r["iid"] for r in rows}
+
+    def running_tasks(self) -> list[dict]:
+        """All currently-running tasks. The dispatcher derives per-instance
+        busy state from these (which box is running what)."""
+        rows = self._execute(
+            "SELECT * FROM tasks WHERE status = 'running'"
+        ).fetchall()
+        return [self._task_row(r) for r in rows]
 
     def running_task_count(self) -> int:
         row = self._execute(
