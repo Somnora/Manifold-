@@ -102,6 +102,19 @@ CREATE TABLE IF NOT EXISTS agent_steps (
     PRIMARY KEY (run_id, seq)
 );
 
+-- Human approval gates for autopilot actions (Phase 36): a run with
+-- require_approval pauses spend/destructive actions here until decided.
+CREATE TABLE IF NOT EXISTS approvals (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    action      TEXT NOT NULL,
+    args        TEXT NOT NULL,          -- JSON
+    status      TEXT NOT NULL,          -- pending|approved|denied|expired
+    created_at  TEXT NOT NULL,
+    decided_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -168,6 +181,9 @@ class Database:
         self._ensure_column("tasks", "lifecycle_events", "TEXT")
         # Phase 35: pin a manual job to a specific instance (multi-GPU).
         self._ensure_column("tasks", "target_instance_id", "TEXT")
+        # Phase 36: runs whose spend actions pause for human approval.
+        self._ensure_column("agent_runs", "require_approval",
+                            "INTEGER NOT NULL DEFAULT 0")
         self._lock = threading.Lock()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -556,16 +572,63 @@ class Database:
     # -- autopilot runs ---------------------------------------------------------------
 
     def create_agent_run(self, *, goal: str, brain_instance_id: str,
-                         brain_model: str, max_steps: int) -> str:
+                         brain_model: str, max_steps: int,
+                         require_approval: bool = False) -> str:
         run_id = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO agent_runs
                (id, created_at, goal, brain_instance_id, brain_model,
-                status, max_steps)
-               VALUES (?, ?, ?, ?, ?, 'running', ?)""",
-            (run_id, utcnow(), goal, brain_instance_id, brain_model, max_steps),
+                status, max_steps, require_approval)
+               VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
+            (run_id, utcnow(), goal, brain_instance_id, brain_model,
+             max_steps, 1 if require_approval else 0),
         )
         return run_id
+
+    # -- approvals (Phase 36) -----------------------------------------------------
+
+    def create_approval(self, run_id: str, seq: int, action: str,
+                        args: dict) -> str:
+        approval_id = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO approvals (id, run_id, seq, action, args,
+               status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            (approval_id, run_id, seq, action, json.dumps(args), utcnow()),
+        )
+        return approval_id
+
+    def get_approval(self, approval_id: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        approval = dict(row)
+        approval["args"] = json.loads(approval["args"])
+        return approval
+
+    def decide_approval(self, approval_id: str, status: str) -> bool:
+        """pending -> approved/denied/expired. False if already decided
+        (the WHERE guard makes concurrent decisions race-safe)."""
+        cur = self._execute(
+            """UPDATE approvals SET status = ?, decided_at = ?
+               WHERE id = ? AND status = 'pending'""",
+            (status, utcnow(), approval_id),
+        )
+        return cur.rowcount > 0
+
+    def pending_approvals(self) -> list[dict]:
+        rows = self._execute(
+            """SELECT a.*, r.goal AS run_goal FROM approvals a
+               LEFT JOIN agent_runs r ON a.run_id = r.id
+               WHERE a.status = 'pending' ORDER BY a.created_at""",
+        ).fetchall()
+        out = []
+        for r in rows:
+            approval = dict(r)
+            approval["args"] = json.loads(approval["args"])
+            out.append(approval)
+        return out
 
     def update_agent_run(self, run_id: str, **fields: Any) -> None:
         allowed = {"status", "steps_taken", "summary", "error", "finished_at"}

@@ -59,12 +59,35 @@ idle:
   poll_seconds: 15
 
 autopilot:
-  # Agent runs: a model served on one instance drives Manifold's guarded
-  # operations. Every launch/terminate still passes the same guards.
+  # Agent runs: a model (GPU-served, local, or frontier API) drives
+  # Manifold's guarded operations. Every launch/terminate still passes the
+  # same guards.
   max_steps_default: 20     # steps per run unless the request says otherwise
   max_steps_cap: 50         # hard ceiling no request can exceed
   wait_cap_seconds: 120     # longest single "wait" action the agent may take
   chat_timeout_seconds: 300 # per-turn timeout talking to the brain model
+  # Approval-gated runs: how long a paused launch/run_job/terminate waits
+  # for your Approve/Deny before auto-denying (the run adapts, not dies).
+  approval_timeout_seconds: 600
+
+hub:
+  # The local half of Manifold: brains on this machine and frontier APIs.
+  # Local model servers probed for brains (appear automatically when up).
+  local_endpoints:
+    - { name: ollama, base_url: "http://127.0.0.1:11434/v1" }
+    - { name: lmstudio, base_url: "http://127.0.0.1:1234/v1" }
+  # Frontier APIs usable as brains once their key env var is in .env.
+  api_brains:
+    - { name: claude, base_url: "https://api.anthropic.com/v1",
+        model: claude-sonnet-4-5, api_key_env: ANTHROPIC_API_KEY }
+    - { name: openai, base_url: "https://api.openai.com/v1",
+        model: gpt-4o, api_key_env: OPENAI_API_KEY }
+    - { name: gemini,
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        model: gemini-2.5-pro, api_key_env: GEMINI_API_KEY }
+  # The in-dashboard terminal on THIS machine (Hub page). Loopback-only and
+  # origin-checked; set false to remove the endpoint entirely.
+  local_terminal: true
 
 watches:
   # Capacity watches: poll the instance-types catalog on this interval.

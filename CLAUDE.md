@@ -40,7 +40,8 @@ npm run dev     # then open http://localhost:3000
   - `task_queue.py` — `TaskQueue` interface + SQLite implementation
   - `dispatcher.py` — per-instance parallel task dispatch (server+batch coexist; jobs can target an instance), idle auto-termination, capacity watches, GPU telemetry sampling, auto-manage lifecycle (queue-then-launch through the guarded paths)
   - `estimates.py` — pure cost/utilization functions: pre-launch estimate + post-run right-size hint (advisory only, off the launch path)
-  - `agent.py` — Autopilot: agent loop driven by a model served on an instance; fixed action allowlist
+  - `agent.py` — Autopilot: agent loop driven by any brain; fixed action allowlist; optional human approval gate on spend actions
+  - `brains.py` — brain registry: instance-served models, local Ollama/LM Studio (auto-detected), frontier APIs (key-gated)
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes
   - `mcp_server.py` — MCP stdio bridge; HTTP-only thin client (AST-enforced), run via `uv run manifold-mcp`
@@ -49,7 +50,7 @@ npm run dev     # then open http://localhost:3000
 - `backend/tests/` — pytest; everything runs against mocks
 - `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init (metrics, unpersisted/recent files, fs browse/usage/delete)
 - `templates/*.yaml` — job templates (vllm-serve, sglang-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, script-run, llm-synthesize, gpu-smoke)
-- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md, distill-your-own-model.md, desktop-build.md)
+- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md, distill-your-own-model.md, desktop-build.md, local-hub.md)
 - `config.yaml` — guardrails, retry policy, SSH settings, telemetry sample interval
 - `.env` — secrets only (gitignored; template in `.env.example`)
 - `DECISIONS.md` — every non-obvious choice gets an entry (what/alternatives/why)

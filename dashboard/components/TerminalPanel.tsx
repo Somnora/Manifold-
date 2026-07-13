@@ -5,10 +5,17 @@ import "@xterm/xterm/css/xterm.css";
 import { wsBase } from "@/lib/backend";
 
 
-// A real shell on the instance: xterm.js <-> backend WS <-> SSH session on
-// the managed connection. Nothing runs on the instance except sshd; closing
-// the panel closes the shell.
-export function TerminalPanel({ instanceId }: { instanceId: string }) {
+// A real shell in the dashboard: xterm.js <-> backend WS. Two flavors of
+// the same wire protocol: an instance shell (SSH session over the managed
+// connection) or, with wsPath="/local/terminal", a shell on THIS machine
+// (the local half of the hub). Closing the panel closes the shell.
+export function TerminalPanel({
+  instanceId,
+  wsPath,
+}: {
+  instanceId?: string;
+  wsPath?: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<"connecting" | "open" | "closed">(
     "connecting",
@@ -57,7 +64,8 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
         }
       };
 
-      const ws = new WebSocket(`${wsBase()}/instances/${instanceId}/terminal`);
+      const path = wsPath ?? `/instances/${instanceId}/terminal`;
+      const ws = new WebSocket(`${wsBase()}${path}`);
 
       ws.onopen = () => {
         setStatus("open");
@@ -97,7 +105,7 @@ export function TerminalPanel({ instanceId }: { instanceId: string }) {
       disposed = true;
       cleanup?.();
     };
-  }, [instanceId]);
+  }, [instanceId, wsPath]);
 
   return (
     <div className="mt-3 overflow-hidden rounded border border-zinc-300 bg-[#09090b]">

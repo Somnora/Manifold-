@@ -118,6 +118,9 @@ Rules:
 - GPUs cost real money. Prefer the cheapest type that fits. Terminate
   instances you started once the work is finished (sync first if needed).
 - One action per turn. Be decisive; you have a limited number of steps.
+- Some runs gate launch_gpu / run_job / terminate_instance behind HUMAN
+  approval: the action may take a while to answer, and a denial comes back
+  as an error - respect it, adapt or finish instead of retrying it.
 
 Goal: {goal}"""
 
@@ -139,20 +142,29 @@ class Autopilot:
 
     # -- lifecycle ------------------------------------------------------------------
 
-    def start_run(self, *, goal: str, brain_instance_id: str,
-                  brain_model: str, brain_port: int, max_steps: int) -> str:
+    def start_run(self, *, goal: str, brain_ref: str,
+                  brain_model: str, brain_port: int, max_steps: int,
+                  client_fn=None, require_approval: bool = False) -> str:
+        """client_fn() -> chat client for the brain, resolved per turn (an
+        instance brain's connection can be replaced mid-run). None keeps
+        the legacy instance resolution via the orchestrator."""
         run_id = self.db.create_agent_run(
-            goal=goal, brain_instance_id=brain_instance_id,
+            goal=goal, brain_instance_id=brain_ref,
             brain_model=brain_model, max_steps=max_steps,
+            require_approval=require_approval,
         )
         self.db.record_audit(
             "autopilot", "run_start",
             f"{run_id}: goal={goal[:120]!r} brain={brain_model} "
-            f"on {brain_instance_id} (max {max_steps} steps)",
+            f"via {brain_ref} (max {max_steps} steps"
+            + (", approval-gated" if require_approval else "") + ")",
         )
+        if client_fn is None:
+            instance_id = brain_ref.partition(":")[2] or brain_ref
+            client_fn = lambda: self.orchestrator.model_client_for(instance_id)  # noqa: E731
         self.tasks[run_id] = asyncio.create_task(
-            self._run_loop(run_id, goal, brain_instance_id, brain_model,
-                           brain_port, max_steps)
+            self._run_loop(run_id, goal, client_fn, brain_model,
+                           brain_port, max_steps, require_approval)
         )
         return run_id
 
@@ -175,9 +187,9 @@ class Autopilot:
 
     # -- the loop ---------------------------------------------------------------------
 
-    async def _run_loop(self, run_id: str, goal: str, brain_instance_id: str,
+    async def _run_loop(self, run_id: str, goal: str, client_fn,
                         brain_model: str, brain_port: int,
-                        max_steps: int) -> None:
+                        max_steps: int, require_approval: bool) -> None:
         messages: list[dict] = [
             # .replace, not .format: the prompt is full of literal JSON braces.
             {"role": "system", "content": SYSTEM_PROMPT.replace("{goal}", goal)},
@@ -188,7 +200,7 @@ class Autopilot:
             for seq in range(1, max_steps + 1):
                 try:
                     reply = await asyncio.wait_for(
-                        self._chat(brain_instance_id, brain_model,
+                        self._chat(client_fn, brain_model,
                                    brain_port, messages),
                         timeout=self.settings.autopilot.chat_timeout_seconds,
                     )
@@ -232,7 +244,8 @@ class Autopilot:
                     self._finish(run_id, seq, "succeeded", summary=summary)
                     return
 
-                observation = await self._execute(action, args)
+                observation = await self._execute(
+                    run_id, seq, action, args, require_approval)
                 self._record(run_id, seq, thought=thought, action=action,
                              args=args, result=observation)
                 messages.append({"role": "user",
@@ -288,13 +301,11 @@ class Autopilot:
 
     # -- talking to the brain ------------------------------------------------------------
 
-    async def _chat(self, instance_id: str, model: str, port: int,
+    async def _chat(self, client_fn, model: str, port: int,
                     messages: list[dict]) -> str:
-        client = self.orchestrator.model_client_for(instance_id)
+        client = client_fn()
         if client is None:
-            raise ModelClientError(
-                f"no managed connection to brain instance {instance_id}"
-            )
+            raise ModelClientError("brain unreachable: no connection/client")
         payload = {
             "model": model,
             "messages": messages,
@@ -318,10 +329,48 @@ class Autopilot:
 
     # -- the action surface ---------------------------------------------------------------
 
-    async def _execute(self, action: str, args: dict) -> dict:
+    # Actions that spend money or destroy state: with require_approval on,
+    # these pause for a human Approve/Deny instead of executing.
+    GATED_ACTIONS = frozenset({"launch_gpu", "run_job", "terminate_instance"})
+
+    async def _await_approval(self, approval_id: str) -> str:
+        """Poll until the human decides or the timeout auto-denies.
+
+        Cancellation (run cancelled while waiting) expires the approval so
+        no stale pending card lingers in the UI."""
+        timeout = self.settings.autopilot.approval_timeout_seconds
+        deadline = asyncio.get_event_loop().time() + timeout
+        try:
+            while asyncio.get_event_loop().time() < deadline:
+                approval = self.db.get_approval(approval_id)
+                if approval and approval["status"] != "pending":
+                    return approval["status"]
+                await self._sleep(0.5)
+        except asyncio.CancelledError:
+            self.db.decide_approval(approval_id, "expired")
+            raise
+        self.db.decide_approval(approval_id, "expired")
+        return "expired"
+
+    async def _execute(self, run_id: str, seq: int, action: str, args: dict,
+                       require_approval: bool) -> dict:
         """Run one action; ALL failures come back as {"error": ...} data so
         the model can read them. Nothing raises across this boundary except
         cancellation."""
+        if require_approval and action in self.GATED_ACTIONS:
+            approval_id = self.db.create_approval(run_id, seq, action, args)
+            self.db.record_audit(
+                "autopilot", "approval_requested",
+                f"run {run_id} step {seq}: {action} "
+                f"{json.dumps(args)[:150]} (id {approval_id})")
+            decision = await self._await_approval(approval_id)
+            if decision == "denied":
+                return {"error": f"{action} was DENIED by the user. Do not "
+                                 f"retry it unchanged; adapt or finish."}
+            if decision == "expired":
+                return {"error": f"{action} approval timed out with no "
+                                 f"human decision - treat as denied."}
+            # approved: fall through and execute for real.
         try:
             handler = getattr(self, f"_act_{action}", None)
             if handler is None:

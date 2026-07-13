@@ -250,6 +250,26 @@ export type Utilization = {
   hint?: string;
 };
 
+export type Brain = {
+  ref: string; // "instance:<id>" | "local:<endpoint>/<model>" | "api:<name>"
+  kind: "instance" | "local" | "api";
+  label: string;
+  model: string;
+  detail: string;
+  ready: boolean;
+};
+
+export type Approval = {
+  id: string;
+  run_id: string;
+  run_goal: string | null;
+  seq: number;
+  action: string;
+  args: Record<string, unknown>;
+  status: "pending" | "approved" | "denied" | "expired";
+  created_at: string;
+};
+
 export type AgentRun = {
   id: string;
   created_at: string;
@@ -399,6 +419,19 @@ export const api = {
       }),
     }),
 
+  brains: () => request<{ brains: Brain[] }>("/brains").then((r) => r.brains),
+
+  approvals: () =>
+    request<{ approvals: Approval[] }>("/autopilot/approvals").then(
+      (r) => r.approvals,
+    ),
+
+  decideApproval: (id: string, approve: boolean) =>
+    request<{ approval: Approval }>(`/autopilot/approvals/${id}`, {
+      method: "POST",
+      body: JSON.stringify({ approve }),
+    }),
+
   autopilotRuns: () =>
     request<{ runs: AgentRun[] }>("/autopilot/runs").then((r) => r.runs),
 
@@ -407,8 +440,10 @@ export const api = {
 
   startAutopilot: (body: {
     goal: string;
-    brain_instance_id: string;
+    brain?: string; // full brain ref (instance:/local:/api:)
+    brain_instance_id?: string; // legacy spelling for instance brains
     max_steps?: number;
+    require_approval?: boolean;
   }) =>
     request<{ run: AgentRun }>("/autopilot/runs", {
       method: "POST",

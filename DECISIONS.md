@@ -1696,3 +1696,49 @@ canned unpersisted files, so an auto-manage teardown parks at 'terminating'
 with the reason on the job card — the safety hook doing exactly what
 Prompt B specified (never force). Resolve from the instance card (sync /
 terminate) and the job completes.
+
+## 2026-07-13 — The local hub: external brains, approval gates, local terminal
+
+**Context:** James's north star - "one synergetic system": local models,
+frontier APIs, and GPU-served models all first-class drivers of Manifold,
+plus a terminal on the local machine, plus approval-gated agent spending.
+
+**Brains registry (brains.py).** One abstraction, three kinds:
+`instance:` (served on a Manifold GPU, the original), `local:` (Ollama /
+LM Studio on this machine, auto-detected by probing /v1/models on their
+standard loopback ports), `api:` (Anthropic/OpenAI/Gemini via their
+OpenAI-compatible endpoints; offered ONLY when the key env var is set, so
+there is never a selectable-but-broken option). All three expose the same
+chat interface (ExternalBrainClient duck-types ModelClient), so the agent
+loop is brain-agnostic: Autopilot.start_run takes a client factory, and
+the run's brain ref is stored in the existing brain_instance_id column
+(strings like "local:ollama/llama3.1" - no schema migration).
+**The safety model is deliberately unchanged by the brain:** same action
+allowlist, same guards, same caps, same audit - a frontier model gets no
+more power than a 4B local one.
+
+**Approval gates.** Runs started with require_approval pause launch_gpu /
+run_job / terminate_instance as a `pending` row in a new approvals table;
+the agent loop polls until a human decision. Deny returns "DENIED by the
+user" AS DATA (the model adapts - test-proven, and nothing executes);
+approve falls through to the normal guarded execution; a timeout
+(autopilot.approval_timeout_seconds, 600s) auto-denies so an unattended
+run never spends. decide_approval uses a status='pending' WHERE guard, so
+a double-click or race decides exactly once. Gated set choice: the three
+actions that spend money or destroy state; reads stay free because an
+approval prompt per get_job_status would make the feature unusable.
+
+**Local terminal.** WS /local/terminal forks a login shell in a pty and
+speaks the exact wire protocol of the instance terminal (one generalized
+TerminalPanel drives both). Threat model: the backend is loopback-only,
+but browsers allow cross-origin WebSockets that CORS middleware does NOT
+cover - so the endpoint enforces a strict Origin allowlist (localhost /
+127.0.0.1) before accepting, plus a config kill switch
+(hub.local_terminal). POSIX-only for now; Windows says so instead of
+half-working. Audited on open. Alternatives: no local terminal (but the
+hub's whole point is one pane of glass), an allow-any-origin socket
+(would let any website you visit run shell commands - rejected).
+
+**Hub page.** The meeting point: local terminal, live brains list with
+kind badges, pending approvals. Autopilot's picker now reads the same
+/brains registry instead of probing instances itself.

@@ -102,8 +102,17 @@ class AgentAuditRequest(BaseModel):
 
 class AutopilotRequest(BaseModel):
     goal: str = Field(min_length=4, max_length=4000)
-    brain_instance_id: str
+    # Either a full brain ref ("instance:<id>" | "local:<ep>/<model>" |
+    # "api:<name>") or the legacy instance id field below.
+    brain: str | None = None
+    brain_instance_id: str | None = None
     max_steps: int | None = Field(default=None, ge=1)
+    # Pause launch_gpu / run_job / terminate_instance for human Approve/Deny.
+    require_approval: bool = False
+
+
+class ApprovalDecision(BaseModel):
+    approve: bool
 
 
 class ChatRequest(BaseModel):
@@ -219,6 +228,8 @@ def create_app(
         image_checker=image_checker,
     )
     autopilot = Autopilot(settings, orchestrator, queue, templates, db)
+    from .brains import BrainRegistry
+    brains = BrainRegistry(settings, orchestrator, queue, templates)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -246,6 +257,7 @@ def create_app(
     app.state.settings = settings
     app.state.dispatcher = dispatcher
     app.state.queue = queue
+    app.state.brains = brains
     app.state.autopilot = autopilot
 
     # The dashboard (Phase 2) runs on localhost:3000 and is the only
@@ -542,6 +554,97 @@ def create_app(
         finally:
             output_task.cancel()
             process.close()
+
+    @app.websocket("/local/terminal")
+    async def local_terminal(ws: WebSocket):
+        """A shell on THIS machine, in the dashboard - the local half of the
+        hub. Same wire protocol as the instance terminal, so the same panel
+        drives both.
+
+        Security posture (see DECISIONS.md): the backend only listens on
+        loopback, but browsers allow cross-origin WebSocket connections, so
+        a malicious web page could otherwise reach this endpoint. Defense:
+        a strict Origin allowlist (localhost only) - checked HERE because
+        CORS middleware does not cover WebSockets - plus a config kill
+        switch (hub.local_terminal).
+        """
+        origin = ws.headers.get("origin", "")
+        host = origin.split("://", 1)[-1].split(":")[0].lower()
+        if not settings.hub.local_terminal or host not in (
+                "localhost", "127.0.0.1"):
+            await ws.close(code=4403)
+            return
+        if os.name == "nt":
+            await ws.accept()
+            await ws.send_text("\r\n[manifold] the local terminal is not "
+                               "supported on Windows yet\r\n")
+            await ws.close()
+            return
+
+        import fcntl
+        import pty
+        import shutil
+        import signal
+        import struct
+        import termios
+
+        await ws.accept()
+        shell = os.environ.get("SHELL") or shutil.which("zsh") or "/bin/sh"
+        pid, fd = pty.fork()
+        if pid == 0:                       # child: become the user's shell
+            os.execvp(shell, [shell, "-l"])
+
+        loop = asyncio.get_event_loop()
+        out_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        def on_readable():
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                data = b""
+            out_queue.put_nowait(data or None)
+            if not data:
+                loop.remove_reader(fd)
+
+        loop.add_reader(fd, on_readable)
+
+        async def pump_output():
+            try:
+                while True:
+                    data = await out_queue.get()
+                    if data is None:
+                        break
+                    await ws.send_text(data.decode(errors="replace"))
+                await ws.send_text("\r\n[manifold] shell exited\r\n")
+                await ws.close()
+            except (WebSocketDisconnect, RuntimeError):
+                pass
+
+        output_task = asyncio.create_task(pump_output())
+        db.record_audit("dashboard", "local_terminal_open", shell)
+        try:
+            while True:
+                msg = await ws.receive_json()
+                if msg.get("type") == "input":
+                    os.write(fd, msg.get("data", "").encode())
+                elif msg.get("type") == "resize":
+                    size = struct.pack(
+                        "HHHH", int(msg.get("rows", 24)),
+                        int(msg.get("cols", 80)), 0, 0)
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+        except (WebSocketDisconnect, KeyError, ValueError, OSError):
+            pass
+        finally:
+            output_task.cancel()
+            try:
+                loop.remove_reader(fd)
+            except Exception:
+                pass
+            try:
+                os.kill(pid, signal.SIGHUP)   # end the shell with its window
+                os.close(fd)
+            except OSError:
+                pass
 
     # -- chat with a served model -----------------------------------------------
 
@@ -1283,39 +1386,84 @@ def create_app(
 
     @app.post("/autopilot/runs", status_code=202)
     async def start_autopilot_run(req: AutopilotRequest):
-        serving = _serving_task(req.brain_instance_id)
-        if serving is None:
-            raise HTTPException(
-                409,
-                f"No model is being served on {req.brain_instance_id}. "
-                "Queue a vllm-serve job there first; the running model "
-                "becomes the run's brain.",
+        # The brain can be any registered kind: instance:<id> (a model
+        # served on a Manifold GPU), local:<endpoint>/<model> (Ollama /
+        # LM Studio on this machine), or api:<name> (frontier API with a
+        # key in .env). brain_instance_id remains as the legacy spelling.
+        ref = req.brain or (f"instance:{req.brain_instance_id}"
+                            if req.brain_instance_id else None)
+        if not ref:
+            raise HTTPException(422, "pick a brain (instance/local/api)")
+
+        if ref.startswith("instance:"):
+            instance_id = ref.partition(":")[2]
+            serving = _serving_task(instance_id)
+            if serving is None:
+                raise HTTPException(
+                    409,
+                    f"No model is being served on {instance_id}. "
+                    "Queue a vllm-serve job there first; the running model "
+                    "becomes the run's brain.",
+                )
+            readiness = await dispatcher.model_ready(
+                instance_id, serving["id"], serving["port"]
             )
-        readiness = await dispatcher.model_ready(
-            req.brain_instance_id, serving["id"], serving["port"]
-        )
-        if not readiness["ready"]:
-            raise HTTPException(
-                409,
-                f"The brain model {serving['model_id']} is still loading "
-                f"({readiness['error']}). Wait until it is ready, then start "
-                f"the run.",
-            )
-        if orchestrator.model_client_for(req.brain_instance_id) is None:
-            raise HTTPException(
-                409, f"no managed connection to {req.brain_instance_id}"
-            )
+            if not readiness["ready"]:
+                raise HTTPException(
+                    409,
+                    f"The brain model {serving['model_id']} is still loading "
+                    f"({readiness['error']}). Wait until it is ready, then "
+                    f"start the run.",
+                )
+            if orchestrator.model_client_for(instance_id) is None:
+                raise HTTPException(
+                    409, f"no managed connection to {instance_id}"
+                )
+            brain_model, brain_port = serving["model_id"], serving["port"]
+            client_fn = None      # per-turn resolution via the orchestrator
+        else:
+            try:
+                client, brain_model, brain_port = brains.resolve(ref)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc))
+            client_fn = lambda: client  # noqa: E731
+
         cap = settings.autopilot.max_steps_cap
         max_steps = min(req.max_steps or settings.autopilot.max_steps_default,
                         cap)
         run_id = autopilot.start_run(
             goal=req.goal,
-            brain_instance_id=req.brain_instance_id,
-            brain_model=serving["model_id"],
-            brain_port=serving["port"],
+            brain_ref=ref,
+            brain_model=brain_model,
+            brain_port=brain_port,
             max_steps=max_steps,
+            client_fn=client_fn,
+            require_approval=req.require_approval,
         )
         return {"run": db.get_agent_run(run_id)}
+
+    @app.get("/brains")
+    async def list_brains():
+        """Every model that can drive Manifold right now: served on a GPU
+        instance, running locally (Ollama/LM Studio), or a frontier API
+        with a key configured."""
+        from dataclasses import asdict
+        return {"brains": [asdict(b) for b in await brains.list_brains()]}
+
+    @app.get("/autopilot/approvals")
+    async def list_pending_approvals():
+        """Actions waiting on a human Approve/Deny (approval-gated runs)."""
+        return {"approvals": db.pending_approvals()}
+
+    @app.post("/autopilot/approvals/{approval_id}")
+    async def decide_approval(approval_id: str, req: ApprovalDecision):
+        status = "approved" if req.approve else "denied"
+        if not db.decide_approval(approval_id, status):
+            raise HTTPException(
+                409, "already decided (or expired) - the run has moved on")
+        db.record_audit("dashboard", f"approval_{status}",
+                        f"approval {approval_id}")
+        return {"approval": db.get_approval(approval_id)}
 
     @app.get("/autopilot/runs")
     async def list_autopilot_runs():
