@@ -154,6 +154,10 @@ class HubSettings:
     local_endpoints: tuple[LocalBrainEndpoint, ...] = DEFAULT_LOCAL_ENDPOINTS
     # Frontier APIs usable as brains once their key is in .env.
     api_brains: tuple[ApiBrain, ...] = DEFAULT_API_BRAINS
+    # Frontier CLIs usable as brains via YOUR OWN login (claude / codex /
+    # gemini): each authenticates with the provider's official OAuth, and
+    # Manifold just invokes the CLI - no tokens or keys ever touch Manifold.
+    cli_brains: tuple[str, ...] = ("claude", "codex", "gemini")
     # The in-dashboard terminal on THIS machine (loopback + origin-checked).
     local_terminal: bool = True
 
@@ -305,6 +309,9 @@ def load_settings(
                          str(b.get("api_key_env", "")))
                 for b in hub.get("api_brains") or []
             ) or DEFAULT_API_BRAINS,
+            cli_brains=tuple(
+                str(n) for n in hub.get("cli_brains") or []
+            ) or ("claude", "codex", "gemini"),
             local_terminal=bool(hub.get("local_terminal", True)),
         ),
         telemetry=TelemetrySettings(

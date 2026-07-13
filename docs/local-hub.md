@@ -15,11 +15,22 @@ OpenAI-compatible interface:
 | --- | --- | --- |
 | `instance:` | Qwen3.6 on your H100 | queue vllm-serve; appears when running |
 | `local:` | llama3.1 via Ollama on your Mac | start Ollama/LM Studio; auto-detected |
+| `cli:` | Claude via your Max subscription | log into the claude/codex/gemini CLI once; auto-detected |
 | `api:` | Claude / GPT / Gemini | put the API key in .env; appears instantly |
 
 - Local detection probes `127.0.0.1:11434` (Ollama) and `:1234`
   (LM Studio) for `/v1/models` - nothing to configure, results cached a
   few seconds. Endpoints are editable under `hub.local_endpoints`.
+- CLI brains are the subscription path - "OAuth without the API bill".
+  You log into each CLI once with the provider's OWN official OAuth
+  (`claude`, `codex`, or `gemini` in any terminal); Manifold then invokes
+  the CLI as a subprocess per turn and never sees a token. This is the
+  ToS-clean way to use a Claude/ChatGPT/Gemini subscription from a
+  third-party tool: impersonating the CLIs' OAuth client ids directly
+  would violate provider terms and risk the ACCOUNT, so Manifold does not
+  do it. (Anthropic and OpenAI have announced sanctioned "sign in with
+  your subscription" programs for third-party apps; when those open up,
+  a first-party OAuth flow can replace this cleanly.)
 - API brains use each provider's OpenAI-compatible endpoint. Keys live in
   .env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) and are
   never stored anywhere else. No key -> the option simply is not offered.

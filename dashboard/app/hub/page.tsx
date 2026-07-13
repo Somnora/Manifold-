@@ -10,12 +10,14 @@ const KIND_LABEL: Record<Brain["kind"], string> = {
   instance: "GPU instance",
   local: "this machine",
   api: "frontier API",
+  cli: "your login",
 };
 
 const KIND_TONE: Record<Brain["kind"], string> = {
   instance: "bg-emerald-100 text-emerald-800",
   local: "bg-sky-100 text-sky-800",
   api: "bg-indigo-100 text-indigo-800",
+  cli: "bg-amber-100 text-amber-800",
 };
 
 // The Hub: where the local machine and the cloud meet. A terminal on THIS
@@ -96,7 +98,12 @@ export default function HubPage() {
                   automatically within seconds.
                 </li>
                 <li>
-                  Add an Anthropic / OpenAI / Gemini API key to .env
+                  Log into a frontier CLI once (claude, codex, or gemini) -
+                  it appears here via your own subscription, no API key
+                  needed.
+                </li>
+                <li>
+                  Or add an Anthropic / OpenAI / Gemini API key to .env
                   (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) - the
                   frontier brain appears on the next refresh.
                 </li>

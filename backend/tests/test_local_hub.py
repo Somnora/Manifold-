@@ -278,3 +278,79 @@ def test_local_terminal_echoes_and_respects_origin(tmp_path):
                 if "manifold_36" in seen:
                     break
             assert "manifold_36" in seen
+
+
+# -- cli brains (frontier CLIs via the user's own login) -------------------------------
+
+
+def make_fake_cli(tmp_path, name, reply):
+    """A fake frontier CLI: ignores its args and prints `reply` the way the
+    real CLI would (claude prints JSON with .result; gemini prints text)."""
+    import json as _json
+    script = tmp_path / name
+    if name == "claude":
+        body = f"print({_json.dumps(_json.dumps({'result': reply}))})"
+    else:
+        body = f"print({_json.dumps(reply)})"
+    script.write_text(f"#!/usr/bin/env python3\nimport sys\n{body}\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_cli_brains_offered_when_installed(tmp_path):
+    app, _, _ = registry_client(tmp_path)
+    reg = app.state.brains
+    fake = make_fake_cli(tmp_path, "claude", "hi")
+    reg._which = lambda name: fake if name == "claude" else None
+    with TestClient(app) as client:
+        brains = client.get("/brains").json()["brains"]
+        cli = [b for b in brains if b["kind"] == "cli"]
+        assert [b["ref"] for b in cli] == ["cli:claude"]
+        assert "your Claude (Anthropic) login" in cli[0]["label"]
+
+
+def test_cli_brain_answers_via_subprocess(tmp_path):
+    """The real subprocess plumbing: flatten -> spawn -> parse .result."""
+    from app.brains import CliBrainClient
+
+    fake = make_fake_cli(tmp_path, "claude", "pong from the cli")
+    client = CliBrainClient("claude", fake)
+    reply = asyncio.run(client.chat_completion(0, {
+        "messages": [{"role": "system", "content": "be brief"},
+                     {"role": "user", "content": "ping"}],
+    }))
+    assert reply["choices"][0]["message"]["content"] == "pong from the cli"
+
+
+def test_cli_brain_failure_is_actionable(tmp_path):
+    """A CLI that exits nonzero (e.g. not logged in) surfaces a hint, not a
+    stack trace."""
+    from app.brains import CliBrainClient
+    from app.model_client import ModelClientError
+
+    script = tmp_path / "claude"
+    script.write_text("#!/usr/bin/env python3\nimport sys\n"
+                      "sys.stderr.write('not logged in')\nsys.exit(1)\n")
+    script.chmod(0o755)
+    client = CliBrainClient("claude", str(script))
+    with pytest.raises(ModelClientError) as exc:
+        asyncio.run(client.chat_completion(0, {
+            "messages": [{"role": "user", "content": "ping"}]}))
+    assert "is it logged in" in str(exc.value)
+
+
+def test_cli_brain_drives_a_run_end_to_end(tmp_path):
+    """A fake `gemini` CLI answers with the done-action: the whole agent
+    loop works over the subprocess brain."""
+    reply = '{"action": "done", "args": {"summary": "cli brain works"}}'
+    fake = make_fake_cli(tmp_path, "gemini", reply)
+    app, _, _ = registry_client(tmp_path)
+    app.state.brains._which = lambda name: fake if name == "gemini" else None
+    with TestClient(app) as client:
+        run = client.post("/autopilot/runs", json={
+            "goal": "Prove the cli brain path works.",
+            "brain": "cli:gemini",
+        }).json()["run"]
+        done = wait_run(client, run["id"])
+        assert done["status"] == "succeeded"
+        assert done["summary"] == "cli brain works"

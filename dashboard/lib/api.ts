@@ -252,7 +252,7 @@ export type Utilization = {
 
 export type Brain = {
   ref: string; // "instance:<id>" | "local:<endpoint>/<model>" | "api:<name>"
-  kind: "instance" | "local" | "api";
+  kind: "instance" | "local" | "api" | "cli";
   label: string;
   model: string;
   detail: string;

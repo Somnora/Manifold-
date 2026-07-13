@@ -1742,3 +1742,30 @@ hub's whole point is one pane of glass), an allow-any-origin socket
 **Hub page.** The meeting point: local terminal, live brains list with
 kind badges, pending approvals. Autopilot's picker now reads the same
 /brains registry instead of probing instances itself.
+
+## 2026-07-13 — Subscription brains via CLI delegation, not spoofed OAuth
+
+**Asked:** OAuth login for frontier models instead of API keys.
+
+**Decided:** `cli:` brains. The user logs into the provider's own CLI once
+(claude / codex / gemini - each ships its own official OAuth flow), and
+Manifold invokes that CLI as a subprocess per turn (CliBrainClient: argv
+list, no shell, cwd = an empty scratch dir so an agentic CLI has nothing
+to poke at, hard timeout, stderr surfaced with an "is it logged in?"
+hint). Detection = executable on PATH; the registry offers what exists.
+Invocations verified against the installed CLIs' actual flags: claude
+`-p --output-format json` (.result), codex `exec --skip-git-repo-check
+-s read-only --output-last-message <tmp>`, gemini `-p -o text`.
+
+**Why not real OAuth:** the providers' subscription OAuth client ids
+belong to their own apps; a third-party impersonating Claude Code's or
+Codex's client id violates provider ToS and risks the user's ACCOUNT.
+The sanctioned third-party programs (Anthropic's and OpenAI's "sign in
+with your subscription") are preview/waitlist and require registering the
+app for its own client id - noted as the future replacement. CLI
+delegation gives the same UX today (log in once with the provider's own
+flow, no API key, subscription billing) with zero ToS exposure and zero
+token handling in Manifold.
+
+**Unchanged:** the brain safety model. A CLI brain gets the same action
+allowlist, guards, caps, approval gates, and audit as every other brain.
