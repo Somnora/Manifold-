@@ -19,7 +19,8 @@ class TaskQueue(abc.ABC):
     def enqueue(self, *, template: str, parameters: dict,
                 auto_manage: bool = False, gpu_type: str | None = None,
                 region: str | None = None,
-                filesystem: str | None = None) -> str:
+                filesystem: str | None = None,
+                target_instance_id: str | None = None) -> str:
         """Add a task; returns its id.
 
         When auto_manage is set, the dispatcher owns the instance lifecycle
@@ -66,10 +67,12 @@ class SQLiteTaskQueue(TaskQueue):
     def enqueue(self, *, template: str, parameters: dict,
                 auto_manage: bool = False, gpu_type: str | None = None,
                 region: str | None = None,
-                filesystem: str | None = None) -> str:
+                filesystem: str | None = None,
+                target_instance_id: str | None = None) -> str:
         return self._db.create_task(
             template=template, parameters=parameters, auto_manage=auto_manage,
-            gpu_type=gpu_type, region=region, filesystem=filesystem)
+            gpu_type=gpu_type, region=region, filesystem=filesystem,
+            target_instance_id=target_instance_id)
 
     def next_queued(self) -> dict | None:
         return self._db.next_queued_task()

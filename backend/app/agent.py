@@ -35,6 +35,7 @@ from .dispatcher import ParameterError, coerce_parameters
 from .lambda_api import LambdaAPIError
 from .model_client import ModelClientError
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
+from .preferences import GATEABLE_ACTIONS
 from .task_queue import TaskQueue
 from .templates import JobTemplate
 
@@ -107,7 +108,7 @@ Actions:
 - get_job_status {"task_id": str} -> queued|running|succeeded|failed + outputs
 - get_job_logs {"task_id": str, "tail": int} -> recent log lines
 - sync_outputs {"instance_id": str} -> save ephemeral scratch to persistent storage
-- terminate_instance {"instance_id": str, "force": bool} -> stop billing; force=false is blocked if unsaved files exist (then sync_outputs and retry)
+- terminate_instance {"instance_id": str, "force": bool} -> stop billing; force=false first RESCUES ephemeral files (saving them to persistent storage), and is blocked only if some file still could not be saved
 - wait {"seconds": number} -> pause before polling again
 - done {"summary": str} -> finish the run; ALWAYS end with this
 
@@ -118,6 +119,10 @@ Rules:
 - GPUs cost real money. Prefer the cheapest type that fits. Terminate
   instances you started once the work is finished (sync first if needed).
 - One action per turn. Be decisive; you have a limited number of steps.
+- Some runs gate certain actions (launch_gpu / run_job / terminate_instance)
+  behind HUMAN approval: such an action may take a while to answer, and a
+  denial comes back as an error - respect it, adapt or finish instead of
+  retrying it.
 
 Goal: {goal}"""
 
@@ -128,31 +133,53 @@ class Autopilot:
 
     def __init__(self, settings: Settings, orchestrator: Orchestrator,
                  queue: TaskQueue, templates: dict[str, JobTemplate],
-                 db: Database, *, sleep=asyncio.sleep):
+                 db: Database, *, sleep=asyncio.sleep, notifier=None):
         self.settings = settings
         self.orchestrator = orchestrator
         self.queue = queue
         self.templates = templates
         self.db = db
         self._sleep = sleep
+        # NotificationCenter (optional): pings when an action pauses for
+        # approval and when a run ends. An approval nobody hears about is a
+        # stall, not a safety feature.
+        self.notifier = notifier
         self.tasks: dict[str, asyncio.Task] = {}
 
     # -- lifecycle ------------------------------------------------------------------
 
-    def start_run(self, *, goal: str, brain_instance_id: str,
-                  brain_model: str, brain_port: int, max_steps: int) -> str:
+    def start_run(self, *, goal: str, brain_ref: str,
+                  brain_model: str, brain_port: int, max_steps: int,
+                  client_fn=None,
+                  gated_actions: frozenset[str] = frozenset()) -> str:
+        """client_fn() -> chat client for the brain, resolved per turn (an
+        instance brain's connection can be replaced mid-run). None keeps
+        the legacy instance resolution via the orchestrator.
+
+        gated_actions names the actions that pause for a human Approve/Deny
+        (a subset of GATEABLE_ACTIONS). Empty = the run is fully autonomous
+        within the guards. The policy is frozen at start: changing the
+        default in Settings mid-run does not move the goalposts under a run
+        that is already going."""
+        gated = frozenset(gated_actions) & set(GATEABLE_ACTIONS)
         run_id = self.db.create_agent_run(
-            goal=goal, brain_instance_id=brain_instance_id,
+            goal=goal, brain_instance_id=brain_ref,
             brain_model=brain_model, max_steps=max_steps,
+            gated_actions=tuple(gated),
         )
         self.db.record_audit(
             "autopilot", "run_start",
             f"{run_id}: goal={goal[:120]!r} brain={brain_model} "
-            f"on {brain_instance_id} (max {max_steps} steps)",
+            f"via {brain_ref} (max {max_steps} steps"
+            + (f", approval required for: {', '.join(sorted(gated))}"
+               if gated else ", no approval gates") + ")",
         )
+        if client_fn is None:
+            instance_id = brain_ref.partition(":")[2] or brain_ref
+            client_fn = lambda: self.orchestrator.model_client_for(instance_id)  # noqa: E731
         self.tasks[run_id] = asyncio.create_task(
-            self._run_loop(run_id, goal, brain_instance_id, brain_model,
-                           brain_port, max_steps)
+            self._run_loop(run_id, goal, client_fn, brain_model,
+                           brain_port, max_steps, gated)
         )
         return run_id
 
@@ -175,9 +202,9 @@ class Autopilot:
 
     # -- the loop ---------------------------------------------------------------------
 
-    async def _run_loop(self, run_id: str, goal: str, brain_instance_id: str,
+    async def _run_loop(self, run_id: str, goal: str, client_fn,
                         brain_model: str, brain_port: int,
-                        max_steps: int) -> None:
+                        max_steps: int, gated: frozenset[str]) -> None:
         messages: list[dict] = [
             # .replace, not .format: the prompt is full of literal JSON braces.
             {"role": "system", "content": SYSTEM_PROMPT.replace("{goal}", goal)},
@@ -188,7 +215,7 @@ class Autopilot:
             for seq in range(1, max_steps + 1):
                 try:
                     reply = await asyncio.wait_for(
-                        self._chat(brain_instance_id, brain_model,
+                        self._chat(client_fn, brain_model,
                                    brain_port, messages),
                         timeout=self.settings.autopilot.chat_timeout_seconds,
                     )
@@ -232,7 +259,8 @@ class Autopilot:
                     self._finish(run_id, seq, "succeeded", summary=summary)
                     return
 
-                observation = await self._execute(action, args)
+                observation = await self._execute(
+                    run_id, seq, action, args, gated)
                 self._record(run_id, seq, thought=thought, action=action,
                              args=args, result=observation)
                 messages.append({"role": "user",
@@ -285,16 +313,25 @@ class Autopilot:
             + (f": {summary[:150]}" if summary else "")
             + (f": {error[:150]}" if error else ""),
         )
+        self._notify(
+            "run_finished",
+            f"Autopilot run {status}",
+            (summary or error or f"{steps} step(s)")[:200],
+            ref=run_id,
+        )
+
+    def _notify(self, kind: str, title: str, body: str,
+                ref: str | None = None) -> None:
+        if self.notifier is not None:
+            self.notifier.notify(kind, title, body, ref=ref)
 
     # -- talking to the brain ------------------------------------------------------------
 
-    async def _chat(self, instance_id: str, model: str, port: int,
+    async def _chat(self, client_fn, model: str, port: int,
                     messages: list[dict]) -> str:
-        client = self.orchestrator.model_client_for(instance_id)
+        client = client_fn()
         if client is None:
-            raise ModelClientError(
-                f"no managed connection to brain instance {instance_id}"
-            )
+            raise ModelClientError("brain unreachable: no connection/client")
         payload = {
             "model": model,
             "messages": messages,
@@ -318,10 +355,53 @@ class Autopilot:
 
     # -- the action surface ---------------------------------------------------------------
 
-    async def _execute(self, action: str, args: dict) -> dict:
+    async def _await_approval(self, approval_id: str) -> str:
+        """Poll until the human decides or the timeout auto-denies.
+
+        Cancellation (run cancelled while waiting) expires the approval so
+        no stale pending card lingers in the UI."""
+        timeout = self.settings.autopilot.approval_timeout_seconds
+        deadline = asyncio.get_event_loop().time() + timeout
+        try:
+            while asyncio.get_event_loop().time() < deadline:
+                approval = self.db.get_approval(approval_id)
+                if approval and approval["status"] != "pending":
+                    return approval["status"]
+                await self._sleep(0.5)
+        except asyncio.CancelledError:
+            self.db.decide_approval(approval_id, "expired")
+            raise
+        self.db.decide_approval(approval_id, "expired")
+        return "expired"
+
+    async def _execute(self, run_id: str, seq: int, action: str, args: dict,
+                       gated: frozenset[str]) -> dict:
         """Run one action; ALL failures come back as {"error": ...} data so
         the model can read them. Nothing raises across this boundary except
         cancellation."""
+        if action in gated:
+            approval_id = self.db.create_approval(run_id, seq, action, args)
+            self.db.record_audit(
+                "autopilot", "approval_requested",
+                f"run {run_id} step {seq}: {action} "
+                f"{json.dumps(args)[:150]} (id {approval_id})")
+            self._notify(
+                "approval_requested",
+                f"Autopilot needs your approval: {action}",
+                f"{json.dumps(args)[:160]}\nThe run is paused until you "
+                f"decide, and auto-denies after "
+                f"{self.settings.autopilot.approval_timeout_seconds / 60:.0f} "
+                f"minutes.",
+                ref=approval_id,
+            )
+            decision = await self._await_approval(approval_id)
+            if decision == "denied":
+                return {"error": f"{action} was DENIED by the user. Do not "
+                                 f"retry it unchanged; adapt or finish."}
+            if decision == "expired":
+                return {"error": f"{action} approval timed out with no "
+                                 f"human decision - treat as denied."}
+            # approved: fall through and execute for real.
         try:
             handler = getattr(self, f"_act_{action}", None)
             if handler is None:

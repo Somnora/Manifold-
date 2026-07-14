@@ -17,6 +17,8 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from .preferences import Preferences, preferences_from_dict
+
 # Repo root is one level above backend/.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -111,6 +113,55 @@ class AutopilotSettings:
     max_steps_cap: int = 50
     wait_cap_seconds: float = 120.0
     chat_timeout_seconds: float = 300.0
+    # How long a run waits on a human Approve/Deny before the pending
+    # action auto-denies (the run then adapts; it does not die).
+    approval_timeout_seconds: float = 600.0
+
+
+@dataclass(frozen=True)
+class LocalBrainEndpoint:
+    name: str = ""
+    base_url: str = ""
+
+
+@dataclass(frozen=True)
+class ApiBrain:
+    name: str = ""
+    base_url: str = ""
+    model: str = ""
+    api_key_env: str = ""      # env var holding the key (.env; never stored)
+
+
+# Default local-hub wiring: the two standard local model servers, and the
+# three frontier APIs that expose OpenAI-compatible chat endpoints. An API
+# brain only appears once its key env var is set (Settings page or .env).
+DEFAULT_LOCAL_ENDPOINTS = (
+    LocalBrainEndpoint("ollama", "http://127.0.0.1:11434/v1"),
+    LocalBrainEndpoint("lmstudio", "http://127.0.0.1:1234/v1"),
+)
+DEFAULT_API_BRAINS = (
+    ApiBrain("claude", "https://api.anthropic.com/v1",
+             "claude-sonnet-4-5", "ANTHROPIC_API_KEY"),
+    ApiBrain("openai", "https://api.openai.com/v1",
+             "gpt-4o", "OPENAI_API_KEY"),
+    ApiBrain("gemini",
+             "https://generativelanguage.googleapis.com/v1beta/openai",
+             "gemini-2.5-pro", "GEMINI_API_KEY"),
+)
+
+
+@dataclass(frozen=True)
+class HubSettings:
+    # Local model servers to probe for brains (Ollama, LM Studio, ...).
+    local_endpoints: tuple[LocalBrainEndpoint, ...] = DEFAULT_LOCAL_ENDPOINTS
+    # Frontier APIs usable as brains once their key is in .env.
+    api_brains: tuple[ApiBrain, ...] = DEFAULT_API_BRAINS
+    # Frontier CLIs usable as brains via YOUR OWN login (claude / codex /
+    # gemini): each authenticates with the provider's official OAuth, and
+    # Manifold just invokes the CLI - no tokens or keys ever touch Manifold.
+    cli_brains: tuple[str, ...] = ("claude", "codex", "gemini")
+    # The in-dashboard terminal on THIS machine (loopback + origin-checked).
+    local_terminal: bool = True
 
 
 @dataclass(frozen=True)
@@ -133,6 +184,9 @@ class AutoManageSettings:
 class Settings:
     # Secrets (from .env). Empty string means "not configured".
     lambda_api_key: str = ""
+    # NOTE: `preferences` below holds the DEFAULTS for the user-editable
+    # policies (approval gates, notifications, data safety). The user's own
+    # choices live in the database and override these; see preferences.py.
     s3_access_key_id: str = ""
     s3_secret_access_key: str = ""
     tailscale_authkey: str = ""
@@ -147,8 +201,10 @@ class Settings:
     idle: IdleSettings = field(default_factory=IdleSettings)
     watches: WatchSettings = field(default_factory=WatchSettings)
     autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
+    hub: HubSettings = field(default_factory=HubSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
     auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
+    preferences: "Preferences" = field(default_factory=lambda: Preferences())
     default_connection_mode: str = "direct-ssh"
     db_path: str = str(DATA_ROOT / "manifold.db")
 
@@ -202,8 +258,13 @@ def load_settings(
     idle = raw.get("idle", {})
     watches = raw.get("watches", {})
     autopilot = raw.get("autopilot", {})
+    hub = raw.get("hub", {})
     telemetry = raw.get("telemetry", {})
     auto_manage = raw.get("auto_manage", {})
+    # Defaults for the Settings-page policies. A garbage value here can never
+    # stop the backend from starting: preferences_from_dict ignores what it
+    # does not understand and clamps what it does.
+    preferences = preferences_from_dict(Preferences(), raw.get("preferences", {}))
 
     db_path = database.get("path", "manifold.db")
     if not os.path.isabs(db_path):
@@ -243,6 +304,25 @@ def load_settings(
             max_steps_cap=int(autopilot.get("max_steps_cap", 50)),
             wait_cap_seconds=float(autopilot.get("wait_cap_seconds", 120)),
             chat_timeout_seconds=float(autopilot.get("chat_timeout_seconds", 300)),
+            approval_timeout_seconds=float(
+                autopilot.get("approval_timeout_seconds", 600)),
+        ),
+        hub=HubSettings(
+            local_endpoints=tuple(
+                LocalBrainEndpoint(str(e.get("name", "")),
+                                   str(e.get("base_url", "")))
+                for e in hub.get("local_endpoints") or []
+            ) or DEFAULT_LOCAL_ENDPOINTS,
+            api_brains=tuple(
+                ApiBrain(str(b.get("name", "")), str(b.get("base_url", "")),
+                         str(b.get("model", "")),
+                         str(b.get("api_key_env", "")))
+                for b in hub.get("api_brains") or []
+            ) or DEFAULT_API_BRAINS,
+            cli_brains=tuple(
+                str(n) for n in hub.get("cli_brains") or []
+            ) or ("claude", "codex", "gemini"),
+            local_terminal=bool(hub.get("local_terminal", True)),
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
@@ -250,6 +330,7 @@ def load_settings(
         auto_manage=AutoManageSettings(
             poll_seconds=float(auto_manage.get("poll_seconds", 5)),
         ),
+        preferences=preferences,
         ssh=SSHSettings(
             key_name=str(ssh.get("key_name", "")),
             private_key_path=str(ssh.get("private_key_path", "~/.ssh/id_ed25519")),

@@ -176,6 +176,7 @@ class Dispatcher:
         lambda_client: LambdaClient,
         *,
         image_checker: ImageChecker | None = None,
+        notifier=None,
         clock=time.monotonic,
     ):
         self.settings = settings
@@ -186,8 +187,16 @@ class Dispatcher:
         self.client = lambda_client
         # Pre-launch image preflight (None = skip, images assumed fine).
         self.image_checker = image_checker
+        # NotificationCenter (optional): pings when a job settles. Batch jobs
+        # run for hours unattended - the point of Manifold is that you are not
+        # sitting there watching the log.
+        self.notifier = notifier
         self._clock = clock
         self._loops: list[asyncio.Task] = []
+        # In-flight dispatched jobs: task id -> the asyncio task running it.
+        # Guards the queued->running gap against double-dispatch and lets
+        # stop() cancel work in progress.
+        self._dispatching: dict[str, asyncio.Task] = {}
         # Terminal activity is reported by the terminal WS handler (Phase 5);
         # jobs update it too, so "idle" means neither jobs nor shells.
         self.last_activity: dict[str, float] = {}
@@ -216,16 +225,55 @@ class Dispatcher:
     async def stop(self) -> None:
         for loop in self._loops:
             loop.cancel()
-        for loop in self._loops:
+        for fut in self._dispatching.values():
+            fut.cancel()
+        for fut in list(self._loops) + list(self._dispatching.values()):
             try:
-                await loop
+                await fut
             except asyncio.CancelledError:
                 pass
         self._loops = []
+        self._dispatching = {}
 
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
         self.last_activity[instance_id] = self._clock()
+
+    # -- job completion (the single funnel) ----------------------------------------
+
+    def _finish_task(self, task_id: str, *, exit_code: int,
+                     output_paths: list[str], error: str = "",
+                     notify: bool = True) -> None:
+        """Settle a task and ping once.
+
+        EVERY completion path in this file goes through here - dispatch
+        errors, bad parameters, a missing image, a lost connection, the
+        container's own exit code, an auto-manage failure. One funnel means
+        a job can never finish silently, which is the whole point when the
+        job is running unattended on a GPU that costs money.
+        """
+        self.queue.mark_finished(task_id, exit_code=exit_code,
+                                 output_paths=output_paths, error=error)
+        if not notify or self.notifier is None:
+            return
+        task = self.queue.get(task_id) or {}
+        name = task.get("template", "job")
+        succeeded = task.get("status") == "succeeded"
+        where = f" on {task['instance_id']}" if task.get("instance_id") else ""
+        if succeeded:
+            outputs = task.get("output_paths") or []
+            self.notifier.notify(
+                "job_succeeded", f"Job succeeded: {name}",
+                f"{task_id}{where}"
+                + (f"\nOutputs: {', '.join(outputs[:3])}" if outputs else ""),
+                ref=task_id,
+            )
+        else:
+            self.notifier.notify(
+                "job_failed", f"Job failed: {name}",
+                f"{task_id}{where}\n{(error or f'exit {exit_code}')[:200]}",
+                ref=task_id,
+            )
 
     # -- idle keep-alive ---------------------------------------------------------------
 
@@ -327,19 +375,44 @@ class Dispatcher:
 
     # -- task loop -----------------------------------------------------------------
 
-    def _pick_dispatchable(
-        self,
-    ) -> tuple[dict, str, ManagedConnection] | None:
-        """First queued task that has an eligible connected instance.
+    def _is_server(self, template_name: str) -> bool:
+        """Server templates publish ports and stream for their lifetime
+        (vllm-serve, sglang-serve); batch templates run to completion."""
+        template = self.templates.get(template_name)
+        return bool(template is not None and template.ports)
 
-        Binding keeps the two job kinds from stepping on each other:
+    def _busy_map(self) -> tuple[set[str], set[str]]:
+        """Per-instance busy state from RUNNING tasks: (batch, server).
+
+        The concurrency rule per instance: one batch task at a time (GPU
+        contention), one server at a time (its port), but a server and a
+        batch task COEXIST - that is the documented serve+synthesize
+        pipeline. Instances are independent of each other."""
+        busy_batch: set[str] = set()
+        busy_server: set[str] = set()
+        for task in self.db.running_tasks():
+            iid = task.get("instance_id")
+            if not iid:
+                continue
+            if self._is_server(task["template"]):
+                busy_server.add(iid)
+            else:
+                busy_batch.add(iid)
+        return busy_batch, busy_server
+
+    def _pick_dispatchable(self) -> list[tuple[dict, str, ManagedConnection]]:
+        """Every queued task that has an eligible connected instance RIGHT
+        NOW, each bound to its instance. One pass can dispatch to several
+        instances at once - each GPU runs its own work independently.
+
+        Binding rules:
         - an auto-managed job runs ONLY on the instance its own lifecycle
-          launched, and only once that instance is 'ready' (connected);
-        - a manual job runs on any connected instance NOT owned by an
-          auto-managed lifecycle, so it never lands on a box about to be
-          torn down.
-        Scanning (rather than taking only the oldest) stops a waiting manual
-        job from blocking a ready auto-managed one, and vice versa.
+          launched, once that instance is 'ready' (connected);
+        - a manual job with target_instance_id runs only there (and never
+          on an auto-owned box); untargeted manual jobs take the first free
+          non-auto-owned instance;
+        - per instance: one batch task at a time, one server at a time,
+          server+batch coexist (see _busy_map).
         """
         connected = {
             iid: conn
@@ -347,47 +420,85 @@ class Dispatcher:
             if conn.state == ConnectionState.CONNECTED
         }
         if not connected:
-            return None
+            return []
         auto_owned = self.db.auto_managed_instance_ids()
+        busy_batch, busy_server = self._busy_map()
+        picks: list[tuple[dict, str, ManagedConnection]] = []
+
+        def free(iid: str, server: bool) -> bool:
+            return iid not in (busy_server if server else busy_batch)
+
+        def take(task: dict, iid: str) -> None:
+            picks.append((task, iid, connected[iid]))
+            (busy_server if self._is_server(task["template"])
+             else busy_batch).add(iid)
+
         for task in self.db.queued_tasks():
+            if task["id"] in self._dispatching:
+                continue   # picked on a previous tick, not yet marked running
+            server = self._is_server(task["template"])
             if task["auto_manage"]:
                 if task["lifecycle"] != "ready" or not task["launch_id"]:
                     continue
                 launch = self.db.get_launch(task["launch_id"])
                 iid = launch["lambda_instance_id"] if launch else None
-                if iid and iid in connected:
-                    return task, iid, connected[iid]
+                if iid and iid in connected and free(iid, server):
+                    take(task, iid)
             else:
-                for iid, conn in connected.items():
-                    if iid not in auto_owned:
-                        return task, iid, conn
-        return None
+                target = task.get("target_instance_id")
+                candidates = [target] if target else [
+                    iid for iid in connected if iid not in auto_owned]
+                for iid in candidates:
+                    if (iid in connected and iid not in auto_owned
+                            and free(iid, server)):
+                        take(task, iid)
+                        break
+        return picks
 
     async def _task_loop(self) -> None:
         while True:
             try:
-                await self._dispatch_once()
+                self._dispatch_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("task loop iteration failed")
             await asyncio.sleep(self.settings.tasks.poll_seconds)
 
-    async def _dispatch_once(self) -> None:
-        if self.queue.running_count() > 0:
-            return  # one task at a time per instance; keep it simple
-        pick = self._pick_dispatchable()
-        if pick is None:
-            return  # nothing queued, or no eligible instance yet
-        task, instance_id, conn = pick
-        await self._run_task(task, instance_id, conn)
+    def _dispatch_once(self) -> None:
+        """Spawn every dispatchable task as its own asyncio task.
+
+        Dispatch must NOT await a job inline: a server job (vllm-serve)
+        streams for hours, and awaiting it would freeze every other
+        instance's queue - the exact bug found at the Phase 35 test pass."""
+        for task_id in [t for t, fut in self._dispatching.items() if fut.done()]:
+            self._dispatching.pop(task_id)
+        for task, instance_id, conn in self._pick_dispatchable():
+            self._dispatching[task["id"]] = asyncio.create_task(
+                self._run_task_guarded(task, instance_id, conn))
+
+    async def _run_task_guarded(self, task: dict, instance_id: str,
+                                conn: ManagedConnection) -> None:
+        """_run_task with a crash net: a spawned task's exception would
+        otherwise vanish, leaving the job stuck 'running' forever."""
+        try:
+            await self._run_task(task, instance_id, conn)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("dispatched task %s crashed", task["id"])
+            current = self.queue.get(task["id"])
+            if current and current["status"] in ("queued", "running"):
+                self._finish_task(
+                    task["id"], exit_code=-1, output_paths=[],
+                    error=f"internal dispatch error: {exc}")
 
     async def _run_task(self, task: dict, instance_id: str,
                         conn: ManagedConnection) -> None:
         task_id = task["id"]
         template = self.templates.get(task["template"])
         if template is None:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[],
                 error=f"template '{task['template']}' no longer exists",
             )
@@ -396,7 +507,7 @@ class Dispatcher:
         launch = self.db.find_launch_by_instance(instance_id)
         filesystem = (launch or {}).get("filesystem")
         if not filesystem:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[],
                 error=f"no filesystem recorded for instance {instance_id}",
             )
@@ -405,7 +516,7 @@ class Dispatcher:
         try:
             parameters = coerce_parameters(template, task["parameters"])
         except ParameterError as exc:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[], error=str(exc)
             )
             return
@@ -414,7 +525,7 @@ class Dispatcher:
         # before any docker pull ever runs on the instance.
         image_error = await self._image_preflight(template)
         if image_error is not None:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[], error=image_error
             )
             self.db.record_audit(
@@ -455,7 +566,7 @@ class Dispatcher:
             )
         except ConnectionError as exc:
             self.queue.append_log(task_id, f"[manifold] connection lost: {exc}")
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[],
                 error=f"SSH connection lost during task: {exc}",
             )
@@ -469,7 +580,7 @@ class Dispatcher:
             task_id,
             f"[manifold] exited {exit_code}; log archived at {remote_log}",
         )
-        self.queue.mark_finished(
+        self._finish_task(
             task_id,
             exit_code=exit_code,
             output_paths=outputs,
@@ -524,10 +635,6 @@ class Dispatcher:
         up (we seed last_activity then), so a freshly booted instance gets a
         full quiet period before it is eligible.
         """
-        if self.queue.running_count() > 0:
-            # A running job keeps every instance alive (single-instance
-            # guardrail today; revisit when concurrency > 1).
-            return
         now = self._clock()
         timeout = self.settings.idle.timeout_seconds
         # Instances an auto-managed job owns are governed by that job's
@@ -536,8 +643,12 @@ class Dispatcher:
         # lifecycle is ever lost (its job reached a terminal state), the
         # instance drops out of this set and the idle loop resumes as backstop.
         auto_owned = self.db.auto_managed_instance_ids()
+        # A running task pins ITS OWN instance only (Phase 35): with several
+        # GPUs up, a job on box A must not keep an idle box B billing.
+        pinned = {t["instance_id"] for t in self.db.running_tasks()
+                  if t.get("instance_id")}
         for instance_id, conn in list(self.orchestrator.connections.items()):
-            if instance_id in auto_owned:
+            if instance_id in auto_owned or instance_id in pinned:
                 continue
             if conn.state != ConnectionState.CONNECTED:
                 # Not reachable: don't count unreachable time as idle.
@@ -555,25 +666,26 @@ class Dispatcher:
                 f"{instance_id} idle {now - last:.0f}s (limit {timeout:.0f}s)",
             )
             try:
-                # force=False: the Phase 3 safety hook still applies.
+                # force=False: terminate() rescues the instance's data first
+                # (sync to the persistent volume and/or download here, per the
+                # data-safety policy) and only refuses if something could NOT
+                # be saved. No sync-then-force dance here any more — that lived
+                # in this loop when terminate() did not rescue, and it meant
+                # every OTHER caller had to reimplement it.
                 await self.orchestrator.terminate(instance_id, force=False)
                 self.last_activity.pop(instance_id, None)
             except TerminationBlocked as exc:
-                # Unpersisted files: sync them, then try once more. If that
-                # still fails, leave the instance alone and try next cycle.
-                logger.info("idle termination blocked by %d files; syncing",
-                            len(exc.files))
+                # The rescue could not save everything. Leave the box up with
+                # the data intact rather than destroying it; the orchestrator
+                # has already pinged the user. Retried next cycle.
+                logger.warning(
+                    "idle termination of %s refused: %d file(s) unsaveable",
+                    instance_id, len(exc.files))
                 self.db.record_audit(
-                    "backend", "idle_sync",
-                    f"{instance_id}: {len(exc.files)} unpersisted files",
+                    "backend", "idle_termination_blocked",
+                    f"{instance_id}: {len(exc.files)} file(s) could not be "
+                    f"saved; instance left running",
                 )
-                try:
-                    await self.orchestrator.sync_ephemeral(instance_id)
-                    await self.orchestrator.terminate(instance_id, force=True)
-                    self.last_activity.pop(instance_id, None)
-                except (LaunchRejected, TerminationBlocked) as sync_exc:
-                    logger.warning("idle sync+terminate failed for %s: %s",
-                                   instance_id, sync_exc)
 
     # -- auto-manage lifecycle loop -----------------------------------------------------
 
@@ -656,7 +768,7 @@ class Dispatcher:
         if task and task["status"] == "queued":
             # Never dispatched (guard rejection or boot failure): close it out
             # so it leaves the active list with the reason attached.
-            self.queue.mark_finished(job["id"], exit_code=-1, output_paths=[],
+            self._finish_task(job["id"], exit_code=-1, output_paths=[],
                                      error=reason)
         self._transition(job, "failed", detail=reason,
                          audit_action="auto_manage_failed")
@@ -745,14 +857,13 @@ class Dispatcher:
             self._transition(job, "done", instance_id=iid,
                              detail="synced and terminated")
         except TerminationBlocked as exc:
-            # Spec: if files REMAIN after the intended sync, do NOT force.
-            # Surface it exactly like the manual flow and leave the box up for
-            # review. The loop keeps retrying force=False, so the moment the
-            # user syncs/clears the files (or terminates manually) the job
-            # completes on its own.
-            msg = (f"termination blocked: {len(exc.files)} unpersisted "
-                   f"file(s) remain after sync; instance {iid} left running "
-                   f"for review")
+            # The rescue could not save every file, and the data-safety policy
+            # says data beats billing. Do NOT force. Surface it exactly like
+            # the manual flow and leave the box up for review; the loop keeps
+            # retrying force=False, so the moment the user resolves the files
+            # (or terminates manually) the job completes on its own.
+            msg = (f"termination blocked: {len(exc.files)} file(s) could not "
+                   f"be saved; instance {iid} left running for review")
             if job.get("lifecycle_detail") != msg:
                 self.db.set_task_lifecycle(job["id"], "terminating",
                                            detail=msg, stamp=False)
@@ -790,8 +901,10 @@ class Dispatcher:
         self.db.set_task_lifecycle(task_id, "cancelled",
                                    detail="cancelled by user")
         if task["status"] == "queued":
-            self.queue.mark_finished(task_id, exit_code=-1, output_paths=[],
-                                     error="cancelled by user")
+            # notify=False: the user is standing right there having just
+            # clicked Cancel. Pinging them about it would be noise.
+            self._finish_task(task_id, exit_code=-1, output_paths=[],
+                              error="cancelled by user", notify=False)
         self.db.record_audit(
             "backend", "auto_manage_cancelled",
             f"job {task_id}" + (f" instance {iid}" if iid else "")

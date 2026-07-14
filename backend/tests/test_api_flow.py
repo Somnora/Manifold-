@@ -37,13 +37,12 @@ def test_full_lifecycle_over_http(client):
     assert inst["hourly_rate_usd"] == 1.29
 
     # Terminate and confirm history records it with timestamps for costing.
-    # The Phase 3 safety hook blocks first (mock sidecar reports unpersisted
-    # files), then force goes through.
+    # The mock sidecar reports unpersisted files, so the Phase 37 rescue runs
+    # first (rsync to the persistent volume) and the termination then goes
+    # through in ONE call — the user does not have to know about any of it.
     resp = client.delete(f"/instances/{instance_id}")
-    assert resp.status_code == 409
-    assert resp.json()["blocked"] is True
-    resp = client.delete(f"/instances/{instance_id}", params={"force": "true"})
     assert resp.status_code == 200
+    assert resp.json()["rescue"]["synced_to"].endswith("/ephemeral-backup/")
 
     history = client.get("/launches").json()["launches"]
     row = next(l for l in history if l["id"] == launch["id"])

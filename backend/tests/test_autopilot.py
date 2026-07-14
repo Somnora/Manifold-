@@ -139,6 +139,10 @@ def test_golden_run_brain_manages_second_gpu(tmp_path, mock_client,
         resp = client.post("/autopilot/runs", json={
             "goal": "Launch a second A10 in us-east-1 and confirm it is up.",
             "brain_instance_id": brain_id,
+            # This test is about the agent loop, not the approval gate. An
+            # explicit empty policy opts out; omitting it would inherit the
+            # Settings default (gate launches) and park at step 2.
+            "approve_actions": [],
         })
         assert resp.status_code == 202
         run_id = resp.json()["run"]["id"]
@@ -195,6 +199,7 @@ def test_guards_bind_the_autopilot(tmp_path, mock_client, mock_storage,
         run_id = client.post("/autopilot/runs", json={
             "goal": "Launch the biggest GPU you can.",
             "brain_instance_id": brain_id,
+            "approve_actions": [],      # testing the guard, not the gate
         }).json()["run"]["id"]
 
         run = wait_run(client, run_id)

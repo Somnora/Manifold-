@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import {
   api,
   ApiError,
+  type Instance,
   type ModelPreset,
   type Task,
   type Template,
@@ -58,6 +59,12 @@ export default function JobsPage() {
   });
 
   const { data: tasks, refresh } = usePolling(() => api.tasks(), 2000);
+  // Connected instances, for the "Run on" picker (manual jobs, multi-GPU).
+  const { data: instances } = usePolling(() => api.instances(), 5000);
+  const connected = (instances ?? []).filter(
+    (i: Instance) => i.connection_state === "connected",
+  );
+  const [targetInstance, setTargetInstance] = useState("");
 
   useEffect(() => {
     api
@@ -95,7 +102,12 @@ export default function JobsPage() {
         setSubmitting(false);
         return;
       }
-      const task = await api.enqueueTask(selected, values, autoConfig);
+      const task = await api.enqueueTask(
+        selected,
+        values,
+        autoConfig,
+        !autoConfig && targetInstance ? targetInstance : undefined,
+      );
       setNotice(
         autoConfig
           ? `Queued ${task.id} (${task.template}) — Manifold will rent a ${autoConfig.gpu_type} for it`
@@ -186,6 +198,37 @@ export default function JobsPage() {
               {/* Rent a GPU just for this job (launch -> run -> sync ->
                   terminate), or leave off to run on a connected instance. */}
               <AutoManageControls value={auto} onChange={setAuto} />
+
+              {/* Manual jobs: which running instance takes this job. With
+                  one instance this is informational; with several it is the
+                  multi-GPU router. */}
+              {!auto.enabled && connected.length > 0 && (
+                <label className="block text-xs font-medium text-zinc-600">
+                  Run on
+                  <select
+                    className="mt-1 w-full min-w-0 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+                    value={targetInstance}
+                    onChange={(e) => setTargetInstance(e.target.value)}
+                  >
+                    <option value="">
+                      first free instance ({connected.length} connected)
+                    </option>
+                    {connected.map((i: Instance) => (
+                      <option key={i.id} value={i.id}>
+                        {i.name} · {i.gpu_description || i.instance_type} ·{" "}
+                        {i.region}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {!auto.enabled && connected.length === 0 && (
+                <p className="rounded border border-zinc-200 bg-zinc-100 px-3 py-2 text-xs text-zinc-500">
+                  No instance is connected: this job will wait in the queue
+                  until one is running (launch one on Instances), or turn on
+                  auto-manage above to rent a GPU just for it.
+                </p>
+              )}
 
               {/* Advisory pre-launch estimate: what a run of this template is
                   likely to cost. When auto-manage is on it follows that GPU. */}

@@ -414,9 +414,18 @@ class MockSSHProcess:
         self._line = ""
         if command is not None:
             self.stdout._feed(f"mock output of: {command}\n")
-            self.stdout._feed_eof()
-            self.stderr._feed_eof()
-            self.exit_status = 0
+            if "-p 127.0.0.1:" in command:
+                # A server job (only server templates publish ports): a real
+                # vllm/sglang container streams for hours, so the mock stays
+                # RUNNING instead of exiting - that is what makes chat,
+                # autopilot, and serve+batch concurrency demoable in mock
+                # mode. The process ends when the connection closes
+                # (termination) - see MockSSHConnection.close().
+                self.stdout._feed("mock server listening (stays running)\n")
+            else:
+                self.stdout._feed_eof()
+                self.stderr._feed_eof()
+                self.exit_status = 0
         else:
             self.stdout._feed(
                 "Welcome to the Manifold mock shell (no GPU was billed).\r\n"
@@ -552,7 +561,17 @@ class MockSSHConnection:
         self.processes.append(process)
         return process
 
+    def _finish_open_processes(self) -> None:
+        """End any still-streaming processes (mock servers): a real SSH
+        connection closing ends its channels, so readers must not hang."""
+        for process in self.processes:
+            if process.exit_status is None:
+                process.stdout._feed_eof()
+                process.stderr._feed_eof()
+                process.exit_status = 0
+
     def close(self) -> None:
+        self._finish_open_processes()
         self._closed.set()
 
     async def wait_closed(self) -> None:
@@ -560,4 +579,5 @@ class MockSSHConnection:
 
     def simulate_drop(self) -> None:
         """Simulate the network dropping the connection."""
+        self._finish_open_processes()
         self._closed.set()

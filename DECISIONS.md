@@ -1655,3 +1655,226 @@ downloadable, outside the tree that `git clone` pulls by default.
 already public, and confirmed no secret ever entered git history — `.env`,
 `manifold.db`, `host_keys.json` are gitignored and were never tracked.
 Sharing the repo link was already safe before this change.
+
+## 2026-07-13 — Per-instance parallel dispatch (supersedes "one task at a time")
+
+**Found at James's mock test pass.** Three compounding problems: (1) the
+dispatcher awaited each job INLINE and refused to dispatch while anything
+was running — so a server job (vllm-serve streams for its lifetime) froze
+every other job forever, contradicting the documented serve+synthesize
+pipeline; (2) with several GPUs there was no way to say which box a job
+should run on; (3) the mock SSH process exited instantly for server jobs, so
+vllm-serve went 'succeeded' in a second and chat/autopilot had no brain to
+find — masking bug (1) in every demo and test.
+
+**Decided:**
+- Dispatch spawns each job as its own asyncio task (`_dispatching` map
+  guards the queued->running gap and lets stop() cancel). Instances run
+  their work independently.
+- Per-instance concurrency rule: one BATCH task at a time (GPU contention),
+  one SERVER at a time (its port), but server+batch coexist — that is the
+  sanctioned pipeline. The 2026-07-11 "one task at a time" entry is
+  superseded; its rationale (serialized batch work per GPU) survives as the
+  per-instance batch rule.
+- Manual jobs accept `target_instance_id` (Jobs page "Run on" picker);
+  untargeted jobs take the first free non-auto-owned instance. Auto-managed
+  jobs still bind only to their own launched box.
+- Idle: a running task pins ITS OWN instance only — a job on box A no
+  longer keeps an idle box B billing (previously any running task blocked
+  ALL idle termination). Auto-owned instances stay lifecycle-governed.
+- Mock fidelity: mock server processes (commands publishing ports) stay
+  RUNNING until the connection closes (`MockSSHConnection.close()` now EOFs
+  open streams so nothing hangs); and mock mode always forces its own
+  registered ssh key — a real key name in config.yaml made every
+  auto-manage launch fail in the packaged demo.
+
+**Multi-GPU how-to:** raise `guardrails.max_concurrent_instances` (and mind
+`max_hourly_spend_usd`) in config.yaml; the guard stays deliberate.
+
+**Known mock-demo quirk (spec-correct):** the demo sidecar reports two
+canned unpersisted files, so an auto-manage teardown parks at 'terminating'
+with the reason on the job card — the safety hook doing exactly what
+Prompt B specified (never force). Resolve from the instance card (sync /
+terminate) and the job completes.
+
+## 2026-07-13 — The local hub: external brains, approval gates, local terminal
+
+**Context:** James's north star - "one synergetic system": local models,
+frontier APIs, and GPU-served models all first-class drivers of Manifold,
+plus a terminal on the local machine, plus approval-gated agent spending.
+
+**Brains registry (brains.py).** One abstraction, three kinds:
+`instance:` (served on a Manifold GPU, the original), `local:` (Ollama /
+LM Studio on this machine, auto-detected by probing /v1/models on their
+standard loopback ports), `api:` (Anthropic/OpenAI/Gemini via their
+OpenAI-compatible endpoints; offered ONLY when the key env var is set, so
+there is never a selectable-but-broken option). All three expose the same
+chat interface (ExternalBrainClient duck-types ModelClient), so the agent
+loop is brain-agnostic: Autopilot.start_run takes a client factory, and
+the run's brain ref is stored in the existing brain_instance_id column
+(strings like "local:ollama/llama3.1" - no schema migration).
+**The safety model is deliberately unchanged by the brain:** same action
+allowlist, same guards, same caps, same audit - a frontier model gets no
+more power than a 4B local one.
+
+**Approval gates.** Runs started with require_approval pause launch_gpu /
+run_job / terminate_instance as a `pending` row in a new approvals table;
+the agent loop polls until a human decision. Deny returns "DENIED by the
+user" AS DATA (the model adapts - test-proven, and nothing executes);
+approve falls through to the normal guarded execution; a timeout
+(autopilot.approval_timeout_seconds, 600s) auto-denies so an unattended
+run never spends. decide_approval uses a status='pending' WHERE guard, so
+a double-click or race decides exactly once. Gated set choice: the three
+actions that spend money or destroy state; reads stay free because an
+approval prompt per get_job_status would make the feature unusable.
+
+**Local terminal.** WS /local/terminal forks a login shell in a pty and
+speaks the exact wire protocol of the instance terminal (one generalized
+TerminalPanel drives both). Threat model: the backend is loopback-only,
+but browsers allow cross-origin WebSockets that CORS middleware does NOT
+cover - so the endpoint enforces a strict Origin allowlist (localhost /
+127.0.0.1) before accepting, plus a config kill switch
+(hub.local_terminal). POSIX-only for now; Windows says so instead of
+half-working. Audited on open. Alternatives: no local terminal (but the
+hub's whole point is one pane of glass), an allow-any-origin socket
+(would let any website you visit run shell commands - rejected).
+
+**Hub page.** The meeting point: local terminal, live brains list with
+kind badges, pending approvals. Autopilot's picker now reads the same
+/brains registry instead of probing instances itself.
+
+## 2026-07-13 — Subscription brains via CLI delegation, not spoofed OAuth
+
+**Asked:** OAuth login for frontier models instead of API keys.
+
+**Decided:** `cli:` brains. The user logs into the provider's own CLI once
+(claude / codex / gemini - each ships its own official OAuth flow), and
+Manifold invokes that CLI as a subprocess per turn (CliBrainClient: argv
+list, no shell, cwd = an empty scratch dir so an agentic CLI has nothing
+to poke at, hard timeout, stderr surfaced with an "is it logged in?"
+hint). Detection = executable on PATH; the registry offers what exists.
+Invocations verified against the installed CLIs' actual flags: claude
+`-p --output-format json` (.result), codex `exec --skip-git-repo-check
+-s read-only --output-last-message <tmp>`, gemini `-p -o text`.
+
+**Why not real OAuth:** the providers' subscription OAuth client ids
+belong to their own apps; a third-party impersonating Claude Code's or
+Codex's client id violates provider ToS and risks the user's ACCOUNT.
+The sanctioned third-party programs (Anthropic's and OpenAI's "sign in
+with your subscription") are preview/waitlist and require registering the
+app for its own client id - noted as the future replacement. CLI
+delegation gives the same UX today (log in once with the provider's own
+flow, no API key, subscription billing) with zero ToS exposure and zero
+token handling in Manifold.
+
+**Unchanged:** the brain safety model. A CLI brain gets the same action
+allowlist, guards, caps, approval gates, and audit as every other brain.
+
+## 2026-07-13 — Unattended safety: per-action approvals, notifications, data rescue
+
+Three asks, one theme: make a run that nobody is watching SAFE. Autopilot
+already had guards; what it lacked was a way to be away from the keyboard
+without either losing money or losing data.
+
+### Approvals are now per-action, and the default gates launches only
+
+**Decided:** `ApprovalPrefs{launch_gpu: true, run_job: false,
+terminate_instance: false}` (preferences.py), overridable per run via
+`approve_actions` on POST /autopilot/runs. The old boolean
+`require_approval` still works (true = gate everything) and old runs still
+read back correctly (`agent_runs.approval_policy` is additive; the boolean
+column is kept as the derived "is anything gated" flag).
+
+**Why launch-only, and why this is not timidity:** an approval nobody
+answers AUTO-DENIES after `autopilot.approval_timeout_seconds`. So gating an
+action means "if I am away from my desk, this action does not happen":
+
+| gated action | what a no-answer denial costs |
+|---|---|
+| `launch_gpu` | nothing. No GPU starts, $0 spent. |
+| `terminate_instance` | **the GPU keeps billing** while the approval rots. |
+| `run_job` | a GPU you are already paying for sits idle. |
+
+Gating a shutdown therefore burns money exactly when you are away — which is
+when autopilot runs. It is off by default, the UI warns when you switch it
+on, and `test_default_policy_does_not_gate_termination` exists so nobody
+"helpfully" flips it later. The launch is the decision that needs a human;
+the shutdown is the one that must not wait for one.
+
+**Alternative rejected:** making an expired approval AUTO-APPROVE for
+terminate (so the wallet is safe either way). Rejected: an approval gate
+whose failure mode is "does it anyway" is not a gate. Better to not gate the
+action than to pretend to.
+
+### Notifications: a pause nobody hears about is a stall, not a safeguard
+
+**Decided:** a `notifications` table + `NotificationCenter`, with five
+independently-toggled kinds (approval_requested, job_succeeded, job_failed,
+run_finished, data_transferred). Two channels: an in-app bell (always
+recorded, so history survives) and a real OS notification (macOS
+`osascript`, Linux `notify-send`) so it reaches you in another app — which
+is the entire point. The OS sender is INJECTED (`notification_sender`), so
+tests record instead of spraying the developer's Notification Center, and
+mock mode is silent.
+
+Every job completion in the dispatcher was funnelled through one
+`_finish_task`, so no completion path — bad parameters, missing image, lost
+SSH, container exit, auto-manage failure — can finish silently. That funnel
+is the feature; the notification is just what hangs off it.
+
+**Preferences live in SQLite, not config.yaml.** config.yaml is a file a
+human edits, with comments and ordering; a UI that rewrote it would eat
+both. So config.yaml supplies the DEFAULTS and the `preferences` table holds
+what the user changed in Settings. `preferences_from_dict` ignores unknown
+keys and clamps illegal enums, so neither a hand-edited YAML nor a hostile
+PUT can produce an unstartable app.
+
+### Termination now RESCUES data instead of refusing
+
+**Changed a Phase 3 contract deliberately.** The safety hook used to REFUSE
+to terminate while valuable files sat on the instance's ephemeral disk. That
+is the right answer with a human watching and the wrong one at 3am: an
+unattended run hits the 409, the GPU keeps billing, and nobody sees it. Each
+caller had also reimplemented its own sync-then-force dance (the idle loop
+did; the MCP agent had to be taught to).
+
+`Orchestrator.terminate(force=False)` now: asks the sidecar what is on the
+scratch disk → RESCUES it per the data-safety policy → and refuses only if
+something could not be saved. `TerminationBlocked.files` therefore changed
+meaning, from "files that exist" to "files still at risk", and it now carries
+the report of what WAS saved. `force=true` is unchanged: the explicit burn-it.
+
+The user's proposed menu was four options ("all files to local", "all to
+filebase", "synthesized only to local", "synthesized only to filebase").
+That is a cross-product of two independent questions, so it is modelled as
+two:
+
+- **WHERE**: `to_filesystem` (rsync to the Lambda volume — datacenter-local,
+  so fast, free, and it covers the whole scratch dir at once) and/or
+  `to_local` (SFTP down the managed connection to this machine, which costs
+  real transfer time while the GPU bills, so it is off by default and
+  budgeted by `max_local_gib`, smallest-file-first).
+- **WHAT**: `scope: all | outputs` (outputs = files under `outputs/`, the
+  deliverable convention — pull the results, leave the 40 GB checkpoint).
+
+And the question the menu missed, which is the one that actually matters:
+**what if a file cannot be saved?** `if_unsaveable: block | terminate`.
+Default `block`: keep the instance alive with the data intact and ping the
+user. Data loss is permanent; a billing hour is not. `terminate` is
+available for people who mean it, and is recorded in the audit log
+(`terminate_data_lost`) and the notification — never silent.
+
+**Honest reporting is a requirement, not a nicety.** A rescue that quietly
+drops files is worse than no rescue, because it lies. Anything skipped
+(scope, budget, transfer failure) is reported with its reason and counted as
+unsaved, which is what the block keys on. Downloads go to a `.part` file and
+are renamed on completion, so an interrupted rescue cannot leave a truncated
+file that looks saved. Paths come FROM the instance, so both the remote and
+local sides are normalized and confined (`data_safety.remote_path` /
+`local_path`) — a hostile sidecar cannot traverse out of the scratch root or
+out of the rescue directory.
+
+**The decisions are pure.** `data_safety.py` does no I/O: scope selection,
+transfer budgeting, and path confinement are testable without an instance, an
+SSH server, or a byte of network. The transport lives in the orchestrator,
+which owns the connections.

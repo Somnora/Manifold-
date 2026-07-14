@@ -51,7 +51,9 @@ from .lambda_api import (
 from .agent import Autopilot, find_serving_task
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
+from .notifications import NotificationCenter, os_notify
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
+from .preferences import GATEABLE_ACTIONS, PreferenceStore
 from .sidecar_client import MockSidecarClient
 from .image_checker import MockImageChecker, RealImageChecker
 from .storage import MockStorage, S3AdapterStorage, StorageClient
@@ -81,6 +83,9 @@ class TaskRequest(BaseModel):
     gpu_type: str | None = None
     region: str | None = None
     filesystem: str | None = None
+    # Pin a manual job to a specific connected instance (multi-GPU). Omit
+    # to take the first free instance. Ignored when auto_manage is set.
+    target_instance_id: str | None = None
 
 
 class WatchRequest(BaseModel):
@@ -99,8 +104,35 @@ class AgentAuditRequest(BaseModel):
 
 class AutopilotRequest(BaseModel):
     goal: str = Field(min_length=4, max_length=4000)
-    brain_instance_id: str
+    # Either a full brain ref ("instance:<id>" | "local:<ep>/<model>" |
+    # "api:<name>") or the legacy instance id field below.
+    brain: str | None = None
+    brain_instance_id: str | None = None
     max_steps: int | None = Field(default=None, ge=1)
+    # Which actions pause for a human Approve/Deny. None = use the saved
+    # policy from Settings (launch-only by default). An explicit list is a
+    # per-run override; [] means fully autonomous within the guards.
+    approve_actions: list[str] | None = None
+    # Legacy (pre-Phase 37) boolean: true gates ALL gateable actions. Only
+    # consulted when approve_actions is absent.
+    require_approval: bool | None = None
+
+
+class ApprovalDecision(BaseModel):
+    approve: bool
+
+
+class PreferencesPatch(BaseModel):
+    """A partial update; every section and field is optional. Unknown keys
+    are ignored rather than rejected (see preferences.py)."""
+    approvals: dict | None = None
+    notifications: dict | None = None
+    data_safety: dict | None = None
+
+
+class NotificationsReadRequest(BaseModel):
+    # Omit to mark everything read.
+    ids: list[str] | None = None
 
 
 class ChatRequest(BaseModel):
@@ -137,6 +169,7 @@ def create_app(
     model_client_factory=None,     # (ManagedConnection) -> ModelClient
     image_checker=None,            # ImageChecker; mock mode injects MockImageChecker
     lambda_client_factory=None,    # (api_key) -> LambdaClient, for key validation
+    notification_sender=None,      # (title, body) -> None; tests record, mock no-ops
     env_path=None,                 # where /settings writes secrets (.env)
     templates_dir=None,
     mock: bool = False,
@@ -157,6 +190,7 @@ def create_app(
             image_checker = RealImageChecker()
 
     if mock:
+        shared_sidecar = None
         if sidecar_factory is None:
             shared_sidecar = MockSidecarClient()
             sidecar_factory = lambda conn: shared_sidecar  # noqa: E731
@@ -169,13 +203,24 @@ def create_app(
             storage_factory = lambda fs: shared  # noqa: E731
         if connect_fn is None:
             async def _mock_dial():
-                return MockSSHConnection()
+                conn = MockSSHConnection()
+                # Seed the demo's unpersisted files into the mock SFTP store so
+                # a mock-mode rescue really transfers something and the report
+                # is honest. Content is a placeholder; the SIZES the policy
+                # budgets against come from the sidecar, as in real mode.
+                for f in (shared_sidecar.unpersisted if shared_sidecar else []):
+                    conn.sftp_files[f"/workspace/ephemeral/{f['path']}"] = (
+                        f"[mock] contents of {f['path']}\n".encode()
+                    )
+                return conn
             connect_fn = lambda host: _mock_dial  # noqa: E731
-        if not settings.ssh.key_name:
-            # Mock mode must work without any real configuration.
-            settings = replace(
-                settings, ssh=replace(settings.ssh, key_name="mock-key")
-            )
+        # Mock mode must work with ANY configuration: the mock catalog only
+        # registers mock keys, so a real key name from config.yaml (e.g.
+        # lambda-burst-ed25519) would fail every default-key launch - the
+        # auto-manage path hit exactly this at the Phase 35 test pass.
+        settings = replace(
+            settings, ssh=replace(settings.ssh, key_name="mock-key")
+        )
     elif lambda_client is None:
         # Real mode: never crash on a missing key. Start with a placeholder
         # that returns a clear "configure me" error on every call; the
@@ -197,10 +242,25 @@ def create_app(
             )
 
     db = Database(settings.db_path)
+
+    # Preferences: the policies the user edits in Settings (approval gates,
+    # notification toggles, data safety). config.yaml supplies the defaults;
+    # the DB holds what they changed. Every component reads through the store,
+    # so a change takes effect on the next tick with no restart.
+    prefs = PreferenceStore(db, settings.preferences)
+    # In mock mode and under tests the OS ping is a no-op: a test suite must
+    # not spray the user's Notification Center.
+    notifier = NotificationCenter(
+        db, prefs,
+        sender=(notification_sender if notification_sender is not None
+                else ((lambda title, body: None) if mock else os_notify)),
+    )
+
     orchestrator = Orchestrator(
         settings, lambda_client, db,
         connect_fn=connect_fn, sidecar_factory=sidecar_factory,
         model_client_factory=model_client_factory,
+        prefs=prefs, notifier=notifier,
     )
     storage_cache: dict[str, StorageClient] = {}
 
@@ -211,9 +271,12 @@ def create_app(
     queue = SQLiteTaskQueue(db)
     dispatcher = Dispatcher(
         settings, orchestrator, queue, templates, db, lambda_client,
-        image_checker=image_checker,
+        image_checker=image_checker, notifier=notifier,
     )
-    autopilot = Autopilot(settings, orchestrator, queue, templates, db)
+    autopilot = Autopilot(settings, orchestrator, queue, templates, db,
+                          notifier=notifier)
+    from .brains import BrainRegistry
+    brains = BrainRegistry(settings, orchestrator, queue, templates)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -241,6 +304,7 @@ def create_app(
     app.state.settings = settings
     app.state.dispatcher = dispatcher
     app.state.queue = queue
+    app.state.brains = brains
     app.state.autopilot = autopilot
 
     # The dashboard (Phase 2) runs on localhost:3000 and is the only
@@ -261,8 +325,9 @@ def create_app(
     @app.exception_handler(TerminationBlocked)
     async def _termination_blocked(request, exc: TerminationBlocked):
         from fastapi.responses import JSONResponse
-        # 409 with the evidence: clients show the list and offer
-        # sync-then-terminate or force=true. Never a silent block.
+        # 409 with the evidence: the rescue already ran, so this names the
+        # files it could NOT save, and `rescue` says what it did save.
+        # Clients show both and offer force=true. Never a silent block.
         return JSONResponse(
             status_code=409,
             content={
@@ -270,6 +335,7 @@ def create_app(
                 "blocked": True,
                 "instance_id": exc.instance_id,
                 "unpersisted_files": exc.files,
+                "rescue": exc.report,
             },
         )
 
@@ -390,6 +456,47 @@ def create_app(
         )
         return {"saved": True, "validated": validated}
 
+    # -- preferences (the Settings-page policies; not secrets) ---------------------
+
+    @app.get("/preferences")
+    async def get_preferences():
+        """The three policies the Settings page edits, plus the vocabulary a
+        client needs to render them (so the UI never hardcodes the lists)."""
+        from .preferences import NOTIFICATION_KINDS
+        return {
+            "preferences": prefs.get().to_dict(),
+            "gateable_actions": list(GATEABLE_ACTIONS),
+            "notification_kinds": list(NOTIFICATION_KINDS),
+        }
+
+    @app.put("/preferences")
+    async def update_preferences(patch: PreferencesPatch):
+        updated = prefs.update(patch.model_dump(exclude_none=True))
+        db.record_audit(
+            "dashboard", "preferences_update",
+            f"approvals={sorted(updated.approvals.gated_actions())} "
+            f"data_safety.to_local={updated.data_safety.to_local} "
+            f"data_safety.if_unsaveable={updated.data_safety.if_unsaveable}",
+        )
+        return {"preferences": updated.to_dict()}
+
+    # -- notifications --------------------------------------------------------------
+
+    @app.get("/notifications")
+    async def list_notifications(unread_only: bool = False, limit: int = 50):
+        return {
+            "notifications": notifier.list(unread_only=unread_only, limit=limit),
+            "unread": notifier.unread_count(),
+        }
+
+    @app.post("/notifications/read")
+    async def mark_notifications_read(req: NotificationsReadRequest):
+        return {"marked": notifier.mark_read(req.ids)}
+
+    @app.delete("/notifications")
+    async def clear_notifications():
+        return {"cleared": notifier.clear()}
+
     # -- instances ----------------------------------------------------------------
 
     @app.get("/instance-types")
@@ -476,6 +583,14 @@ def create_app(
     async def sync_instance(instance_id: str):
         return await orchestrator.sync_ephemeral(instance_id)
 
+    @app.post("/instances/{instance_id}/rescue")
+    async def rescue_instance(instance_id: str):
+        """Run the data-safety policy NOW, without terminating: save this
+        instance's ephemeral files to the persistent volume and/or pull them
+        down to this machine. The same code termination runs — so the report
+        you get here is exactly what a termination would do."""
+        return {"rescue": await orchestrator.rescue(instance_id)}
+
     @app.get("/instances/{instance_id}/metrics")
     async def instance_metrics(instance_id: str):
         sidecar = orchestrator.sidecar_for(instance_id)
@@ -537,6 +652,97 @@ def create_app(
         finally:
             output_task.cancel()
             process.close()
+
+    @app.websocket("/local/terminal")
+    async def local_terminal(ws: WebSocket):
+        """A shell on THIS machine, in the dashboard - the local half of the
+        hub. Same wire protocol as the instance terminal, so the same panel
+        drives both.
+
+        Security posture (see DECISIONS.md): the backend only listens on
+        loopback, but browsers allow cross-origin WebSocket connections, so
+        a malicious web page could otherwise reach this endpoint. Defense:
+        a strict Origin allowlist (localhost only) - checked HERE because
+        CORS middleware does not cover WebSockets - plus a config kill
+        switch (hub.local_terminal).
+        """
+        origin = ws.headers.get("origin", "")
+        host = origin.split("://", 1)[-1].split(":")[0].lower()
+        if not settings.hub.local_terminal or host not in (
+                "localhost", "127.0.0.1"):
+            await ws.close(code=4403)
+            return
+        if os.name == "nt":
+            await ws.accept()
+            await ws.send_text("\r\n[manifold] the local terminal is not "
+                               "supported on Windows yet\r\n")
+            await ws.close()
+            return
+
+        import fcntl
+        import pty
+        import shutil
+        import signal
+        import struct
+        import termios
+
+        await ws.accept()
+        shell = os.environ.get("SHELL") or shutil.which("zsh") or "/bin/sh"
+        pid, fd = pty.fork()
+        if pid == 0:                       # child: become the user's shell
+            os.execvp(shell, [shell, "-l"])
+
+        loop = asyncio.get_event_loop()
+        out_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        def on_readable():
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                data = b""
+            out_queue.put_nowait(data or None)
+            if not data:
+                loop.remove_reader(fd)
+
+        loop.add_reader(fd, on_readable)
+
+        async def pump_output():
+            try:
+                while True:
+                    data = await out_queue.get()
+                    if data is None:
+                        break
+                    await ws.send_text(data.decode(errors="replace"))
+                await ws.send_text("\r\n[manifold] shell exited\r\n")
+                await ws.close()
+            except (WebSocketDisconnect, RuntimeError):
+                pass
+
+        output_task = asyncio.create_task(pump_output())
+        db.record_audit("dashboard", "local_terminal_open", shell)
+        try:
+            while True:
+                msg = await ws.receive_json()
+                if msg.get("type") == "input":
+                    os.write(fd, msg.get("data", "").encode())
+                elif msg.get("type") == "resize":
+                    size = struct.pack(
+                        "HHHH", int(msg.get("rows", 24)),
+                        int(msg.get("cols", 80)), 0, 0)
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+        except (WebSocketDisconnect, KeyError, ValueError, OSError):
+            pass
+        finally:
+            output_task.cancel()
+            try:
+                loop.remove_reader(fd)
+            except Exception:
+                pass
+            try:
+                os.kill(pid, signal.SIGHUP)   # end the shell with its window
+                os.close(fd)
+            except OSError:
+                pass
 
     # -- chat with a served model -----------------------------------------------
 
@@ -1143,8 +1349,13 @@ def create_app(
                 f"{req.gpu_type}/{req.region}/{req.filesystem}")
         else:
             task_id = queue.enqueue(template=req.template,
-                                    parameters=req.parameters)
-            db.record_audit("api", "task_enqueue", f"{task_id} ({req.template})")
+                                    parameters=req.parameters,
+                                    target_instance_id=req.target_instance_id)
+            db.record_audit(
+                "api", "task_enqueue",
+                f"{task_id} ({req.template})"
+                + (f" -> {req.target_instance_id}"
+                   if req.target_instance_id else ""))
         return {"task": queue.get(task_id)}
 
     async def _validate_auto_manage(req: "TaskRequest") -> None:
@@ -1273,39 +1484,108 @@ def create_app(
 
     @app.post("/autopilot/runs", status_code=202)
     async def start_autopilot_run(req: AutopilotRequest):
-        serving = _serving_task(req.brain_instance_id)
-        if serving is None:
-            raise HTTPException(
-                409,
-                f"No model is being served on {req.brain_instance_id}. "
-                "Queue a vllm-serve job there first; the running model "
-                "becomes the run's brain.",
+        # The brain can be any registered kind: instance:<id> (a model
+        # served on a Manifold GPU), local:<endpoint>/<model> (Ollama /
+        # LM Studio on this machine), or api:<name> (frontier API with a
+        # key in .env). brain_instance_id remains as the legacy spelling.
+        ref = req.brain or (f"instance:{req.brain_instance_id}"
+                            if req.brain_instance_id else None)
+        if not ref:
+            raise HTTPException(422, "pick a brain (instance/local/api)")
+
+        if ref.startswith("instance:"):
+            instance_id = ref.partition(":")[2]
+            serving = _serving_task(instance_id)
+            if serving is None:
+                raise HTTPException(
+                    409,
+                    f"No model is being served on {instance_id}. "
+                    "Queue a vllm-serve job there first; the running model "
+                    "becomes the run's brain.",
+                )
+            readiness = await dispatcher.model_ready(
+                instance_id, serving["id"], serving["port"]
             )
-        readiness = await dispatcher.model_ready(
-            req.brain_instance_id, serving["id"], serving["port"]
-        )
-        if not readiness["ready"]:
-            raise HTTPException(
-                409,
-                f"The brain model {serving['model_id']} is still loading "
-                f"({readiness['error']}). Wait until it is ready, then start "
-                f"the run.",
-            )
-        if orchestrator.model_client_for(req.brain_instance_id) is None:
-            raise HTTPException(
-                409, f"no managed connection to {req.brain_instance_id}"
-            )
+            if not readiness["ready"]:
+                raise HTTPException(
+                    409,
+                    f"The brain model {serving['model_id']} is still loading "
+                    f"({readiness['error']}). Wait until it is ready, then "
+                    f"start the run.",
+                )
+            if orchestrator.model_client_for(instance_id) is None:
+                raise HTTPException(
+                    409, f"no managed connection to {instance_id}"
+                )
+            brain_model, brain_port = serving["model_id"], serving["port"]
+            client_fn = None      # per-turn resolution via the orchestrator
+        else:
+            try:
+                client, brain_model, brain_port = brains.resolve(ref)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc))
+            client_fn = lambda: client  # noqa: E731
+
+        # Approval policy: an explicit per-run list wins; then the legacy
+        # boolean (true = gate everything); otherwise the saved Settings
+        # policy, which defaults to launches only.
+        if req.approve_actions is not None:
+            unknown = set(req.approve_actions) - set(GATEABLE_ACTIONS)
+            if unknown:
+                raise HTTPException(
+                    422,
+                    f"cannot gate {', '.join(sorted(unknown))}. Gateable "
+                    f"actions: {', '.join(GATEABLE_ACTIONS)}")
+            gated = frozenset(req.approve_actions)
+        elif req.require_approval is not None:
+            gated = frozenset(GATEABLE_ACTIONS) if req.require_approval \
+                else frozenset()
+        else:
+            gated = prefs.get().approvals.gated_actions()
+
         cap = settings.autopilot.max_steps_cap
         max_steps = min(req.max_steps or settings.autopilot.max_steps_default,
                         cap)
         run_id = autopilot.start_run(
             goal=req.goal,
-            brain_instance_id=req.brain_instance_id,
-            brain_model=serving["model_id"],
-            brain_port=serving["port"],
+            brain_ref=ref,
+            brain_model=brain_model,
+            brain_port=brain_port,
             max_steps=max_steps,
+            client_fn=client_fn,
+            gated_actions=gated,
         )
         return {"run": db.get_agent_run(run_id)}
+
+    @app.get("/brains")
+    async def list_brains():
+        """Every model that can drive Manifold right now: served on a GPU
+        instance, running locally (Ollama/LM Studio), or a frontier API
+        with a key configured."""
+        from dataclasses import asdict
+        return {"brains": [asdict(b) for b in await brains.list_brains()]}
+
+    @app.get("/autopilot/approvals")
+    async def list_pending_approvals():
+        """Actions waiting on a human Approve/Deny (approval-gated runs).
+
+        timeout_seconds is part of the answer, not a detail: an undecided
+        approval AUTO-DENIES when it expires, so a client that does not show
+        the clock is hiding the most important thing about the card."""
+        return {
+            "approvals": db.pending_approvals(),
+            "timeout_seconds": settings.autopilot.approval_timeout_seconds,
+        }
+
+    @app.post("/autopilot/approvals/{approval_id}")
+    async def decide_approval(approval_id: str, req: ApprovalDecision):
+        status = "approved" if req.approve else "denied"
+        if not db.decide_approval(approval_id, status):
+            raise HTTPException(
+                409, "already decided (or expired) - the run has moved on")
+        db.record_audit("dashboard", f"approval_{status}",
+                        f"approval {approval_id}")
+        return {"approval": db.get_approval(approval_id)}
 
     @app.get("/autopilot/runs")
     async def list_autopilot_runs():

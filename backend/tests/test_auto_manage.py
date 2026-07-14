@@ -44,6 +44,7 @@ def _app(settings, *, sidecar, mock=None, image_checker=None):
         sidecar_factory=lambda conn: sidecar,
         model_client_factory=lambda conn: MockModelClient(),
         image_checker=image_checker or MockImageChecker(),
+        notification_sender=lambda title, body: None,
     )
     return app, mock
 
@@ -166,13 +167,16 @@ def test_auto_managed_over_budget_is_rejected_with_reason(tmp_path):
 
 
 def test_termination_blocked_is_surfaced_not_forced(tmp_path):
-    # Default sidecar reports unpersisted files that the (mock) sync does not
-    # clear, so terminate(force=False) blocks. The job must NOT force: it
-    # parks at 'terminating' with the box still up, then completes on its own
-    # once the files are cleared.
+    # With a data-safety policy that can save NOTHING (no persistent volume,
+    # no download), the 2 files the sidecar reports are unsaveable, so
+    # terminate(force=False) blocks. The job must NOT force: it parks at
+    # 'terminating' with the box still up, then completes on its own once the
+    # files are cleared. Data beats billing, and never silently.
     sidecar = MockSidecarClient()   # 2 unpersisted files
     app, mock = _app(_fast(tmp_path), sidecar=sidecar)
     with TestClient(app) as client:
+        client.put("/preferences", json={
+            "data_safety": {"to_filesystem": False, "to_local": False}})
         r = _queue_auto(client)
         task_id = r.json()["task"]["id"]
 
@@ -181,7 +185,7 @@ def test_termination_blocked_is_surfaced_not_forced(tmp_path):
         time.sleep(0.2)
         parked = client.get(f"/tasks/{task_id}").json()
         assert parked["lifecycle"] == "terminating"
-        assert "unpersisted" in (parked["lifecycle_detail"] or "").lower()
+        assert "could not be saved" in (parked["lifecycle_detail"] or "").lower()
 
         # The instance is deliberately left running for review (not forced).
         live = [i for i in mock.instances.values() if i.is_running]

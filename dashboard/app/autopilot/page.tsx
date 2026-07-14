@@ -6,63 +6,62 @@ import {
   ApiError,
   type AgentRun,
   type AgentStep,
-  type Instance,
+  type Brain,
+  type GateableAction,
 } from "@/lib/api";
+import { ApprovalsPanel } from "@/components/ApprovalsPanel";
 import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import { formatDate } from "@/lib/format";
 
-// Autopilot: a model served on one of YOUR instances (vllm-serve) drives
-// Manifold's guarded operations toward a goal — GPU A managing GPU B.
-// Every step is recorded below and on the Agent Activity page; budget and
-// concurrency guards bind the autopilot exactly as they bind you.
+const GATE_LABEL: Record<GateableAction, string> = {
+  launch_gpu: "starting a GPU",
+  run_job: "running a job",
+  terminate_instance: "shutting one down",
+};
+
+// Autopilot: a model (served on one of YOUR instances, running locally, or a
+// frontier API) drives Manifold's guarded operations toward a goal. Every step
+// is recorded below and on the Agent Activity page; budget and concurrency
+// guards bind the autopilot exactly as they bind you.
 export default function AutopilotPage() {
-  const [brains, setBrains] = useState<
-    { instanceId: string; name: string; model: string }[]
-  >([]);
   const [brain, setBrain] = useState("");
   const [goal, setGoal] = useState("");
   const [maxSteps, setMaxSteps] = useState(20);
+  // Which actions pause for approval. Seeded from the Settings policy, and
+  // overridable for this one run.
+  const [gates, setGates] = useState<GateableAction[] | null>(null);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
 
   const { data: runs, refresh } = usePolling(() => api.autopilotRuns(), 2000);
+  // Every model that can drive Manifold: served on a GPU instance, running
+  // locally (Ollama/LM Studio), or a frontier API with a key in Settings.
+  const { data: brainList } = usePolling(() => api.brains(), 5000);
+  const brains: Brain[] = brainList ?? [];
 
-  // A brain = a connected instance currently serving a model.
   useEffect(() => {
-    let cancelled = false;
-    async function findBrains() {
-      try {
-        const instances = await api.instances();
-        const connected = instances.filter(
-          (i: Instance) => i.connection_state === "connected",
-        );
-        const results = await Promise.all(
-          connected.map(async (i: Instance) => {
-            const m = await api.modelStatus(i.id).catch(() => null);
-            // Only a READY model can be a brain — a still-loading one would
-            // fail the run on its first turn.
-            return m?.serving && m?.ready
-              ? { instanceId: i.id, name: i.name || i.id, model: m.model_id! }
-              : null;
-          }),
-        );
-        if (!cancelled) {
-          const found = results.filter(Boolean) as typeof brains;
-          setBrains(found);
-          if (found.length > 0) setBrain((v) => v || found[0].instanceId);
-        }
-      } catch {
-        /* instances endpoint errors are surfaced elsewhere */
-      }
-    }
-    findBrains();
-    const id = setInterval(findBrains, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    if (brains.length > 0 && !brain) setBrain(brains[0].ref);
+  }, [brains, brain]);
+
+  useEffect(() => {
+    api
+      .preferences()
+      .then((r) =>
+        setGates(
+          r.gateable_actions.filter((a) => r.preferences.approvals[a]),
+        ),
+      )
+      .catch(() => setGates(["launch_gpu"]));
   }, []);
+
+  function toggleGate(action: GateableAction, on: boolean) {
+    setGates((g) =>
+      on
+        ? [...(g ?? []), action]
+        : (g ?? []).filter((a) => a !== action),
+    );
+  }
 
   async function start(e: React.FormEvent) {
     e.preventDefault();
@@ -71,8 +70,9 @@ export default function AutopilotPage() {
     try {
       await api.startAutopilot({
         goal: goal.trim(),
-        brain_instance_id: brain,
+        brain,
         max_steps: maxSteps,
+        approve_actions: gates ?? [],
       });
       setGoal("");
       refresh();
@@ -91,24 +91,26 @@ export default function AutopilotPage() {
         </h2>
         {brains.length === 0 ? (
           <p className="mt-3 text-sm text-zinc-500">
-            No brain available. A brain is a running instance serving a model:
-            launch an instance, queue a{" "}
-            <span className="font-mono text-xs">vllm-serve</span> job on it,
-            and once it is running it appears here as a selectable brain.
+            No brain available. A brain can be: a model served on a running
+            instance (queue{" "}
+            <span className="font-mono text-xs">vllm-serve</span> on the Jobs
+            page), a local model server on this machine (start Ollama or LM
+            Studio and it appears here automatically), or a frontier API
+            (add an Anthropic/OpenAI/Gemini key in Settings).
           </p>
         ) : (
           <form onSubmit={start} className="mt-3 space-y-3">
             <div className="flex flex-wrap gap-3">
-              <label className="block text-xs font-medium text-zinc-600">
-                Brain (model + instance)
+              <label className="block min-w-0 text-xs font-medium text-zinc-600">
+                Brain
                 <select
-                  className="mt-1 block rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+                  className="mt-1 block w-full min-w-0 max-w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
                   value={brain}
                   onChange={(e) => setBrain(e.target.value)}
                 >
                   {brains.map((b) => (
-                    <option key={b.instanceId} value={b.instanceId}>
-                      {b.model} on {b.name}
+                    <option key={b.ref} value={b.ref}>
+                      {b.label}
                     </option>
                   ))}
                 </select>
@@ -134,10 +136,44 @@ export default function AutopilotPage() {
               required
               minLength={4}
             />
+            <div className="rounded border border-zinc-200 bg-zinc-50 p-2.5">
+              <p className="text-xs font-medium text-zinc-600">
+                Ask me before the agent...
+              </p>
+              <div className="mt-1.5 flex flex-wrap gap-x-5 gap-y-1.5">
+                {(
+                  Object.keys(GATE_LABEL) as GateableAction[]
+                ).map((action) => (
+                  <label
+                    key={action}
+                    className="flex cursor-pointer items-center gap-1.5 text-xs text-zinc-600"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 accent-teal-400"
+                      checked={(gates ?? []).includes(action)}
+                      onChange={(e) => toggleGate(action, e.target.checked)}
+                    />
+                    {GATE_LABEL[action]}
+                  </label>
+                ))}
+              </div>
+              {(gates ?? []).includes("terminate_instance") && (
+                <p className="mt-2 rounded border border-amber-300/40 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                  A shutdown approval you do not answer auto-denies, and the
+                  GPU keeps billing while it waits. Leaving this off lets the
+                  agent clean up after itself.
+                </p>
+              )}
+              <p className="mt-1.5 text-[11px] text-zinc-400">
+                Defaults come from Settings. Each gated action pauses here
+                until you approve or deny it.
+              </p>
+            </div>
             <div className="flex items-center justify-between gap-4">
               <p className="text-xs text-zinc-400">
                 The agent can launch GPUs (your budget and concurrency guards
-                apply), run jobs, read logs, sync outputs, and terminate
+                apply), run jobs, read logs, save outputs, and terminate
                 instances. Every step is audited.
               </p>
               <button
@@ -152,6 +188,8 @@ export default function AutopilotPage() {
         )}
         {error && <p className="mt-2 text-xs text-red-700">{error}</p>}
       </section>
+
+      <ApprovalsPanel />
 
       <section>
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
@@ -233,7 +271,9 @@ function RunCard({ run, onChanged }: { run: AgentRun; onChanged: () => void }) {
       </div>
 
       <p className="mt-1 text-xs text-zinc-400">
-        brain: <span className="font-mono">{run.brain_model}</span>
+        brain: <span className="font-mono">{run.brain_model}</span>{" "}
+        <span className="text-zinc-300">·</span>{" "}
+        <span className="font-mono">{run.brain_instance_id}</span>
       </p>
       {run.summary && (
         <p className="mt-2 rounded bg-emerald-50 px-3 py-2 text-sm text-emerald-900">

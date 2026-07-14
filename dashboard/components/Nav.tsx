@@ -12,6 +12,7 @@ const groups = [
     { href: "/storage", label: "Storage" },
   ],
   [
+    { href: "/hub", label: "Hub" },
     { href: "/autopilot", label: "Autopilot" },
     { href: "/agents", label: "Agent Activity" },
   ],

@@ -102,6 +102,43 @@ CREATE TABLE IF NOT EXISTS agent_steps (
     PRIMARY KEY (run_id, seq)
 );
 
+-- Human approval gates for autopilot actions (Phase 36): a run with
+-- require_approval pauses spend/destructive actions here until decided.
+CREATE TABLE IF NOT EXISTS approvals (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    action      TEXT NOT NULL,
+    args        TEXT NOT NULL,          -- JSON
+    status      TEXT NOT NULL,          -- pending|approved|denied|expired
+    created_at  TEXT NOT NULL,
+    decided_at  TEXT
+);
+
+-- Notifications (Phase 37): the ping an unattended run owes you. One row
+-- per event; the dashboard polls unread ones and raises a toast + an OS
+-- notification. Kinds are toggled individually in Settings.
+CREATE TABLE IF NOT EXISTS notifications (
+    id          TEXT PRIMARY KEY,
+    at          TEXT NOT NULL,
+    kind        TEXT NOT NULL,          -- see preferences.NOTIFICATION_KINDS
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL DEFAULT '',
+    ref         TEXT,                   -- task/approval/run/instance id
+    read        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread
+    ON notifications(read, at);
+
+-- User preferences (Phase 37): approval policy, notification toggles, and
+-- the data-safety policy, as one JSON blob. config.yaml holds the DEFAULTS;
+-- this holds what the user changed in Settings (a UI must not rewrite a
+-- commented YAML file). See preferences.py.
+CREATE TABLE IF NOT EXISTS preferences (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL           -- JSON
+);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -166,6 +203,15 @@ class Database:
         self._ensure_column("tasks", "lifecycle", "TEXT")
         self._ensure_column("tasks", "lifecycle_detail", "TEXT")
         self._ensure_column("tasks", "lifecycle_events", "TEXT")
+        # Phase 35: pin a manual job to a specific instance (multi-GPU).
+        self._ensure_column("tasks", "target_instance_id", "TEXT")
+        # Phase 36: runs whose spend actions pause for human approval.
+        self._ensure_column("agent_runs", "require_approval",
+                            "INTEGER NOT NULL DEFAULT 0")
+        # Phase 37: WHICH actions this run gates (JSON list). require_approval
+        # above stays as the derived "is anything gated" flag, so old rows and
+        # old clients keep working.
+        self._ensure_column("agent_runs", "approval_policy", "TEXT")
         self._lock = threading.Lock()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -328,7 +374,8 @@ class Database:
     def create_task(self, *, template: str, parameters: dict,
                     auto_manage: bool = False, gpu_type: str | None = None,
                     region: str | None = None,
-                    filesystem: str | None = None) -> str:
+                    filesystem: str | None = None,
+                    target_instance_id: str | None = None) -> str:
         task_id = uuid.uuid4().hex[:12]
         # Auto-managed jobs start in lifecycle 'queued' with a first event
         # stamp; manual jobs leave lifecycle NULL (the field is unused for
@@ -339,11 +386,11 @@ class Database:
             """INSERT INTO tasks
                (id, created_at, template, parameters, status,
                 auto_manage, gpu_type, region, filesystem,
-                lifecycle, lifecycle_events)
-               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
+                lifecycle, lifecycle_events, target_instance_id)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, utcnow(), template, json.dumps(parameters),
              1 if auto_manage else 0, gpu_type, region, filesystem,
-             lifecycle, events),
+             lifecycle, events, target_instance_id),
         )
         return task_id
 
@@ -482,6 +529,14 @@ class Database:
         ).fetchall()
         return {r["iid"] for r in rows}
 
+    def running_tasks(self) -> list[dict]:
+        """All currently-running tasks. The dispatcher derives per-instance
+        busy state from these (which box is running what)."""
+        rows = self._execute(
+            "SELECT * FROM tasks WHERE status = 'running'"
+        ).fetchall()
+        return [self._task_row(r) for r in rows]
+
     def running_task_count(self) -> int:
         row = self._execute(
             "SELECT COUNT(*) AS n FROM tasks WHERE status = 'running'"
@@ -545,16 +600,64 @@ class Database:
     # -- autopilot runs ---------------------------------------------------------------
 
     def create_agent_run(self, *, goal: str, brain_instance_id: str,
-                         brain_model: str, max_steps: int) -> str:
+                         brain_model: str, max_steps: int,
+                         gated_actions: tuple[str, ...] = ()) -> str:
         run_id = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO agent_runs
                (id, created_at, goal, brain_instance_id, brain_model,
-                status, max_steps)
-               VALUES (?, ?, ?, ?, ?, 'running', ?)""",
-            (run_id, utcnow(), goal, brain_instance_id, brain_model, max_steps),
+                status, max_steps, require_approval, approval_policy)
+               VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)""",
+            (run_id, utcnow(), goal, brain_instance_id, brain_model,
+             max_steps, 1 if gated_actions else 0,
+             json.dumps(sorted(gated_actions))),
         )
         return run_id
+
+    # -- approvals (Phase 36) -----------------------------------------------------
+
+    def create_approval(self, run_id: str, seq: int, action: str,
+                        args: dict) -> str:
+        approval_id = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO approvals (id, run_id, seq, action, args,
+               status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            (approval_id, run_id, seq, action, json.dumps(args), utcnow()),
+        )
+        return approval_id
+
+    def get_approval(self, approval_id: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        approval = dict(row)
+        approval["args"] = json.loads(approval["args"])
+        return approval
+
+    def decide_approval(self, approval_id: str, status: str) -> bool:
+        """pending -> approved/denied/expired. False if already decided
+        (the WHERE guard makes concurrent decisions race-safe)."""
+        cur = self._execute(
+            """UPDATE approvals SET status = ?, decided_at = ?
+               WHERE id = ? AND status = 'pending'""",
+            (status, utcnow(), approval_id),
+        )
+        return cur.rowcount > 0
+
+    def pending_approvals(self) -> list[dict]:
+        rows = self._execute(
+            """SELECT a.*, r.goal AS run_goal FROM approvals a
+               LEFT JOIN agent_runs r ON a.run_id = r.id
+               WHERE a.status = 'pending' ORDER BY a.created_at""",
+        ).fetchall()
+        out = []
+        for r in rows:
+            approval = dict(r)
+            approval["args"] = json.loads(approval["args"])
+            out.append(approval)
+        return out
 
     def update_agent_run(self, run_id: str, **fields: Any) -> None:
         allowed = {"status", "steps_taken", "summary", "error", "finished_at"}
@@ -567,18 +670,26 @@ class Database:
             (*fields.values(), run_id),
         )
 
+    @staticmethod
+    def _run_row(row: sqlite3.Row) -> dict:
+        run = dict(row)
+        raw = run.get("approval_policy")
+        run["approval_policy"] = json.loads(raw) if raw else []
+        run["require_approval"] = bool(run.get("require_approval"))
+        return run
+
     def get_agent_run(self, run_id: str) -> dict | None:
         row = self._execute(
             "SELECT * FROM agent_runs WHERE id = ?", (run_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return self._run_row(row) if row else None
 
     def list_agent_runs(self, limit: int = 50) -> list[dict]:
         rows = self._execute(
             "SELECT * FROM agent_runs ORDER BY created_at DESC, id LIMIT ?",
             (limit,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._run_row(r) for r in rows]
 
     def add_agent_step(self, run_id: str, seq: int, *, thought: str,
                        action: str, args: dict, result: dict) -> None:
@@ -616,6 +727,72 @@ class Database:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # -- notifications (Phase 37) ---------------------------------------------------
+
+    def create_notification(self, *, kind: str, title: str, body: str = "",
+                            ref: str | None = None) -> str:
+        notification_id = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO notifications (id, at, kind, title, body, ref, read)
+               VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (notification_id, utcnow(), kind, title, body, ref),
+        )
+        return notification_id
+
+    def list_notifications(self, *, unread_only: bool = False,
+                           limit: int = 50) -> list[dict]:
+        where = "WHERE read = 0 " if unread_only else ""
+        rows = self._execute(
+            f"SELECT * FROM notifications {where}ORDER BY at DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [{**dict(r), "read": bool(r["read"])} for r in rows]
+
+    def unread_notification_count(self) -> int:
+        row = self._execute(
+            "SELECT COUNT(*) AS n FROM notifications WHERE read = 0"
+        ).fetchone()
+        return row["n"]
+
+    def mark_notifications_read(self, ids: list[str] | None = None) -> int:
+        """Mark the given notifications read; ids=None marks everything."""
+        if ids is None:
+            cur = self._execute("UPDATE notifications SET read = 1 WHERE read = 0")
+            return cur.rowcount
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        cur = self._execute(
+            f"UPDATE notifications SET read = 1 WHERE id IN ({placeholders})",
+            tuple(ids),
+        )
+        return cur.rowcount
+
+    def clear_notifications(self) -> int:
+        cur = self._execute("DELETE FROM notifications")
+        return cur.rowcount
+
+    # -- preferences (Phase 37) -----------------------------------------------------
+
+    def get_preferences(self, key: str) -> dict | None:
+        row = self._execute(
+            "SELECT value FROM preferences WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    def set_preferences(self, key: str, value: dict) -> None:
+        self._execute(
+            """INSERT INTO preferences (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (key, json.dumps(value)),
+        )
 
     # -- capacity watches -----------------------------------------------------------
 

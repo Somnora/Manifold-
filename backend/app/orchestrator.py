@@ -35,6 +35,13 @@ from typing import Awaitable, Callable
 
 from .cloud_init import build_user_data
 from .config import Settings
+from .data_safety import (
+    GIB,
+    local_path,
+    plan_local_transfer,
+    remote_path,
+    summarize,
+)
 from .connections import (
     CONNECTION_MODES,
     ConnectionManager,
@@ -72,18 +79,23 @@ class LaunchRejected(Exception):
 
 
 class TerminationBlocked(Exception):
-    """The pre-termination safety hook found unpersisted files.
+    """Termination refused: files on the instance could not be saved.
 
-    Carries the file list so clients can show it and offer sync or force.
+    Raised AFTER the rescue has run and done everything the data-safety
+    policy allows (see data_safety.py). `files` is therefore not "files that
+    exist" but "files still at risk" — the ones a rescue could not save. The
+    report carries what WAS saved, so a client can show both halves.
     """
 
-    def __init__(self, instance_id: str, files: list[dict]):
+    def __init__(self, instance_id: str, files: list[dict],
+                 report: dict | None = None):
         super().__init__(
-            f"{len(files)} unpersisted file(s) on {instance_id}; "
-            f"sync them or pass force=true"
+            f"{len(files)} file(s) on {instance_id} could not be saved; "
+            f"rescue them or pass force=true to terminate anyway"
         )
         self.instance_id = instance_id
         self.files = files
+        self.report = report or {}
 
 
 @dataclass
@@ -109,10 +121,16 @@ class Orchestrator:
         connect_fn: Callable[[str], Callable[[], Awaitable]] | None = None,
         sidecar_factory: Callable[[ManagedConnection], SidecarClient] | None = None,
         model_client_factory: Callable[[ManagedConnection], "ModelClient"] | None = None,
+        prefs=None,          # PreferenceStore: the data-safety policy
+        notifier=None,       # NotificationCenter: pings on rescue/blocked
     ):
         self.settings = settings
         self.client = lambda_client
         self.db = db
+        # Both optional so a bare Orchestrator (tests, scripts) keeps working:
+        # no prefs means the built-in defaults, no notifier means no pings.
+        self.prefs = prefs
+        self.notifier = notifier
         # connect_fn(host) returns the coroutine factory a ManagedConnection
         # uses to dial; tests and mock mode inject one, real mode uses asyncssh.
         self._connect_fn = connect_fn
@@ -284,28 +302,40 @@ class Orchestrator:
             return None
         return self._model_client_factory(conn)
 
-    async def terminate(self, instance_id: str, *, force: bool = False) -> dict:
-        """Terminate an instance, guarded by the unpersisted-files hook.
+    def _data_safety(self) -> "DataSafetyPrefs":
+        from .preferences import DataSafetyPrefs
+        return self.prefs.get().data_safety if self.prefs else DataSafetyPrefs()
 
-        Unless force=true, ask the sidecar (over the managed connection)
-        what valuable files sit in ephemeral scratch; if any, raise
-        TerminationBlocked with the list instead of terminating. If the
-        sidecar is unreachable (still booting, connection down), proceed —
-        the hook is best-effort evidence, not a way to wedge termination.
+    async def terminate(self, instance_id: str, *, force: bool = False) -> dict:
+        """Terminate an instance, rescuing its data first.
+
+        Unless force=true:
+        1. Ask the sidecar what valuable files sit in ephemeral scratch (the
+           disk that dies with the box).
+        2. RESCUE them per the data-safety policy: rsync the whole scratch
+           dir to the persistent volume (cheap, datacenter-local) and/or pull
+           files down to this machine over the managed connection.
+        3. Anything the rescue could not save decides the outcome:
+           if_unsaveable="block" refuses the termination and pings you (data
+           is unrecoverable, a billing hour is not); "terminate" proceeds and
+           records exactly what was lost.
+
+        If the sidecar is unreachable (still booting, connection down) we
+        proceed — the hook is best-effort evidence, not a way to wedge
+        termination. force=true skips all of it: the explicit "burn it".
         """
+        report = None
         if not force:
-            sidecar = self.sidecar_for(instance_id)
-            if sidecar is not None:
-                try:
-                    report = await sidecar.unpersisted_files()
-                    files = report.get("files", [])
-                except SidecarError as exc:
-                    logger.warning(
-                        "sidecar check skipped for %s: %s", instance_id, exc
-                    )
-                    files = []
-                if files:
-                    raise TerminationBlocked(instance_id, files)
+            report = await self.rescue(instance_id)
+            unsaved = report.get("unsaved", [])
+            if unsaved and self._data_safety().if_unsaveable == "block":
+                self._notify_blocked(instance_id, report)
+                raise TerminationBlocked(instance_id, unsaved, report)
+            if unsaved:
+                self.db.record_audit(
+                    "backend", "terminate_data_lost",
+                    f"{instance_id}: terminating with {len(unsaved)} unsaved "
+                    f"file(s) (data_safety.if_unsaveable=terminate)")
 
         conn = self.connections.pop(instance_id, None)
         if conn is not None:
@@ -319,7 +349,138 @@ class Orchestrator:
             self.db.update_launch(
                 launch["id"], status="terminated", terminated_at=utcnow()
             )
-        return {"instance_id": instance_id, "terminated": True}
+        return {"instance_id": instance_id, "terminated": True,
+                "rescue": report}
+
+    def _notify_blocked(self, instance_id: str, report: dict) -> None:
+        if self.notifier is None:
+            return
+        unsaved = report.get("unsaved", [])
+        self.notifier.notify(
+            "data_transferred",
+            f"Instance {instance_id[:12]} left running to protect data",
+            f"{len(unsaved)} file(s) could not be saved, so termination was "
+            f"refused and the GPU is still billing. {summarize(report)}. "
+            f"Save them or force-terminate from the instance card.",
+            ref=instance_id,
+        )
+
+    async def rescue(self, instance_id: str,
+                     files: list[dict] | None = None) -> dict:
+        """Save an instance's ephemeral files per the data-safety policy.
+
+        Returns a report that names, precisely, what was saved and what was
+        not. `unsaved` is the load-bearing field: it is what termination and
+        the UI key on, and it is only empty when the data is genuinely safe.
+
+        Never raises: a rescue failure becomes evidence in the report, which
+        the caller (terminate) then weighs against the policy. Raising here
+        would mean a broken sidecar could wedge every termination.
+        """
+        prefs = self._data_safety()
+        report: dict = {
+            "instance_id": instance_id, "attempted": False,
+            "files_found": 0, "synced_to": None, "sync_error": "",
+            "downloaded": [], "downloaded_bytes": 0, "skipped": [],
+            "unsaved": [], "local_dir": None,
+        }
+
+        sidecar = self.sidecar_for(instance_id)
+        if sidecar is None:
+            return report                      # no connection: nothing to ask
+        if files is None:
+            try:
+                files = (await sidecar.unpersisted_files()).get("files", [])
+            except SidecarError as exc:
+                logger.warning("sidecar check skipped for %s: %s",
+                               instance_id, exc)
+                return report                  # unreachable: proceed, as before
+        report["files_found"] = len(files)
+        if not files:
+            return report
+        report["attempted"] = True
+
+        # 1. The persistent volume. An rsync inside the datacenter is fast and
+        #    free, and it copies the WHOLE scratch dir - not just the files the
+        #    sidecar flagged - so a success makes everything safe at once.
+        if prefs.to_filesystem:
+            try:
+                synced = await self.sync_ephemeral(instance_id)
+                report["synced_to"] = synced["synced_to"]
+            except LaunchRejected as exc:
+                # No filesystem attached, no connection, or rsync failed. Not
+                # fatal: the local download below may still save the data.
+                report["sync_error"] = exc.detail
+                logger.warning("rescue: sync failed for %s: %s",
+                               instance_id, exc.detail)
+
+        # 2. This machine. Costs real transfer time over the SSH connection
+        #    while the GPU bills, so it is budgeted and reported honestly.
+        if prefs.to_local:
+            plan = plan_local_transfer(
+                files, scope=prefs.scope,
+                max_bytes=int(prefs.max_local_gib * GIB))
+            report["local_dir"] = str(
+                Path(prefs.local_dir).expanduser() / instance_id)
+            for f in plan.download:
+                try:
+                    written = await self._download_to_local(
+                        instance_id, f["path"], prefs.local_dir)
+                except Exception as exc:   # noqa: BLE001 - report, never raise
+                    logger.warning("rescue: could not download %s from %s: %s",
+                                   f["path"], instance_id, exc)
+                    plan.skipped.append({**f, "reason": f"download failed: {exc}"})
+                    continue
+                report["downloaded"].append({**f, "bytes_written": written})
+                report["downloaded_bytes"] += written
+            report["skipped"] = plan.skipped
+
+        # 3. What is STILL at risk? A successful filesystem sync copied
+        #    everything, so nothing is. Otherwise it is whatever did not make
+        #    it down to this machine.
+        if report["synced_to"]:
+            report["unsaved"] = []
+        else:
+            saved = {d["path"] for d in report["downloaded"]}
+            report["unsaved"] = [f for f in files if f["path"] not in saved]
+
+        detail = summarize(report)
+        self.db.record_audit("backend", "data_rescue", f"{instance_id}: {detail}")
+        if self.notifier is not None and (report["downloaded"] or report["synced_to"]):
+            self.notifier.notify(
+                "data_transferred",
+                f"Saved data from instance {instance_id[:12]}",
+                detail + (f" -> {report['local_dir']}"
+                          if report["downloaded"] else ""),
+                ref=instance_id,
+            )
+        return report
+
+    async def _download_to_local(self, instance_id: str, rel_path: str,
+                                 local_dir: str) -> int:
+        """Stream one ephemeral file down to this machine over SFTP.
+
+        Written to a .part file and renamed on completion, so an interrupted
+        rescue can never leave a truncated file that LOOKS like a saved one.
+        """
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            raise ConnectionError(f"no managed connection to {instance_id}")
+        remote = remote_path(rel_path)
+        target = local_path(local_dir, instance_id, rel_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(target.name + ".part")
+        written = 0
+        try:
+            with partial.open("wb") as fh:
+                async for chunk in conn.sftp_read(remote):
+                    fh.write(chunk)
+                    written += len(chunk)
+            partial.replace(target)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+        return written
 
     async def sync_ephemeral(self, instance_id: str) -> dict:
         """rsync ephemeral scratch to the persistent filesystem, over the
