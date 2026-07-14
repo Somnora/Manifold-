@@ -13,10 +13,14 @@ export function TerminalPanel({
   instanceId,
   wsPath,
   label,
+  fill,
 }: {
   instanceId?: string;
   wsPath?: string;
   label?: string;
+  // fill: size to the parent instead of the self-resizable h-80 box. Used
+  // by the terminal drawer, whose own top-edge handle does the resizing.
+  fill?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<"connecting" | "open" | "closed">(
@@ -110,11 +114,17 @@ export function TerminalPanel({
   }, [instanceId, wsPath]);
 
   return (
-    <div className="mt-3 overflow-hidden rounded border border-zinc-300 bg-[#09090b]">
-      <div className="flex items-center justify-between border-b border-zinc-200 px-3 py-1.5">
+    <div
+      className={
+        fill
+          ? "flex h-full min-h-0 flex-col overflow-hidden rounded border border-zinc-300 bg-[#09090b]"
+          : "mt-3 overflow-hidden rounded border border-zinc-300 bg-[#09090b]"
+      }
+    >
+      <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-3 py-1.5">
         <span className="text-xs text-zinc-400">
-          {label ?? "Terminal (SSH via the managed connection)"} · drag the
-          bottom-right corner to resize
+          {label ?? "Terminal (SSH via the managed connection)"}
+          {fill ? "" : " · drag the bottom-right corner to resize"}
         </span>
         <span
           className={`text-xs ${
@@ -130,8 +140,15 @@ export function TerminalPanel({
       </div>
       {/* Padding is on THIS wrapper; the xterm host below fills it exactly
           so FitAddon measures a clean, padding-free box. resize-y gives a
-          native drag handle; the ResizeObserver refits rows on every drag. */}
-      <div className="h-80 min-h-40 max-h-[85vh] resize-y overflow-hidden p-2">
+          native drag handle; the ResizeObserver refits rows on every drag
+          (and on every drawer resize, in fill mode). */}
+      <div
+        className={
+          fill
+            ? "min-h-0 flex-1 overflow-hidden p-2"
+            : "h-80 min-h-40 max-h-[85vh] resize-y overflow-hidden p-2"
+        }
+      >
         <div ref={containerRef} className="h-full w-full" />
       </div>
     </div>
