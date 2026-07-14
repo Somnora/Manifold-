@@ -1,0 +1,208 @@
+"""User preferences: the policies you can change from the Settings page.
+
+Three sources of truth, kept strictly apart (see CLAUDE.md):
+- .env         secrets. Never here.
+- config.yaml  tunables shipped with the app; supplies the DEFAULTS below.
+- preferences  the user's own runtime choices, stored in SQLite.
+
+config.yaml is a file a person edits with an editor and comments; a UI must
+not rewrite it (it would eat the comments and the ordering). So the Settings
+page writes here instead, and a stored preference overrides the config
+default. Anything the user never touched simply falls through to config.
+
+Three policies live here, and they exist for one reason: an UNATTENDED run
+must be safe with nobody watching.
+
+approvals    which agent actions pause for a human Approve/Deny.
+notifications  what pings you, so a pause is not a silent stall.
+data_safety  what happens to files on an instance when it is torn down.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, replace
+from typing import Any
+
+# The agent actions that can be gated. Kept next to the policy so the API,
+# the UI, and the agent all read the same list.
+GATEABLE_ACTIONS = ("launch_gpu", "run_job", "terminate_instance")
+
+# Notification kinds. Each is an independent toggle.
+NOTIFICATION_KINDS = (
+    "approval_requested",   # an agent action is paused, waiting on you
+    "job_succeeded",
+    "job_failed",
+    "run_finished",         # an autopilot run ended (any outcome)
+    "data_transferred",     # files were rescued off an instance
+)
+
+
+@dataclass(frozen=True)
+class ApprovalPrefs:
+    """Which autopilot actions require a human Approve/Deny.
+
+    Defaults gate LAUNCHES ONLY, and that is a money decision, not a
+    timidity one. An approval that nobody answers auto-denies after
+    autopilot.approval_timeout_seconds — so gating an action means "if I am
+    away from the keyboard, this action does not happen".
+
+    - launch_gpu:         denied by absence = no GPU starts = $0. Safe to gate.
+    - terminate_instance: denied by absence = the GPU KEEPS BILLING while the
+                          approval sits unread. Gating this actively loses
+                          money when you are away, which is exactly when
+                          autopilot is running. Off by default.
+    - run_job:            denied by absence = an already-billing GPU sits idle.
+                          Off by default for the same reason.
+    """
+    launch_gpu: bool = True
+    run_job: bool = False
+    terminate_instance: bool = False
+
+    def gated_actions(self) -> frozenset[str]:
+        return frozenset(a for a in GATEABLE_ACTIONS if getattr(self, a))
+
+
+@dataclass(frozen=True)
+class NotificationPrefs:
+    approval_requested: bool = True
+    job_succeeded: bool = True
+    job_failed: bool = True
+    run_finished: bool = True
+    data_transferred: bool = True
+    # Also raise an OS notification (macOS Notification Center, libnotify on
+    # Linux). In-app notifications are always recorded regardless; this only
+    # controls the ping outside the window.
+    desktop: bool = True
+
+    def wants(self, kind: str) -> bool:
+        return bool(getattr(self, kind, False))
+
+
+@dataclass(frozen=True)
+class DataSafetyPrefs:
+    """What happens to files living on an instance when it is torn down.
+
+    An instance's scratch disk dies with the instance. Manifold already
+    refuses to terminate while valuable unpersisted files exist (the Phase 3
+    safety hook), but "refuse" is only a good answer when a human is
+    watching: an autopilot run at 3am would just leave the GPU billing.
+
+    So termination now RESCUES first, then re-checks. Two independent
+    questions, deliberately not collapsed into one menu:
+
+      WHERE does the data go?   to_filesystem (the Lambda persistent volume,
+                                a datacenter-local rsync, effectively free)
+                                and/or to_local (down the SSH connection to
+                                this machine, which costs real transfer time).
+      WHAT is worth rescuing?   scope: "all" unpersisted files, or "outputs"
+                                only (files under outputs/ — what jobs write
+                                as their deliverable, not multi-GB checkpoints
+                                and caches).
+
+    And the one the four-option menu misses: WHAT IF THE RESCUE FAILS.
+    if_unsaveable decides between the data and the wallet when a file could
+    not be saved (no filesystem attached, transfer budget exhausted, SSH
+    down): "block" keeps the instance alive with the files intact and pings
+    you; "terminate" stops the billing and lets the files die. Default is
+    block, because data loss is unrecoverable and a billing hour is not.
+    """
+    to_filesystem: bool = True
+    to_local: bool = False
+    scope: str = "all"                       # "all" | "outputs"
+    local_dir: str = "~/Manifold/rescued"
+    # Ceiling on ONE instance's download to this machine. A 40 GB checkpoint
+    # dragged over a home connection would bill the GPU for the whole
+    # transfer; files that do not fit are skipped and reported, never
+    # silently dropped.
+    max_local_gib: float = 25.0
+    if_unsaveable: str = "block"             # "block" | "terminate"
+
+
+@dataclass(frozen=True)
+class Preferences:
+    approvals: ApprovalPrefs = ApprovalPrefs()
+    notifications: NotificationPrefs = NotificationPrefs()
+    data_safety: DataSafetyPrefs = DataSafetyPrefs()
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _coerce(section, raw: dict):
+    """Apply a raw dict onto a frozen prefs dataclass, ignoring unknown keys
+    and keeping each field's declared type. Unknown/garbage values keep the
+    current value rather than raising — a preferences file must never be able
+    to stop the backend from starting."""
+    updates: dict[str, Any] = {}
+    for key, value in (raw or {}).items():
+        if not hasattr(section, key):
+            continue
+        current = getattr(section, key)
+        try:
+            if isinstance(current, bool):
+                updates[key] = bool(value)
+            elif isinstance(current, float):
+                updates[key] = float(value)
+            elif isinstance(current, str):
+                updates[key] = str(value)
+        except (TypeError, ValueError):
+            continue
+    section = replace(section, **updates)
+    return _validate(section)
+
+
+def _validate(section):
+    """Clamp the enumerated fields to legal values."""
+    if isinstance(section, DataSafetyPrefs):
+        fixes = {}
+        if section.scope not in ("all", "outputs"):
+            fixes["scope"] = "all"
+        if section.if_unsaveable not in ("block", "terminate"):
+            fixes["if_unsaveable"] = "block"
+        if section.max_local_gib < 0:
+            fixes["max_local_gib"] = 0.0
+        if fixes:
+            section = replace(section, **fixes)
+    return section
+
+
+def preferences_from_dict(base: Preferences, raw: dict) -> Preferences:
+    """Overlay a (possibly partial, possibly hostile) dict onto `base`."""
+    raw = raw or {}
+    return Preferences(
+        approvals=_coerce(base.approvals, raw.get("approvals", {})),
+        notifications=_coerce(base.notifications, raw.get("notifications", {})),
+        data_safety=_coerce(base.data_safety, raw.get("data_safety", {})),
+    )
+
+
+class PreferenceStore:
+    """Reads/writes the preferences row; every component reads through this
+    so a change from the Settings page takes effect on the next tick with no
+    restart and no object graph to re-thread."""
+
+    KEY = "preferences"
+
+    def __init__(self, db, defaults: Preferences | None = None):
+        self._db = db
+        self._defaults = defaults or Preferences()
+        self._cached: Preferences | None = None
+
+    def get(self) -> Preferences:
+        if self._cached is None:
+            raw = self._db.get_preferences(self.KEY)
+            self._cached = preferences_from_dict(self._defaults, raw or {})
+        return self._cached
+
+    def update(self, patch: dict) -> Preferences:
+        """Merge a partial patch over the CURRENT preferences and persist."""
+        merged = preferences_from_dict(self.get(), patch)
+        self._db.set_preferences(self.KEY, json.loads(json.dumps(merged.to_dict())))
+        self._cached = merged
+        return merged
+
+    def reset(self) -> Preferences:
+        self._db.set_preferences(self.KEY, {})
+        self._cached = self._defaults
+        return self._defaults

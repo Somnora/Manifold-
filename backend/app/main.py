@@ -51,7 +51,9 @@ from .lambda_api import (
 from .agent import Autopilot, find_serving_task
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
+from .notifications import NotificationCenter, os_notify
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
+from .preferences import GATEABLE_ACTIONS, PreferenceStore
 from .sidecar_client import MockSidecarClient
 from .image_checker import MockImageChecker, RealImageChecker
 from .storage import MockStorage, S3AdapterStorage, StorageClient
@@ -107,12 +109,30 @@ class AutopilotRequest(BaseModel):
     brain: str | None = None
     brain_instance_id: str | None = None
     max_steps: int | None = Field(default=None, ge=1)
-    # Pause launch_gpu / run_job / terminate_instance for human Approve/Deny.
-    require_approval: bool = False
+    # Which actions pause for a human Approve/Deny. None = use the saved
+    # policy from Settings (launch-only by default). An explicit list is a
+    # per-run override; [] means fully autonomous within the guards.
+    approve_actions: list[str] | None = None
+    # Legacy (pre-Phase 37) boolean: true gates ALL gateable actions. Only
+    # consulted when approve_actions is absent.
+    require_approval: bool | None = None
 
 
 class ApprovalDecision(BaseModel):
     approve: bool
+
+
+class PreferencesPatch(BaseModel):
+    """A partial update; every section and field is optional. Unknown keys
+    are ignored rather than rejected (see preferences.py)."""
+    approvals: dict | None = None
+    notifications: dict | None = None
+    data_safety: dict | None = None
+
+
+class NotificationsReadRequest(BaseModel):
+    # Omit to mark everything read.
+    ids: list[str] | None = None
 
 
 class ChatRequest(BaseModel):
@@ -149,6 +169,7 @@ def create_app(
     model_client_factory=None,     # (ManagedConnection) -> ModelClient
     image_checker=None,            # ImageChecker; mock mode injects MockImageChecker
     lambda_client_factory=None,    # (api_key) -> LambdaClient, for key validation
+    notification_sender=None,      # (title, body) -> None; tests record, mock no-ops
     env_path=None,                 # where /settings writes secrets (.env)
     templates_dir=None,
     mock: bool = False,
@@ -169,6 +190,7 @@ def create_app(
             image_checker = RealImageChecker()
 
     if mock:
+        shared_sidecar = None
         if sidecar_factory is None:
             shared_sidecar = MockSidecarClient()
             sidecar_factory = lambda conn: shared_sidecar  # noqa: E731
@@ -181,7 +203,16 @@ def create_app(
             storage_factory = lambda fs: shared  # noqa: E731
         if connect_fn is None:
             async def _mock_dial():
-                return MockSSHConnection()
+                conn = MockSSHConnection()
+                # Seed the demo's unpersisted files into the mock SFTP store so
+                # a mock-mode rescue really transfers something and the report
+                # is honest. Content is a placeholder; the SIZES the policy
+                # budgets against come from the sidecar, as in real mode.
+                for f in (shared_sidecar.unpersisted if shared_sidecar else []):
+                    conn.sftp_files[f"/workspace/ephemeral/{f['path']}"] = (
+                        f"[mock] contents of {f['path']}\n".encode()
+                    )
+                return conn
             connect_fn = lambda host: _mock_dial  # noqa: E731
         # Mock mode must work with ANY configuration: the mock catalog only
         # registers mock keys, so a real key name from config.yaml (e.g.
@@ -211,10 +242,25 @@ def create_app(
             )
 
     db = Database(settings.db_path)
+
+    # Preferences: the policies the user edits in Settings (approval gates,
+    # notification toggles, data safety). config.yaml supplies the defaults;
+    # the DB holds what they changed. Every component reads through the store,
+    # so a change takes effect on the next tick with no restart.
+    prefs = PreferenceStore(db, settings.preferences)
+    # In mock mode and under tests the OS ping is a no-op: a test suite must
+    # not spray the user's Notification Center.
+    notifier = NotificationCenter(
+        db, prefs,
+        sender=(notification_sender if notification_sender is not None
+                else ((lambda title, body: None) if mock else os_notify)),
+    )
+
     orchestrator = Orchestrator(
         settings, lambda_client, db,
         connect_fn=connect_fn, sidecar_factory=sidecar_factory,
         model_client_factory=model_client_factory,
+        prefs=prefs, notifier=notifier,
     )
     storage_cache: dict[str, StorageClient] = {}
 
@@ -225,9 +271,10 @@ def create_app(
     queue = SQLiteTaskQueue(db)
     dispatcher = Dispatcher(
         settings, orchestrator, queue, templates, db, lambda_client,
-        image_checker=image_checker,
+        image_checker=image_checker, notifier=notifier,
     )
-    autopilot = Autopilot(settings, orchestrator, queue, templates, db)
+    autopilot = Autopilot(settings, orchestrator, queue, templates, db,
+                          notifier=notifier)
     from .brains import BrainRegistry
     brains = BrainRegistry(settings, orchestrator, queue, templates)
 
@@ -278,8 +325,9 @@ def create_app(
     @app.exception_handler(TerminationBlocked)
     async def _termination_blocked(request, exc: TerminationBlocked):
         from fastapi.responses import JSONResponse
-        # 409 with the evidence: clients show the list and offer
-        # sync-then-terminate or force=true. Never a silent block.
+        # 409 with the evidence: the rescue already ran, so this names the
+        # files it could NOT save, and `rescue` says what it did save.
+        # Clients show both and offer force=true. Never a silent block.
         return JSONResponse(
             status_code=409,
             content={
@@ -287,6 +335,7 @@ def create_app(
                 "blocked": True,
                 "instance_id": exc.instance_id,
                 "unpersisted_files": exc.files,
+                "rescue": exc.report,
             },
         )
 
@@ -407,6 +456,47 @@ def create_app(
         )
         return {"saved": True, "validated": validated}
 
+    # -- preferences (the Settings-page policies; not secrets) ---------------------
+
+    @app.get("/preferences")
+    async def get_preferences():
+        """The three policies the Settings page edits, plus the vocabulary a
+        client needs to render them (so the UI never hardcodes the lists)."""
+        from .preferences import NOTIFICATION_KINDS
+        return {
+            "preferences": prefs.get().to_dict(),
+            "gateable_actions": list(GATEABLE_ACTIONS),
+            "notification_kinds": list(NOTIFICATION_KINDS),
+        }
+
+    @app.put("/preferences")
+    async def update_preferences(patch: PreferencesPatch):
+        updated = prefs.update(patch.model_dump(exclude_none=True))
+        db.record_audit(
+            "dashboard", "preferences_update",
+            f"approvals={sorted(updated.approvals.gated_actions())} "
+            f"data_safety.to_local={updated.data_safety.to_local} "
+            f"data_safety.if_unsaveable={updated.data_safety.if_unsaveable}",
+        )
+        return {"preferences": updated.to_dict()}
+
+    # -- notifications --------------------------------------------------------------
+
+    @app.get("/notifications")
+    async def list_notifications(unread_only: bool = False, limit: int = 50):
+        return {
+            "notifications": notifier.list(unread_only=unread_only, limit=limit),
+            "unread": notifier.unread_count(),
+        }
+
+    @app.post("/notifications/read")
+    async def mark_notifications_read(req: NotificationsReadRequest):
+        return {"marked": notifier.mark_read(req.ids)}
+
+    @app.delete("/notifications")
+    async def clear_notifications():
+        return {"cleared": notifier.clear()}
+
     # -- instances ----------------------------------------------------------------
 
     @app.get("/instance-types")
@@ -492,6 +582,14 @@ def create_app(
     @app.post("/instances/{instance_id}/sync")
     async def sync_instance(instance_id: str):
         return await orchestrator.sync_ephemeral(instance_id)
+
+    @app.post("/instances/{instance_id}/rescue")
+    async def rescue_instance(instance_id: str):
+        """Run the data-safety policy NOW, without terminating: save this
+        instance's ephemeral files to the persistent volume and/or pull them
+        down to this machine. The same code termination runs — so the report
+        you get here is exactly what a termination would do."""
+        return {"rescue": await orchestrator.rescue(instance_id)}
 
     @app.get("/instances/{instance_id}/metrics")
     async def instance_metrics(instance_id: str):
@@ -1428,6 +1526,23 @@ def create_app(
                 raise HTTPException(409, str(exc))
             client_fn = lambda: client  # noqa: E731
 
+        # Approval policy: an explicit per-run list wins; then the legacy
+        # boolean (true = gate everything); otherwise the saved Settings
+        # policy, which defaults to launches only.
+        if req.approve_actions is not None:
+            unknown = set(req.approve_actions) - set(GATEABLE_ACTIONS)
+            if unknown:
+                raise HTTPException(
+                    422,
+                    f"cannot gate {', '.join(sorted(unknown))}. Gateable "
+                    f"actions: {', '.join(GATEABLE_ACTIONS)}")
+            gated = frozenset(req.approve_actions)
+        elif req.require_approval is not None:
+            gated = frozenset(GATEABLE_ACTIONS) if req.require_approval \
+                else frozenset()
+        else:
+            gated = prefs.get().approvals.gated_actions()
+
         cap = settings.autopilot.max_steps_cap
         max_steps = min(req.max_steps or settings.autopilot.max_steps_default,
                         cap)
@@ -1438,7 +1553,7 @@ def create_app(
             brain_port=brain_port,
             max_steps=max_steps,
             client_fn=client_fn,
-            require_approval=req.require_approval,
+            gated_actions=gated,
         )
         return {"run": db.get_agent_run(run_id)}
 
@@ -1452,8 +1567,15 @@ def create_app(
 
     @app.get("/autopilot/approvals")
     async def list_pending_approvals():
-        """Actions waiting on a human Approve/Deny (approval-gated runs)."""
-        return {"approvals": db.pending_approvals()}
+        """Actions waiting on a human Approve/Deny (approval-gated runs).
+
+        timeout_seconds is part of the answer, not a detail: an undecided
+        approval AUTO-DENIES when it expires, so a client that does not show
+        the clock is hiding the most important thing about the card."""
+        return {
+            "approvals": db.pending_approvals(),
+            "timeout_seconds": settings.autopilot.approval_timeout_seconds,
+        }
 
     @app.post("/autopilot/approvals/{approval_id}")
     async def decide_approval(approval_id: str, req: ApprovalDecision):

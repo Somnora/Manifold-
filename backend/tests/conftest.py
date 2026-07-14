@@ -85,7 +85,15 @@ def mock_model():
 
 
 @pytest.fixture
-def client(settings, mock_client, mock_storage, mock_sidecar, mock_model):
+def os_pings() -> list[tuple[str, str]]:
+    """Records OS-level notifications instead of raising them. A test suite
+    must never spray the developer's Notification Center."""
+    return []
+
+
+@pytest.fixture
+def client(settings, mock_client, mock_storage, mock_sidecar, mock_model,
+           os_pings):
     """TestClient over the real app wiring, with mocks injected."""
     from app.image_checker import MockImageChecker
     app = create_app(
@@ -96,9 +104,25 @@ def client(settings, mock_client, mock_storage, mock_sidecar, mock_model):
         sidecar_factory=lambda conn: mock_sidecar,
         model_client_factory=lambda conn: mock_model,
         image_checker=MockImageChecker(),   # offline: no registry calls in tests
+        notification_sender=lambda title, body: os_pings.append((title, body)),
     )
     with TestClient(app) as test_client:
         yield test_client
+
+
+def set_data_safety(client: TestClient, **policy) -> dict:
+    """Set the data-safety policy through the real API (Settings does the
+    same PUT). Returns the resulting policy."""
+    resp = client.put("/preferences", json={"data_safety": policy})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["preferences"]["data_safety"]
+
+
+def cannot_rescue(client: TestClient) -> None:
+    """Policy under which NOTHING can be saved off an instance: no sync to the
+    persistent volume, no download here. Any valuable file is then, by
+    definition, unsaveable — which is how a test exercises the block."""
+    set_data_safety(client, to_filesystem=False, to_local=False)
 
 
 def wait_for_launch_status(client: TestClient, launch_id: str,

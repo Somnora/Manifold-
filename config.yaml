@@ -70,6 +70,69 @@ autopilot:
   # for your Approve/Deny before auto-denying (the run adapts, not dies).
   approval_timeout_seconds: 600
 
+preferences:
+  # DEFAULTS for the three policies you can also change on the Settings page.
+  # Changing them there stores your choice in the database and overrides what
+  # is written here (a UI must not rewrite a commented YAML file). Editing
+  # this file changes the defaults a fresh install starts with.
+
+  approvals:
+    # Which autopilot actions pause for your Approve/Deny.
+    #
+    # This is a MONEY decision, not a caution decision. An approval nobody
+    # answers auto-denies after autopilot.approval_timeout_seconds, so gating
+    # an action means "if I am away from my desk, this does not happen":
+    #
+    #   launch_gpu         not launching costs $0.            <- safe to gate
+    #   terminate_instance NOT terminating keeps billing.     <- gating this
+    #                      loses money exactly when you are away, which is
+    #                      when autopilot runs. Leave it off.
+    #   run_job            not running leaves a paid GPU idle. Same logic.
+    launch_gpu: true
+    run_job: false
+    terminate_instance: false
+
+  notifications:
+    # A paused approval nobody hears about is a stall, not a safeguard.
+    approval_requested: true
+    job_succeeded: true
+    job_failed: true
+    run_finished: true       # an autopilot run ended
+    data_transferred: true   # files were rescued off an instance
+    # Also raise a real OS notification (macOS Notification Center,
+    # notify-send on Linux) so it reaches you outside the window. In-app
+    # notifications are recorded either way.
+    desktop: true
+
+  data_safety:
+    # What happens to files on an instance's scratch disk when it is torn
+    # down. That disk dies with the instance; the persistent filesystem
+    # survives. Termination RESCUES first, then re-checks.
+    #
+    # WHERE the data goes (both may be on):
+    to_filesystem: true    # rsync scratch to the Lambda persistent volume.
+                           # Datacenter-local, so effectively free and total.
+    to_local: false        # also pull the files down to THIS machine over the
+                           # managed SSH connection. Costs real transfer time
+                           # while the GPU bills, so it is off by default and
+                           # budgeted below.
+    local_dir: "~/Manifold/rescued"
+    max_local_gib: 25.0    # ceiling on one instance's download. Files that do
+                           # not fit are SKIPPED and reported, never silently
+                           # dropped.
+    # WHAT is worth rescuing:
+    #   all      every file the sidecar flags as valuable
+    #   outputs  only a job's deliverables (outputs/...), leaving multi-GB
+    #            checkpoints and caches behind
+    scope: all
+    # And the one that actually matters: what if a file could NOT be saved?
+    #   block      keep the instance alive with the data intact and ping you.
+    #              The GPU keeps billing, but data loss is unrecoverable and a
+    #              billing hour is not.
+    #   terminate  stop the billing and let those files die. Recorded in the
+    #              audit log and the notification, never silent.
+    if_unsaveable: block
+
 hub:
   # The local half of Manifold: brains on this machine and frontier APIs.
   # Local model servers probed for brains (appear automatically when up).

@@ -115,6 +115,30 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_at  TEXT
 );
 
+-- Notifications (Phase 37): the ping an unattended run owes you. One row
+-- per event; the dashboard polls unread ones and raises a toast + an OS
+-- notification. Kinds are toggled individually in Settings.
+CREATE TABLE IF NOT EXISTS notifications (
+    id          TEXT PRIMARY KEY,
+    at          TEXT NOT NULL,
+    kind        TEXT NOT NULL,          -- see preferences.NOTIFICATION_KINDS
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL DEFAULT '',
+    ref         TEXT,                   -- task/approval/run/instance id
+    read        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread
+    ON notifications(read, at);
+
+-- User preferences (Phase 37): approval policy, notification toggles, and
+-- the data-safety policy, as one JSON blob. config.yaml holds the DEFAULTS;
+-- this holds what the user changed in Settings (a UI must not rewrite a
+-- commented YAML file). See preferences.py.
+CREATE TABLE IF NOT EXISTS preferences (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL           -- JSON
+);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -184,6 +208,10 @@ class Database:
         # Phase 36: runs whose spend actions pause for human approval.
         self._ensure_column("agent_runs", "require_approval",
                             "INTEGER NOT NULL DEFAULT 0")
+        # Phase 37: WHICH actions this run gates (JSON list). require_approval
+        # above stays as the derived "is anything gated" flag, so old rows and
+        # old clients keep working.
+        self._ensure_column("agent_runs", "approval_policy", "TEXT")
         self._lock = threading.Lock()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -573,15 +601,16 @@ class Database:
 
     def create_agent_run(self, *, goal: str, brain_instance_id: str,
                          brain_model: str, max_steps: int,
-                         require_approval: bool = False) -> str:
+                         gated_actions: tuple[str, ...] = ()) -> str:
         run_id = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO agent_runs
                (id, created_at, goal, brain_instance_id, brain_model,
-                status, max_steps, require_approval)
-               VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
+                status, max_steps, require_approval, approval_policy)
+               VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)""",
             (run_id, utcnow(), goal, brain_instance_id, brain_model,
-             max_steps, 1 if require_approval else 0),
+             max_steps, 1 if gated_actions else 0,
+             json.dumps(sorted(gated_actions))),
         )
         return run_id
 
@@ -641,18 +670,26 @@ class Database:
             (*fields.values(), run_id),
         )
 
+    @staticmethod
+    def _run_row(row: sqlite3.Row) -> dict:
+        run = dict(row)
+        raw = run.get("approval_policy")
+        run["approval_policy"] = json.loads(raw) if raw else []
+        run["require_approval"] = bool(run.get("require_approval"))
+        return run
+
     def get_agent_run(self, run_id: str) -> dict | None:
         row = self._execute(
             "SELECT * FROM agent_runs WHERE id = ?", (run_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return self._run_row(row) if row else None
 
     def list_agent_runs(self, limit: int = 50) -> list[dict]:
         rows = self._execute(
             "SELECT * FROM agent_runs ORDER BY created_at DESC, id LIMIT ?",
             (limit,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._run_row(r) for r in rows]
 
     def add_agent_step(self, run_id: str, seq: int, *, thought: str,
                        action: str, args: dict, result: dict) -> None:
@@ -690,6 +727,72 @@ class Database:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # -- notifications (Phase 37) ---------------------------------------------------
+
+    def create_notification(self, *, kind: str, title: str, body: str = "",
+                            ref: str | None = None) -> str:
+        notification_id = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO notifications (id, at, kind, title, body, ref, read)
+               VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (notification_id, utcnow(), kind, title, body, ref),
+        )
+        return notification_id
+
+    def list_notifications(self, *, unread_only: bool = False,
+                           limit: int = 50) -> list[dict]:
+        where = "WHERE read = 0 " if unread_only else ""
+        rows = self._execute(
+            f"SELECT * FROM notifications {where}ORDER BY at DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [{**dict(r), "read": bool(r["read"])} for r in rows]
+
+    def unread_notification_count(self) -> int:
+        row = self._execute(
+            "SELECT COUNT(*) AS n FROM notifications WHERE read = 0"
+        ).fetchone()
+        return row["n"]
+
+    def mark_notifications_read(self, ids: list[str] | None = None) -> int:
+        """Mark the given notifications read; ids=None marks everything."""
+        if ids is None:
+            cur = self._execute("UPDATE notifications SET read = 1 WHERE read = 0")
+            return cur.rowcount
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        cur = self._execute(
+            f"UPDATE notifications SET read = 1 WHERE id IN ({placeholders})",
+            tuple(ids),
+        )
+        return cur.rowcount
+
+    def clear_notifications(self) -> int:
+        cur = self._execute("DELETE FROM notifications")
+        return cur.rowcount
+
+    # -- preferences (Phase 37) -----------------------------------------------------
+
+    def get_preferences(self, key: str) -> dict | None:
+        row = self._execute(
+            "SELECT value FROM preferences WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    def set_preferences(self, key: str, value: dict) -> None:
+        self._execute(
+            """INSERT INTO preferences (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (key, json.dumps(value)),
+        )
 
     # -- capacity watches -----------------------------------------------------------
 

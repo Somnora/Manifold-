@@ -282,6 +282,61 @@ export type AgentRun = {
   summary: string | null;
   error: string | null;
   finished_at: string | null;
+  // Which actions this run pauses on (frozen when the run started).
+  approval_policy: GateableAction[];
+};
+
+export type GateableAction = "launch_gpu" | "run_job" | "terminate_instance";
+
+export type NotificationKind =
+  | "approval_requested"
+  | "job_succeeded"
+  | "job_failed"
+  | "run_finished"
+  | "data_transferred";
+
+export type Preferences = {
+  approvals: Record<GateableAction, boolean>;
+  notifications: Record<NotificationKind, boolean> & { desktop: boolean };
+  data_safety: {
+    to_filesystem: boolean;
+    to_local: boolean;
+    scope: "all" | "outputs";
+    local_dir: string;
+    max_local_gib: number;
+    if_unsaveable: "block" | "terminate";
+  };
+};
+
+export type PreferencesPatch = {
+  approvals?: Partial<Record<GateableAction, boolean>>;
+  notifications?: Partial<Record<NotificationKind | "desktop", boolean>>;
+  data_safety?: Partial<Preferences["data_safety"]>;
+};
+
+export type Notification = {
+  id: string;
+  at: string;
+  kind: NotificationKind;
+  title: string;
+  body: string;
+  ref: string | null;
+  read: boolean;
+};
+
+// What a rescue actually did. `unsaved` is the load-bearing field: it is only
+// empty when the data is genuinely safe, and it is what a block keys on.
+export type RescueReport = {
+  instance_id: string;
+  attempted: boolean;
+  files_found: number;
+  synced_to: string | null;
+  sync_error: string;
+  downloaded: { path: string; size_bytes: number; bytes_written: number }[];
+  downloaded_bytes: number;
+  skipped: { path: string; size_bytes: number; reason: string }[];
+  unsaved: UnpersistedFile[];
+  local_dir: string | null;
 };
 
 export type AgentStep = {
@@ -320,15 +375,26 @@ export const api = {
       body: JSON.stringify(body),
     }).then((r) => r.launch),
 
+  // Termination rescues the instance's data first (sync to the persistent
+  // volume and/or download here). That can move real bytes, so it gets a far
+  // longer leash than an ordinary call - a 30s abort mid-rescue would look
+  // like a failure while the transfer was still going fine.
   terminate: (instanceId: string, force = false) =>
-    request<{ terminated: boolean }>(
+    request<{ terminated: boolean; rescue: RescueReport | null }>(
       `/instances/${instanceId}${force ? "?force=true" : ""}`,
-      { method: "DELETE" },
+      { method: "DELETE", timeoutMs: force ? 30_000 : 15 * 60_000 },
     ),
+
+  rescue: (instanceId: string) =>
+    request<{ rescue: RescueReport }>(`/instances/${instanceId}/rescue`, {
+      method: "POST",
+      timeoutMs: 15 * 60_000,
+    }),
 
   syncEphemeral: (instanceId: string) =>
     request<{ synced_to: string }>(`/instances/${instanceId}/sync`, {
       method: "POST",
+      timeoutMs: 10 * 60_000,
     }),
 
   setKeepAlive: (instanceId: string, enabled: boolean) =>
@@ -422,8 +488,8 @@ export const api = {
   brains: () => request<{ brains: Brain[] }>("/brains").then((r) => r.brains),
 
   approvals: () =>
-    request<{ approvals: Approval[] }>("/autopilot/approvals").then(
-      (r) => r.approvals,
+    request<{ approvals: Approval[]; timeout_seconds: number }>(
+      "/autopilot/approvals",
     ),
 
   decideApproval: (id: string, approve: boolean) =>
@@ -443,12 +509,40 @@ export const api = {
     brain?: string; // full brain ref (instance:/local:/api:)
     brain_instance_id?: string; // legacy spelling for instance brains
     max_steps?: number;
-    require_approval?: boolean;
+    // Which actions pause for approval. Omit to inherit the Settings policy.
+    approve_actions?: GateableAction[];
   }) =>
     request<{ run: AgentRun }>("/autopilot/runs", {
       method: "POST",
       body: JSON.stringify(body),
     }).then((r) => r.run),
+
+  preferences: () =>
+    request<{
+      preferences: Preferences;
+      gateable_actions: GateableAction[];
+      notification_kinds: NotificationKind[];
+    }>("/preferences"),
+
+  updatePreferences: (patch: PreferencesPatch) =>
+    request<{ preferences: Preferences }>("/preferences", {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }).then((r) => r.preferences),
+
+  notifications: (limit = 30) =>
+    request<{ notifications: Notification[]; unread: number }>(
+      `/notifications?limit=${limit}`,
+    ),
+
+  markNotificationsRead: (ids?: string[]) =>
+    request<{ marked: number }>("/notifications/read", {
+      method: "POST",
+      body: JSON.stringify({ ids: ids ?? null }),
+    }),
+
+  clearNotifications: () =>
+    request<{ cleared: number }>("/notifications", { method: "DELETE" }),
 
   cancelAutopilot: (runId: string) =>
     request<{ cancelling: boolean }>(`/autopilot/runs/${runId}/cancel`, {

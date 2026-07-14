@@ -1769,3 +1769,112 @@ token handling in Manifold.
 
 **Unchanged:** the brain safety model. A CLI brain gets the same action
 allowlist, guards, caps, approval gates, and audit as every other brain.
+
+## 2026-07-13 — Unattended safety: per-action approvals, notifications, data rescue
+
+Three asks, one theme: make a run that nobody is watching SAFE. Autopilot
+already had guards; what it lacked was a way to be away from the keyboard
+without either losing money or losing data.
+
+### Approvals are now per-action, and the default gates launches only
+
+**Decided:** `ApprovalPrefs{launch_gpu: true, run_job: false,
+terminate_instance: false}` (preferences.py), overridable per run via
+`approve_actions` on POST /autopilot/runs. The old boolean
+`require_approval` still works (true = gate everything) and old runs still
+read back correctly (`agent_runs.approval_policy` is additive; the boolean
+column is kept as the derived "is anything gated" flag).
+
+**Why launch-only, and why this is not timidity:** an approval nobody
+answers AUTO-DENIES after `autopilot.approval_timeout_seconds`. So gating an
+action means "if I am away from my desk, this action does not happen":
+
+| gated action | what a no-answer denial costs |
+|---|---|
+| `launch_gpu` | nothing. No GPU starts, $0 spent. |
+| `terminate_instance` | **the GPU keeps billing** while the approval rots. |
+| `run_job` | a GPU you are already paying for sits idle. |
+
+Gating a shutdown therefore burns money exactly when you are away — which is
+when autopilot runs. It is off by default, the UI warns when you switch it
+on, and `test_default_policy_does_not_gate_termination` exists so nobody
+"helpfully" flips it later. The launch is the decision that needs a human;
+the shutdown is the one that must not wait for one.
+
+**Alternative rejected:** making an expired approval AUTO-APPROVE for
+terminate (so the wallet is safe either way). Rejected: an approval gate
+whose failure mode is "does it anyway" is not a gate. Better to not gate the
+action than to pretend to.
+
+### Notifications: a pause nobody hears about is a stall, not a safeguard
+
+**Decided:** a `notifications` table + `NotificationCenter`, with five
+independently-toggled kinds (approval_requested, job_succeeded, job_failed,
+run_finished, data_transferred). Two channels: an in-app bell (always
+recorded, so history survives) and a real OS notification (macOS
+`osascript`, Linux `notify-send`) so it reaches you in another app — which
+is the entire point. The OS sender is INJECTED (`notification_sender`), so
+tests record instead of spraying the developer's Notification Center, and
+mock mode is silent.
+
+Every job completion in the dispatcher was funnelled through one
+`_finish_task`, so no completion path — bad parameters, missing image, lost
+SSH, container exit, auto-manage failure — can finish silently. That funnel
+is the feature; the notification is just what hangs off it.
+
+**Preferences live in SQLite, not config.yaml.** config.yaml is a file a
+human edits, with comments and ordering; a UI that rewrote it would eat
+both. So config.yaml supplies the DEFAULTS and the `preferences` table holds
+what the user changed in Settings. `preferences_from_dict` ignores unknown
+keys and clamps illegal enums, so neither a hand-edited YAML nor a hostile
+PUT can produce an unstartable app.
+
+### Termination now RESCUES data instead of refusing
+
+**Changed a Phase 3 contract deliberately.** The safety hook used to REFUSE
+to terminate while valuable files sat on the instance's ephemeral disk. That
+is the right answer with a human watching and the wrong one at 3am: an
+unattended run hits the 409, the GPU keeps billing, and nobody sees it. Each
+caller had also reimplemented its own sync-then-force dance (the idle loop
+did; the MCP agent had to be taught to).
+
+`Orchestrator.terminate(force=False)` now: asks the sidecar what is on the
+scratch disk → RESCUES it per the data-safety policy → and refuses only if
+something could not be saved. `TerminationBlocked.files` therefore changed
+meaning, from "files that exist" to "files still at risk", and it now carries
+the report of what WAS saved. `force=true` is unchanged: the explicit burn-it.
+
+The user's proposed menu was four options ("all files to local", "all to
+filebase", "synthesized only to local", "synthesized only to filebase").
+That is a cross-product of two independent questions, so it is modelled as
+two:
+
+- **WHERE**: `to_filesystem` (rsync to the Lambda volume — datacenter-local,
+  so fast, free, and it covers the whole scratch dir at once) and/or
+  `to_local` (SFTP down the managed connection to this machine, which costs
+  real transfer time while the GPU bills, so it is off by default and
+  budgeted by `max_local_gib`, smallest-file-first).
+- **WHAT**: `scope: all | outputs` (outputs = files under `outputs/`, the
+  deliverable convention — pull the results, leave the 40 GB checkpoint).
+
+And the question the menu missed, which is the one that actually matters:
+**what if a file cannot be saved?** `if_unsaveable: block | terminate`.
+Default `block`: keep the instance alive with the data intact and ping the
+user. Data loss is permanent; a billing hour is not. `terminate` is
+available for people who mean it, and is recorded in the audit log
+(`terminate_data_lost`) and the notification — never silent.
+
+**Honest reporting is a requirement, not a nicety.** A rescue that quietly
+drops files is worse than no rescue, because it lies. Anything skipped
+(scope, budget, transfer failure) is reported with its reason and counted as
+unsaved, which is what the block keys on. Downloads go to a `.part` file and
+are renamed on completion, so an interrupted rescue cannot leave a truncated
+file that looks saved. Paths come FROM the instance, so both the remote and
+local sides are normalized and confined (`data_safety.remote_path` /
+`local_path`) — a hostile sidecar cannot traverse out of the scratch root or
+out of the rescue directory.
+
+**The decisions are pure.** `data_safety.py` does no I/O: scope selection,
+transfer budgeting, and path confinement are testable without an instance, an
+SSH server, or a byte of network. The transport lives in the orchestrator,
+which owns the connections.

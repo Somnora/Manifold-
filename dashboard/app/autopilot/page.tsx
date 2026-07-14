@@ -7,21 +7,30 @@ import {
   type AgentRun,
   type AgentStep,
   type Brain,
+  type GateableAction,
 } from "@/lib/api";
 import { ApprovalsPanel } from "@/components/ApprovalsPanel";
 import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import { formatDate } from "@/lib/format";
 
-// Autopilot: a model served on one of YOUR instances (vllm-serve) drives
-// Manifold's guarded operations toward a goal — GPU A managing GPU B.
-// Every step is recorded below and on the Agent Activity page; budget and
-// concurrency guards bind the autopilot exactly as they bind you.
+const GATE_LABEL: Record<GateableAction, string> = {
+  launch_gpu: "starting a GPU",
+  run_job: "running a job",
+  terminate_instance: "shutting one down",
+};
+
+// Autopilot: a model (served on one of YOUR instances, running locally, or a
+// frontier API) drives Manifold's guarded operations toward a goal. Every step
+// is recorded below and on the Agent Activity page; budget and concurrency
+// guards bind the autopilot exactly as they bind you.
 export default function AutopilotPage() {
   const [brain, setBrain] = useState("");
   const [goal, setGoal] = useState("");
   const [maxSteps, setMaxSteps] = useState(20);
-  const [requireApproval, setRequireApproval] = useState(true);
+  // Which actions pause for approval. Seeded from the Settings policy, and
+  // overridable for this one run.
+  const [gates, setGates] = useState<GateableAction[] | null>(null);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
 
@@ -35,6 +44,25 @@ export default function AutopilotPage() {
     if (brains.length > 0 && !brain) setBrain(brains[0].ref);
   }, [brains, brain]);
 
+  useEffect(() => {
+    api
+      .preferences()
+      .then((r) =>
+        setGates(
+          r.gateable_actions.filter((a) => r.preferences.approvals[a]),
+        ),
+      )
+      .catch(() => setGates(["launch_gpu"]));
+  }, []);
+
+  function toggleGate(action: GateableAction, on: boolean) {
+    setGates((g) =>
+      on
+        ? [...(g ?? []), action]
+        : (g ?? []).filter((a) => a !== action),
+    );
+  }
+
   async function start(e: React.FormEvent) {
     e.preventDefault();
     setStarting(true);
@@ -44,7 +72,7 @@ export default function AutopilotPage() {
         goal: goal.trim(),
         brain,
         max_steps: maxSteps,
-        require_approval: requireApproval,
+        approve_actions: gates ?? [],
       });
       setGoal("");
       refresh();
@@ -108,26 +136,44 @@ export default function AutopilotPage() {
               required
               minLength={4}
             />
-            <label
-              className="flex cursor-pointer items-start gap-2 text-xs text-zinc-600"
-              title="launch_gpu, run_job, and terminate_instance pause as a pending approval until you decide; everything else runs freely"
-            >
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={requireApproval}
-                onChange={(e) => setRequireApproval(e.target.checked)}
-              />
-              <span>
-                <span className="font-medium">Require my approval</span> before
-                the agent launches GPUs, queues jobs, or terminates instances
-                (each pauses as a pending card here until you approve or deny).
-              </span>
-            </label>
+            <div className="rounded border border-zinc-200 bg-zinc-50 p-2.5">
+              <p className="text-xs font-medium text-zinc-600">
+                Ask me before the agent...
+              </p>
+              <div className="mt-1.5 flex flex-wrap gap-x-5 gap-y-1.5">
+                {(
+                  Object.keys(GATE_LABEL) as GateableAction[]
+                ).map((action) => (
+                  <label
+                    key={action}
+                    className="flex cursor-pointer items-center gap-1.5 text-xs text-zinc-600"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 accent-teal-400"
+                      checked={(gates ?? []).includes(action)}
+                      onChange={(e) => toggleGate(action, e.target.checked)}
+                    />
+                    {GATE_LABEL[action]}
+                  </label>
+                ))}
+              </div>
+              {(gates ?? []).includes("terminate_instance") && (
+                <p className="mt-2 rounded border border-amber-300/40 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                  A shutdown approval you do not answer auto-denies, and the
+                  GPU keeps billing while it waits. Leaving this off lets the
+                  agent clean up after itself.
+                </p>
+              )}
+              <p className="mt-1.5 text-[11px] text-zinc-400">
+                Defaults come from Settings. Each gated action pauses here
+                until you approve or deny it.
+              </p>
+            </div>
             <div className="flex items-center justify-between gap-4">
               <p className="text-xs text-zinc-400">
                 The agent can launch GPUs (your budget and concurrency guards
-                apply), run jobs, read logs, sync outputs, and terminate
+                apply), run jobs, read logs, save outputs, and terminate
                 instances. Every step is audited.
               </p>
               <button

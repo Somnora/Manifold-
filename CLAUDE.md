@@ -40,8 +40,11 @@ npm run dev     # then open http://localhost:3000
   - `task_queue.py` — `TaskQueue` interface + SQLite implementation
   - `dispatcher.py` — per-instance parallel task dispatch (server+batch coexist; jobs can target an instance), idle auto-termination, capacity watches, GPU telemetry sampling, auto-manage lifecycle (queue-then-launch through the guarded paths)
   - `estimates.py` — pure cost/utilization functions: pre-launch estimate + post-run right-size hint (advisory only, off the launch path)
-  - `agent.py` — Autopilot: agent loop driven by any brain; fixed action allowlist; optional human approval gate on spend actions
+  - `agent.py` — Autopilot: agent loop driven by any brain; fixed action allowlist; per-action human approval gates on spend actions
   - `brains.py` — brain registry: instance-served models, local Ollama/LM Studio (auto-detected), frontier APIs (key-gated)
+  - `preferences.py` — the Settings-page policies (approval gates, notification toggles, data safety). config.yaml holds the DEFAULTS; the user's choices live in SQLite and override them. Never secrets.
+  - `notifications.py` — `NotificationCenter`: in-app bell rows + an OS ping (macOS/Linux). Sender is injected, so tests and mock mode stay silent.
+  - `data_safety.py` — pure rescue decisions: what is in scope, what fits the transfer budget, path confinement. No I/O; the transport lives in the orchestrator.
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes
   - `mcp_server.py` — MCP stdio bridge; HTTP-only thin client (AST-enforced), run via `uv run manifold-mcp`
@@ -62,6 +65,10 @@ npm run dev     # then open http://localhost:3000
 - All guards (budget, concurrency, region match, safety hooks) live in the
   backend/orchestrator. Clients may never contain business logic or a path
   around a guard.
+- Termination saves before it destroys. `orchestrator.terminate(force=False)`
+  rescues the instance's ephemeral files per the data-safety policy and
+  refuses only if a file could NOT be saved. No caller reimplements that
+  dance; `force=true` is the single explicit "burn it".
 - Nothing on a GPU instance listens on a non-loopback interface except sshd.
   All instance communication rides the managed SSH connection.
 - Secrets stay in .env; never hardcode, log, or echo them.

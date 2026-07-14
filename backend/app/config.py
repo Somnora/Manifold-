@@ -17,6 +17,8 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from .preferences import Preferences, preferences_from_dict
+
 # Repo root is one level above backend/.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -182,6 +184,9 @@ class AutoManageSettings:
 class Settings:
     # Secrets (from .env). Empty string means "not configured".
     lambda_api_key: str = ""
+    # NOTE: `preferences` below holds the DEFAULTS for the user-editable
+    # policies (approval gates, notifications, data safety). The user's own
+    # choices live in the database and override these; see preferences.py.
     s3_access_key_id: str = ""
     s3_secret_access_key: str = ""
     tailscale_authkey: str = ""
@@ -199,6 +204,7 @@ class Settings:
     hub: HubSettings = field(default_factory=HubSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
     auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
+    preferences: "Preferences" = field(default_factory=lambda: Preferences())
     default_connection_mode: str = "direct-ssh"
     db_path: str = str(DATA_ROOT / "manifold.db")
 
@@ -255,6 +261,10 @@ def load_settings(
     hub = raw.get("hub", {})
     telemetry = raw.get("telemetry", {})
     auto_manage = raw.get("auto_manage", {})
+    # Defaults for the Settings-page policies. A garbage value here can never
+    # stop the backend from starting: preferences_from_dict ignores what it
+    # does not understand and clamps what it does.
+    preferences = preferences_from_dict(Preferences(), raw.get("preferences", {}))
 
     db_path = database.get("path", "manifold.db")
     if not os.path.isabs(db_path):
@@ -320,6 +330,7 @@ def load_settings(
         auto_manage=AutoManageSettings(
             poll_seconds=float(auto_manage.get("poll_seconds", 5)),
         ),
+        preferences=preferences,
         ssh=SSHSettings(
             key_name=str(ssh.get("key_name", "")),
             private_key_path=str(ssh.get("private_key_path", "~/.ssh/id_ed25519")),

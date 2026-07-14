@@ -251,6 +251,90 @@ def test_ungated_run_needs_no_approval(tmp_path):
         assert client.get("/autopilot/approvals").json()["approvals"] == []
 
 
+# -- the per-action approval policy (Phase 37) ---------------------------------------
+
+TERMINATE = ('{"thought": "clean up", "action": "terminate_instance", '
+             '"args": {"instance_id": "%s"}}')
+
+
+def test_default_policy_gates_the_launch(tmp_path):
+    """A run that says nothing about approvals inherits the Settings policy,
+    which gates launches. This is the shape of a real unattended run."""
+    app, mock, _ = approval_app(tmp_path, [LAUNCH, DONE])
+    with TestClient(app) as client:
+        run = client.post("/autopilot/runs", json={
+            "goal": "Launch a GPU.", "brain": "local:x/scripted",
+        }).json()["run"]
+        assert run["approval_policy"] == ["launch_gpu"]
+        pending = wait_pending(client)
+        assert pending["action"] == "launch_gpu"
+        assert mock.launch_calls == []            # paused, nothing spent
+
+        client.post(f"/autopilot/approvals/{pending['id']}",
+                    json={"approve": True})
+        assert wait_run(client, run["id"])["status"] == "succeeded"
+        assert len(mock.launch_calls) == 1
+
+
+def test_default_policy_does_not_gate_termination(tmp_path):
+    """The money argument, pinned. An unanswered approval AUTO-DENIES; a
+    denied terminate_instance means the GPU keeps billing. So the default
+    policy lets the agent clean up after itself while you are away — the
+    launch was the decision that needed you, not the shutdown."""
+    from tests.conftest import wait_for_launch_status
+
+    app, mock, _ = approval_app(tmp_path, ["", DONE])
+    with TestClient(app) as client:
+        # A GPU is already up (launched through the ordinary guarded path).
+        launch = client.post("/instances", json={
+            "instance_type": "gpu_1x_a10", "region": "us-east-1",
+            "filesystem": "manifold-data"}).json()["launch"]
+        instance_id = wait_for_launch_status(
+            client, launch["id"])["lambda_instance_id"]
+        # The agent's one action: shut it down.
+        app.state.brains.resolve("")[0].lines[0] = TERMINATE % instance_id
+
+        run = client.post("/autopilot/runs", json={
+            "goal": "Tidy up the idle GPU.", "brain": "local:x/scripted",
+        }).json()["run"]
+        assert run["approval_policy"] == ["launch_gpu"]   # the default
+
+        done = wait_run(client, run["id"])
+        assert done["status"] == "succeeded"
+        # It went straight through: no approval was ever raised for the
+        # terminate, so an away-from-keyboard user is not billed for the wait.
+        assert client.get("/autopilot/approvals").json()["approvals"] == []
+        assert mock.instances[instance_id].status == "terminated"
+
+
+def test_gating_termination_is_possible_but_opt_in(tmp_path):
+    """The user can still gate it (their money, their call) — it just is not
+    the default, and it is a per-run/per-Settings choice, not all-or-nothing."""
+    app, mock, _ = approval_app(tmp_path, [LAUNCH, DONE])
+    with TestClient(app) as client:
+        run = client.post("/autopilot/runs", json={
+            "goal": "Launch a GPU.", "brain": "local:x/scripted",
+            "approve_actions": ["terminate_instance"],
+        }).json()["run"]
+        assert run["approval_policy"] == ["terminate_instance"]
+        # launch_gpu is NOT gated in this run, so it runs unattended.
+        done = wait_run(client, run["id"])
+        assert done["status"] == "succeeded"
+        assert len(mock.launch_calls) == 1
+        assert client.get("/autopilot/approvals").json()["approvals"] == []
+
+
+def test_unknown_gated_action_is_rejected(tmp_path):
+    app, _, _ = approval_app(tmp_path, [DONE])
+    with TestClient(app) as client:
+        resp = client.post("/autopilot/runs", json={
+            "goal": "Do a thing.", "brain": "local:x/scripted",
+            "approve_actions": ["rm_rf_slash"],
+        })
+        assert resp.status_code == 422
+        assert "rm_rf_slash" in resp.json()["detail"]
+
+
 # -- local terminal ------------------------------------------------------------------
 
 

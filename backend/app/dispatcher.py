@@ -176,6 +176,7 @@ class Dispatcher:
         lambda_client: LambdaClient,
         *,
         image_checker: ImageChecker | None = None,
+        notifier=None,
         clock=time.monotonic,
     ):
         self.settings = settings
@@ -186,6 +187,10 @@ class Dispatcher:
         self.client = lambda_client
         # Pre-launch image preflight (None = skip, images assumed fine).
         self.image_checker = image_checker
+        # NotificationCenter (optional): pings when a job settles. Batch jobs
+        # run for hours unattended - the point of Manifold is that you are not
+        # sitting there watching the log.
+        self.notifier = notifier
         self._clock = clock
         self._loops: list[asyncio.Task] = []
         # In-flight dispatched jobs: task id -> the asyncio task running it.
@@ -233,6 +238,42 @@ class Dispatcher:
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
         self.last_activity[instance_id] = self._clock()
+
+    # -- job completion (the single funnel) ----------------------------------------
+
+    def _finish_task(self, task_id: str, *, exit_code: int,
+                     output_paths: list[str], error: str = "",
+                     notify: bool = True) -> None:
+        """Settle a task and ping once.
+
+        EVERY completion path in this file goes through here - dispatch
+        errors, bad parameters, a missing image, a lost connection, the
+        container's own exit code, an auto-manage failure. One funnel means
+        a job can never finish silently, which is the whole point when the
+        job is running unattended on a GPU that costs money.
+        """
+        self.queue.mark_finished(task_id, exit_code=exit_code,
+                                 output_paths=output_paths, error=error)
+        if not notify or self.notifier is None:
+            return
+        task = self.queue.get(task_id) or {}
+        name = task.get("template", "job")
+        succeeded = task.get("status") == "succeeded"
+        where = f" on {task['instance_id']}" if task.get("instance_id") else ""
+        if succeeded:
+            outputs = task.get("output_paths") or []
+            self.notifier.notify(
+                "job_succeeded", f"Job succeeded: {name}",
+                f"{task_id}{where}"
+                + (f"\nOutputs: {', '.join(outputs[:3])}" if outputs else ""),
+                ref=task_id,
+            )
+        else:
+            self.notifier.notify(
+                "job_failed", f"Job failed: {name}",
+                f"{task_id}{where}\n{(error or f'exit {exit_code}')[:200]}",
+                ref=task_id,
+            )
 
     # -- idle keep-alive ---------------------------------------------------------------
 
@@ -448,7 +489,7 @@ class Dispatcher:
             logger.exception("dispatched task %s crashed", task["id"])
             current = self.queue.get(task["id"])
             if current and current["status"] in ("queued", "running"):
-                self.queue.mark_finished(
+                self._finish_task(
                     task["id"], exit_code=-1, output_paths=[],
                     error=f"internal dispatch error: {exc}")
 
@@ -457,7 +498,7 @@ class Dispatcher:
         task_id = task["id"]
         template = self.templates.get(task["template"])
         if template is None:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[],
                 error=f"template '{task['template']}' no longer exists",
             )
@@ -466,7 +507,7 @@ class Dispatcher:
         launch = self.db.find_launch_by_instance(instance_id)
         filesystem = (launch or {}).get("filesystem")
         if not filesystem:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[],
                 error=f"no filesystem recorded for instance {instance_id}",
             )
@@ -475,7 +516,7 @@ class Dispatcher:
         try:
             parameters = coerce_parameters(template, task["parameters"])
         except ParameterError as exc:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[], error=str(exc)
             )
             return
@@ -484,7 +525,7 @@ class Dispatcher:
         # before any docker pull ever runs on the instance.
         image_error = await self._image_preflight(template)
         if image_error is not None:
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[], error=image_error
             )
             self.db.record_audit(
@@ -525,7 +566,7 @@ class Dispatcher:
             )
         except ConnectionError as exc:
             self.queue.append_log(task_id, f"[manifold] connection lost: {exc}")
-            self.queue.mark_finished(
+            self._finish_task(
                 task_id, exit_code=-1, output_paths=[],
                 error=f"SSH connection lost during task: {exc}",
             )
@@ -539,7 +580,7 @@ class Dispatcher:
             task_id,
             f"[manifold] exited {exit_code}; log archived at {remote_log}",
         )
-        self.queue.mark_finished(
+        self._finish_task(
             task_id,
             exit_code=exit_code,
             output_paths=outputs,
@@ -625,25 +666,26 @@ class Dispatcher:
                 f"{instance_id} idle {now - last:.0f}s (limit {timeout:.0f}s)",
             )
             try:
-                # force=False: the Phase 3 safety hook still applies.
+                # force=False: terminate() rescues the instance's data first
+                # (sync to the persistent volume and/or download here, per the
+                # data-safety policy) and only refuses if something could NOT
+                # be saved. No sync-then-force dance here any more — that lived
+                # in this loop when terminate() did not rescue, and it meant
+                # every OTHER caller had to reimplement it.
                 await self.orchestrator.terminate(instance_id, force=False)
                 self.last_activity.pop(instance_id, None)
             except TerminationBlocked as exc:
-                # Unpersisted files: sync them, then try once more. If that
-                # still fails, leave the instance alone and try next cycle.
-                logger.info("idle termination blocked by %d files; syncing",
-                            len(exc.files))
+                # The rescue could not save everything. Leave the box up with
+                # the data intact rather than destroying it; the orchestrator
+                # has already pinged the user. Retried next cycle.
+                logger.warning(
+                    "idle termination of %s refused: %d file(s) unsaveable",
+                    instance_id, len(exc.files))
                 self.db.record_audit(
-                    "backend", "idle_sync",
-                    f"{instance_id}: {len(exc.files)} unpersisted files",
+                    "backend", "idle_termination_blocked",
+                    f"{instance_id}: {len(exc.files)} file(s) could not be "
+                    f"saved; instance left running",
                 )
-                try:
-                    await self.orchestrator.sync_ephemeral(instance_id)
-                    await self.orchestrator.terminate(instance_id, force=True)
-                    self.last_activity.pop(instance_id, None)
-                except (LaunchRejected, TerminationBlocked) as sync_exc:
-                    logger.warning("idle sync+terminate failed for %s: %s",
-                                   instance_id, sync_exc)
 
     # -- auto-manage lifecycle loop -----------------------------------------------------
 
@@ -726,7 +768,7 @@ class Dispatcher:
         if task and task["status"] == "queued":
             # Never dispatched (guard rejection or boot failure): close it out
             # so it leaves the active list with the reason attached.
-            self.queue.mark_finished(job["id"], exit_code=-1, output_paths=[],
+            self._finish_task(job["id"], exit_code=-1, output_paths=[],
                                      error=reason)
         self._transition(job, "failed", detail=reason,
                          audit_action="auto_manage_failed")
@@ -815,14 +857,13 @@ class Dispatcher:
             self._transition(job, "done", instance_id=iid,
                              detail="synced and terminated")
         except TerminationBlocked as exc:
-            # Spec: if files REMAIN after the intended sync, do NOT force.
-            # Surface it exactly like the manual flow and leave the box up for
-            # review. The loop keeps retrying force=False, so the moment the
-            # user syncs/clears the files (or terminates manually) the job
-            # completes on its own.
-            msg = (f"termination blocked: {len(exc.files)} unpersisted "
-                   f"file(s) remain after sync; instance {iid} left running "
-                   f"for review")
+            # The rescue could not save every file, and the data-safety policy
+            # says data beats billing. Do NOT force. Surface it exactly like
+            # the manual flow and leave the box up for review; the loop keeps
+            # retrying force=False, so the moment the user resolves the files
+            # (or terminates manually) the job completes on its own.
+            msg = (f"termination blocked: {len(exc.files)} file(s) could not "
+                   f"be saved; instance {iid} left running for review")
             if job.get("lifecycle_detail") != msg:
                 self.db.set_task_lifecycle(job["id"], "terminating",
                                            detail=msg, stamp=False)
@@ -860,8 +901,10 @@ class Dispatcher:
         self.db.set_task_lifecycle(task_id, "cancelled",
                                    detail="cancelled by user")
         if task["status"] == "queued":
-            self.queue.mark_finished(task_id, exit_code=-1, output_paths=[],
-                                     error="cancelled by user")
+            # notify=False: the user is standing right there having just
+            # clicked Cancel. Pinging them about it would be noise.
+            self._finish_task(task_id, exit_code=-1, output_paths=[],
+                              error="cancelled by user", notify=False)
         self.db.record_audit(
             "backend", "auto_manage_cancelled",
             f"job {task_id}" + (f" instance {iid}" if iid else "")

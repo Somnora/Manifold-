@@ -119,6 +119,11 @@ async def test_terminate_blocked_returns_file_list(mcp_wired, mock_client):
         await asyncio.sleep(0.02)
     instance_id = status["lambda_instance_id"]
 
+    # Make the instance's files unsaveable, so the hook has something to
+    # refuse (the default policy would rescue them and terminate cleanly).
+    await mcp_server._http().put("/preferences", json={
+        "data_safety": {"to_filesystem": False, "to_local": False}})
+
     # force=false: the hook returns evidence instead of terminating.
     result = await mcp_server.terminate_instance(instance_id)
     assert result["blocked"] is True
@@ -197,18 +202,17 @@ async def test_worked_example_transcribe_inbox_then_shut_down(mcp_wired, mock_cl
     logs = await mcp_server.get_job_logs(task_id, tail=300)
     assert any("docker run" in l["line"] for l in logs["lines"])
 
-    # Shut down: hook -> sync -> force. Instance ends terminated.
-    blocked = await mcp_server.terminate_instance(instance_id, note="job done")
-    assert blocked["blocked"] is True
-    await mcp_server.sync_outputs(instance_id, note="save outputs first")
-    final = await mcp_server.terminate_instance(
-        instance_id, force=True, note="all synced"
-    )
+    # Shut down. One call: terminate rescues the instance's ephemeral files to
+    # the persistent volume (Phase 37) and then stops the billing. An agent no
+    # longer has to know the hook->sync->force dance to leave a clean box.
+    final = await mcp_server.terminate_instance(instance_id, note="job done")
     assert final["terminated"] is True
+    assert "ephemeral-backup" in final["rescue"]["synced_to"]
+    assert final["rescue"]["unsaved"] == []
 
     # The whole session is on the audit trail.
     resp = await mcp_server._http().get("/audit", params={"actor": "mcp"})
     tools_used = [e["action"] for e in resp.json()["entries"]]
     for expected in ("launch_gpu", "run_job", "get_job_logs",
-                     "terminate_instance", "sync_outputs"):
+                     "terminate_instance"):
         assert expected in tools_used

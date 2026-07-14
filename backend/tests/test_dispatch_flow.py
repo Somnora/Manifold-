@@ -114,7 +114,11 @@ def test_full_task_and_idle_lifecycle(fast_app, mock_client, mock_sidecar):
         ).fetchall()]
         assert "task_dispatch" in actions
         assert "idle_termination" in actions
-        assert "idle_sync" in actions          # hook fired, sync ran
+        # The idle loop no longer sync-then-forces: terminate() itself rescues
+        # the instance's data (Phase 37), so the trail shows the rescue and the
+        # rsync it performed, and the files were saved rather than bypassed.
+        assert "data_rescue" in actions
+        assert "sync_ephemeral" in actions
 
         # History records the termination.
         row = db.find_launch_by_instance(instance_id)

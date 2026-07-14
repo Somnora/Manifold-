@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, ApiError, type Instance, type UnpersistedFile } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  type Instance,
+  type RescueReport,
+  type UnpersistedFile,
+} from "@/lib/api";
 import { StatusBadge } from "@/components/Badge";
 import { TelemetryChart } from "@/components/TelemetryChart";
 import { TerminalPanel } from "@/components/TerminalPanel";
@@ -22,10 +28,13 @@ export function InstanceCard({
   const [showFiles, setShowFiles] = useState(false);
   const [showBrowse, setShowBrowse] = useState(false);
   const [showChat, setShowChat] = useState(false);
-  const [busy, setBusy] = useState<"" | "terminating" | "syncing">("");
+  const [busy, setBusy] = useState<"" | "terminating" | "rescuing">("");
+  // Set when termination was REFUSED: the rescue ran and some file still
+  // could not be saved. `blockedRescue` says what it did manage to save.
   const [blockedFiles, setBlockedFiles] = useState<UnpersistedFile[] | null>(
     null,
   );
+  const [blockedRescue, setBlockedRescue] = useState<RescueReport | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -42,6 +51,9 @@ export function InstanceCard({
     if (connected) setEverConnected(true);
   }, [connected]);
 
+  // Termination saves the instance's scratch files first (per the data-safety
+  // policy in Settings), then stops the billing. It only refuses if a file
+  // could NOT be saved — and then it says which, and what it did save.
   async function terminate(force = false) {
     setBusy("terminating");
     setError("");
@@ -50,8 +62,8 @@ export function InstanceCard({
       onChanged();
     } catch (err) {
       if (err instanceof ApiError && err.status === 409 && err.body?.blocked) {
-        // The safety hook fired: show the evidence and the two ways out.
         setBlockedFiles(err.body.unpersisted_files as UnpersistedFile[]);
+        setBlockedRescue((err.body.rescue as RescueReport) ?? null);
         setConfirming(false);
       } else {
         setError(err instanceof ApiError ? err.message : String(err));
@@ -72,18 +84,30 @@ export function InstanceCard({
     }
   }
 
-  async function syncThenTerminate() {
-    setBusy("syncing");
+  // Run the data-safety policy again without terminating. Worth a click when
+  // the first attempt failed for a transient reason (an SSH blip), or after
+  // widening the policy in Settings.
+  async function retryRescue() {
+    setBusy("rescuing");
     setError("");
     try {
-      const result = await api.syncEphemeral(instance.id);
-      setNotice(`Synced to ${result.synced_to}`);
-      setBlockedFiles(null);
-      // Re-attempt the normal (guarded) terminate; if new files appeared
-      // since the sync, the hook will fire again — correctly.
-      await terminate(false);
+      const { rescue } = await api.rescue(instance.id);
+      if (rescue.unsaved.length === 0) {
+        setNotice(
+          rescue.synced_to
+            ? `Saved to ${rescue.synced_to}`
+            : `Saved ${rescue.downloaded.length} file(s) to ${rescue.local_dir}`,
+        );
+        setBlockedFiles(null);
+        setBlockedRescue(null);
+        await terminate(false);
+        return;
+      }
+      setBlockedFiles(rescue.unsaved);
+      setBlockedRescue(rescue);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
       setBusy("");
     }
   }
@@ -152,9 +176,12 @@ export function InstanceCard({
               <button
                 onClick={() => terminate(false)}
                 disabled={busy !== ""}
+                title="Saves the instance's scratch files first (Settings decides where), then stops the billing"
                 className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-zinc-900 hover:bg-red-500 disabled:opacity-50"
               >
-                {busy === "terminating" ? "Terminating..." : "Yes, terminate"}
+                {busy === "terminating"
+                  ? "Saving your files..."
+                  : "Save files & terminate"}
               </button>
               <button
                 onClick={() => setConfirming(false)}
@@ -259,12 +286,40 @@ export function InstanceCard({
       {blockedFiles && (
         <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-3">
           <p className="text-sm font-medium text-amber-900">
-            Unsaved work on this instance
+            Kept running: {blockedFiles.length} file
+            {blockedFiles.length === 1 ? "" : "s"} could not be saved
           </p>
           <p className="mt-1 text-xs text-amber-800">
-            These files exist only in ephemeral scratch and will be destroyed
-            by termination:
+            Manifold tried to save this instance&apos;s scratch disk before
+            shutting it down and could not. It is still billing, because losing
+            these files is permanent and an extra billing hour is not.
           </p>
+
+          {blockedRescue && (
+            <p className="mt-2 text-xs text-amber-800">
+              {blockedRescue.sync_error ? (
+                <>
+                  Could not copy to your Lambda filesystem:{" "}
+                  <span className="font-mono">{blockedRescue.sync_error}</span>
+                </>
+              ) : blockedRescue.downloaded.length > 0 ? (
+                <>
+                  Saved {blockedRescue.downloaded.length} file(s) to{" "}
+                  <span className="font-mono">{blockedRescue.local_dir}</span>.
+                  These did not fit:
+                </>
+              ) : (
+                <>
+                  Nowhere to put them: turn on a destination in{" "}
+                  <a href="/settings" className="underline">
+                    Settings
+                  </a>
+                  .
+                </>
+              )}
+            </p>
+          )}
+
           <ul className="mt-2 max-h-40 overflow-y-auto font-mono text-xs text-amber-900">
             {blockedFiles.map((f) => (
               <li key={f.path} className="flex justify-between gap-4 py-0.5">
@@ -275,22 +330,24 @@ export function InstanceCard({
               </li>
             ))}
           </ul>
-          <div className="mt-3 flex gap-2">
+
+          <div className="mt-3 flex flex-wrap gap-2">
             <button
-              onClick={syncThenTerminate}
+              onClick={retryRescue}
               disabled={busy !== ""}
               className="rounded bg-zinc-900 px-3 py-1 text-xs font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
             >
-              {busy === "syncing"
-                ? "Syncing..."
-                : "Sync to persistent, then terminate"}
+              {busy === "rescuing"
+                ? "Saving..."
+                : "Try saving them again, then terminate"}
             </button>
             <button
               onClick={() => terminate(true)}
               disabled={busy !== ""}
               className="rounded border border-red-300 px-3 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
             >
-              Terminate anyway (lose files)
+              Terminate anyway (lose {blockedFiles.length} file
+              {blockedFiles.length === 1 ? "" : "s"})
             </button>
             <button
               onClick={() => setBlockedFiles(null)}
