@@ -1878,3 +1878,34 @@ out of the rescue directory.
 transfer budgeting, and path confinement are testable without an instance, an
 SSH server, or a byte of network. The transport lives in the orchestrator,
 which owns the connections.
+
+## 2026-07-14 — Phase 38: nav consolidation + ambient burn rate
+
+**Problem:** 8 top-level pages for this scope, with two overlapping pairs.
+Hub and Autopilot both showed brains and both rendered ApprovalsPanel; Agent
+Activity and History were both "what happened" pages (audit trail vs cost
+ledger). And the hourly burn — the single most important number in the
+product — was visible on exactly one page.
+
+**Decided (frontend only, zero backend changes):**
+
+- **Hub merged into Autopilot.** Brains and approvals live where runs start.
+  The Hub's third feature, the local terminal, is a TOOL, not a PLACE: it
+  became a bottom drawer toggled by the `>_` header button, available on
+  every page. Once opened it stays MOUNTED and is only hidden with CSS, so
+  closing the drawer does not kill the shell — navigate anywhere, reopen,
+  and the session (history, cwd, running command) is where you left it.
+- **Agent Activity merged into History as the "Activity" page** with
+  Spend / Audit tabs. The audit table moved verbatim into
+  components/AuditLog.tsx; deep link `/history?tab=audit`.
+- **Old URLs keep working**: /hub and /agents are client redirect stubs
+  (static export cannot do server redirects), so desktop-app bookmarks and
+  doc links don't break.
+- **BurnChip in the header** next to the bell on every page: sum of running
+  instances' hourly rates, amber + pulsing when > $0, click-through to
+  Instances where the terminate buttons are. Renders nothing while the
+  backend is unreachable — an unknown must not display as a reassuring $0.
+
+Nav went 8 -> 6: Instances · Jobs · Storage | Autopilot | Activity ·
+Settings. Deliberately NOT touched: the Jobs page's density is earned (one
+coherent workflow); Storage's region limitation is a separate problem.

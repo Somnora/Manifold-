@@ -34,8 +34,8 @@ OpenAI-compatible interface:
 - API brains use each provider's OpenAI-compatible endpoint. Keys live in
   .env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) and are
   never stored anywhere else. No key -> the option simply is not offered.
-- The Hub page lists everything currently available; the Autopilot page
-  picks from the same list.
+- The Autopilot page lists everything currently available (the Brains
+  section) and its run form picks from the same list.
 
 The safety model does not change with the brain: same fixed action
 allowlist, same budget/concurrency/region guards, same step caps, same
@@ -43,10 +43,10 @@ audit trail. A frontier model gets no more power than a 4B local one.
 
 ## Approval-gated runs
 
-Start a run with **Require my approval** on (the default) and the three
-actions that spend money or destroy state - `launch_gpu`, `run_job`,
-`terminate_instance` - pause as a pending card (Autopilot and Hub pages)
-until you Approve or Deny:
+Pick which actions need your approval per run (or set the default in
+Settings - out of the box only `launch_gpu` is gated; see the Settings
+page for why gating `terminate_instance` costs money). A gated action
+pauses as a pending card on the Autopilot page until you Approve or Deny:
 
 - **Approve** -> the action executes through the normal guarded path.
 - **Deny** -> the agent receives "DENIED by the user" as data and adapts.
@@ -58,8 +58,10 @@ Every request and decision is audited (`approval_requested`,
 
 ## Local terminal
 
-The Hub page embeds a login shell on the machine running the backend -
-the same xterm panel the instances use, pointed at your own box. Use it
+The `>_` button in the header opens a login shell on the machine running
+the backend, as a bottom drawer available on every page - the same xterm
+panel the instances use, pointed at your own box. Once opened it keeps
+running behind a closed drawer (type `exit` to end the shell). Use it
 to prep datasets, run scripts, or drive the MCP tools without leaving the
 dashboard.
 

@@ -2,7 +2,9 @@ import type { Metadata } from "next";
 import { JetBrains_Mono, Space_Grotesk } from "next/font/google";
 import "./globals.css";
 import { Nav } from "@/components/Nav";
+import { BurnChip } from "@/components/BurnChip";
 import { NotificationBell } from "@/components/NotificationBell";
+import { TerminalDrawer } from "@/components/TerminalDrawer";
 
 // The type pairing: Space Grotesk for UI (geometric, a little posh),
 // JetBrains Mono for anything terminal-adjacent. Self-hosted at build time
@@ -36,7 +38,9 @@ export default function RootLayout({
               <span className="cursor-blink text-teal-400">▌</span>
             </span>
             <Nav />
-            <div className="ml-auto">
+            <div className="ml-auto flex items-center gap-2">
+              <BurnChip />
+              <TerminalDrawer />
               <NotificationBell />
             </div>
           </div>
