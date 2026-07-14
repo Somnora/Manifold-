@@ -4,7 +4,10 @@ import "./globals.css";
 import { Nav } from "@/components/Nav";
 import { BurnChip } from "@/components/BurnChip";
 import { NotificationBell } from "@/components/NotificationBell";
-import { TerminalDrawer } from "@/components/TerminalDrawer";
+import {
+  TerminalDockProvider,
+  TerminalDockToggle,
+} from "@/components/TerminalDock";
 
 // The type pairing: Space Grotesk for UI (geometric, a little posh),
 // JetBrains Mono for anything terminal-adjacent. Self-hosted at build time
@@ -31,21 +34,25 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${grotesk.variable} ${mono.variable}`}>
       <body className="min-h-screen bg-zinc-50 text-zinc-900 antialiased">
-        <header className="sticky top-0 z-40 border-b border-zinc-200 bg-zinc-50/80 backdrop-blur">
-          <div className="mx-auto flex max-w-6xl items-center gap-8 px-6 py-3">
-            <span className="flex items-baseline gap-0.5 font-mono text-sm font-semibold tracking-tight">
-              manifold
-              <span className="cursor-blink text-teal-400">▌</span>
-            </span>
-            <Nav />
-            <div className="ml-auto flex items-center gap-2">
-              <BurnChip />
-              <TerminalDrawer />
-              <NotificationBell />
+        {/* The dock provider wraps everything so any page (instance cards
+            included) can dock a shell, and sessions survive navigation. */}
+        <TerminalDockProvider>
+          <header className="sticky top-0 z-40 border-b border-zinc-200 bg-zinc-50/80 backdrop-blur">
+            <div className="mx-auto flex max-w-6xl items-center gap-8 px-6 py-3">
+              <span className="flex items-baseline gap-0.5 font-mono text-sm font-semibold tracking-tight">
+                manifold
+                <span className="cursor-blink text-teal-400">▌</span>
+              </span>
+              <Nav />
+              <div className="ml-auto flex items-center gap-2">
+                <BurnChip />
+                <TerminalDockToggle />
+                <NotificationBell />
+              </div>
             </div>
-          </div>
-        </header>
-        <main className="mx-auto max-w-6xl px-6 py-8">{children}</main>
+          </header>
+          <main className="mx-auto max-w-6xl px-6 py-8">{children}</main>
+        </TerminalDockProvider>
       </body>
     </html>
   );

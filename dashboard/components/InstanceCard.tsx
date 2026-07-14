@@ -10,7 +10,7 @@ import {
 } from "@/lib/api";
 import { StatusBadge } from "@/components/Badge";
 import { TelemetryChart } from "@/components/TelemetryChart";
-import { TerminalPanel } from "@/components/TerminalPanel";
+import { useTerminalDock } from "@/components/TerminalDock";
 import { RecentFiles } from "@/components/RecentFiles";
 import { FileNavigator } from "@/components/FileNavigator";
 import { ChatPanel } from "@/components/ChatPanel";
@@ -24,7 +24,7 @@ export function InstanceCard({
   onChanged: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
-  const [showTerminal, setShowTerminal] = useState(false);
+  const { dockInstance } = useTerminalDock();
   const [showFiles, setShowFiles] = useState(false);
   const [showBrowse, setShowBrowse] = useState(false);
   const [showChat, setShowChat] = useState(false);
@@ -129,14 +129,13 @@ export function InstanceCard({
           {everConnected && (
             <>
               <button
-                onClick={() => setShowTerminal((s) => !s)}
-                className={`rounded border px-3 py-1 text-xs font-medium ${
-                  showTerminal
-                    ? "border-zinc-900 bg-zinc-900 text-white"
-                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
-                }`}
+                onClick={() =>
+                  dockInstance(instance.id, instance.name || instance.id)
+                }
+                title="Open this instance's shell in the terminal dock, next to your local terminal"
+                className="rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
               >
-                {showTerminal ? "Close Terminal" : "Open Terminal"}
+                Terminal
               </button>
               <button
                 onClick={() => setShowFiles((s) => !s)}
@@ -270,11 +269,11 @@ export function InstanceCard({
 
       {everConnected && <TelemetryChart instanceId={instance.id} />}
 
-      {/* Panels stay mounted through transient reconnects; each surfaces its
-          own connection state rather than being torn down (which flapped). */}
-      {showTerminal && everConnected && (
-        <TerminalPanel instanceId={instance.id} />
-      )}
+      {/* The instance shell lives in the terminal dock (Terminal button
+          above) rather than inline - it survives page navigation there and
+          snaps next to the local terminal. Remaining panels stay mounted
+          through transient reconnects; each surfaces its own connection
+          state rather than being torn down (which flapped). */}
       {showFiles && everConnected && (
         <RecentFiles instanceId={instance.id} />
       )}
