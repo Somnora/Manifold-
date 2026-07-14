@@ -180,22 +180,32 @@ class Orchestrator:
                 f"Valid types: {', '.join(sorted(types))}",
             )
 
-        filesystems = {fs.name: fs for fs in await self.client.list_filesystems()}
-        if filesystem not in filesystems:
-            raise LaunchRejected(
-                400,
-                f"Unknown filesystem '{filesystem}'. "
-                f"Available: {', '.join(sorted(filesystems)) or '(none)'}",
-            )
-        fs = filesystems[filesystem]
-        if fs.region != region:
-            raise LaunchRejected(
-                400,
-                f"Region mismatch: filesystem '{filesystem}' lives in "
-                f"{fs.region} but the launch requests {region}. Lambda "
-                f"filesystems are region-locked and can only be attached at "
-                f"launch — launch in {fs.region} instead.",
-            )
+        # Filesystem is OPTIONAL (Phase 39): "" launches a scratch-only
+        # instance in any region, including ones where the user has no
+        # filesystem. Everything on it is ephemeral - jobs that mount
+        # {persistent} refuse to run, sync has nowhere to go, and the
+        # termination rescue can only save files by downloading them here.
+        # The launch form says all of this before the user clicks.
+        if filesystem:
+            filesystems = {fs.name: fs
+                           for fs in await self.client.list_filesystems()}
+            if filesystem not in filesystems:
+                raise LaunchRejected(
+                    400,
+                    f"Unknown filesystem '{filesystem}'. "
+                    f"Available: {', '.join(sorted(filesystems)) or '(none)'}"
+                    f" - or launch without one (scratch only).",
+                )
+            fs = filesystems[filesystem]
+            if fs.region != region:
+                raise LaunchRejected(
+                    400,
+                    f"Region mismatch: filesystem '{filesystem}' lives in "
+                    f"{fs.region} but the launch requests {region}. Lambda "
+                    f"filesystems are region-locked and can only be attached "
+                    f"at launch — launch in {fs.region} instead, or launch "
+                    f"without a filesystem (scratch only).",
+                )
 
         # SSH key: per-launch choice wins, config.yaml is the fallback. The
         # name must be registered with Lambda or the launch call would fail
@@ -222,18 +232,27 @@ class Orchestrator:
         # snapshot (two quick launches both seeing "0 running").
         running = [i for i in await self.client.list_instances(fresh=True)
                    if i.is_running]
-        limit = self.settings.guardrails.max_concurrent_instances
+        # The NUMBERS come from Settings when the user set them there
+        # (preferences.guardrails; 0 = unset), falling back to config.yaml.
+        # The guards themselves never move out of this function.
+        prefs_guard = self.prefs.get().guardrails if self.prefs else None
+        limit = (prefs_guard.max_concurrent_instances
+                 if prefs_guard and prefs_guard.max_concurrent_instances > 0
+                 else self.settings.guardrails.max_concurrent_instances)
         if len(running) + 1 > limit:
             raise LaunchRejected(
                 409,
                 f"Concurrency guard: {len(running)} instance(s) already "
                 f"running, limit is {limit}. Terminate one first or raise "
-                f"guardrails.max_concurrent_instances in config.yaml.",
+                f"the limit under Settings -> Spending guardrails.",
                 reason_code="concurrency",
             )
 
         current_spend = sum(i.hourly_rate_cents for i in running)
-        budget_cents = round(self.settings.guardrails.max_hourly_spend_usd * 100)
+        budget_usd = (prefs_guard.max_hourly_spend_usd
+                      if prefs_guard and prefs_guard.max_hourly_spend_usd > 0
+                      else self.settings.guardrails.max_hourly_spend_usd)
+        budget_cents = round(budget_usd * 100)
         price = types[instance_type].price_cents_per_hour
         if current_spend + price > budget_cents:
             raise LaunchRejected(
@@ -242,7 +261,7 @@ class Orchestrator:
                 f"(${price / 100:.2f}/hr) would bring hourly spend to "
                 f"${(current_spend + price) / 100:.2f}, over the "
                 f"${budget_cents / 100:.2f} limit "
-                f"(guardrails.max_hourly_spend_usd in config.yaml).",
+                f"(Settings -> Spending guardrails).",
                 reason_code="budget",
             )
 
@@ -639,7 +658,8 @@ class Orchestrator:
                         instance_type=candidate,
                         region=plan.region,
                         ssh_key_names=[plan.ssh_key_name],
-                        filesystem_names=[plan.filesystem],
+                        filesystem_names=(
+                            [plan.filesystem] if plan.filesystem else []),
                         name=plan.name,
                         user_data=build_user_data(
                             # Only a tailscale-mode launch carries the key.

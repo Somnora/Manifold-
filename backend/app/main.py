@@ -128,11 +128,21 @@ class PreferencesPatch(BaseModel):
     approvals: dict | None = None
     notifications: dict | None = None
     data_safety: dict | None = None
+    guardrails: dict | None = None
 
 
 class NotificationsReadRequest(BaseModel):
     # Omit to mark everything read.
     ids: list[str] | None = None
+
+
+class CustomTemplateRequest(BaseModel):
+    yaml: str = Field(min_length=20, max_length=65536)
+
+
+class RunCommandRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=8192)
+    timeout: float = Field(default=120.0, gt=0, le=600)
 
 
 class ChatRequest(BaseModel):
@@ -172,6 +182,7 @@ def create_app(
     notification_sender=None,      # (title, body) -> None; tests record, mock no-ops
     env_path=None,                 # where /settings writes secrets (.env)
     templates_dir=None,
+    custom_templates_dir=None,     # user-authored templates (DATA_ROOT/custom-templates)
     mock: bool = False,
 ) -> FastAPI:
     settings = settings or load_settings()
@@ -264,9 +275,33 @@ def create_app(
     )
     storage_cache: dict[str, StorageClient] = {}
 
-    templates, template_errors = load_templates(
-        templates_dir if templates_dir is not None else RESOURCE_ROOT / "templates"
-    )
+    # Templates come from two places: the bundled set (read-only, ships with
+    # the app) and the user's own custom-templates dir (created from the Jobs
+    # page or by an agent via MCP). One shared dict is handed to the
+    # dispatcher/autopilot/brains, so reloads mutate it IN PLACE and every
+    # consumer sees new templates without a restart. User templates win name
+    # collisions - overriding a bundled template is a feature, not an error.
+    bundled_dir = (templates_dir if templates_dir is not None
+                   else RESOURCE_ROOT / "templates")
+    custom_dir = (custom_templates_dir if custom_templates_dir is not None
+                  else DATA_ROOT / "custom-templates")
+    templates: dict = {}
+    template_errors: dict = {}
+    custom_names: set[str] = set()
+
+    def reload_templates() -> None:
+        loaded, errors = load_templates(bundled_dir)
+        custom, custom_errors = load_templates(custom_dir)
+        loaded.update(custom)
+        errors.update({f"custom/{k}": v for k, v in custom_errors.items()})
+        templates.clear()
+        templates.update(loaded)
+        template_errors.clear()
+        template_errors.update(errors)
+        custom_names.clear()
+        custom_names.update(custom)
+
+    reload_templates()
 
     queue = SQLiteTaskQueue(db)
     dispatcher = Dispatcher(
@@ -467,6 +502,14 @@ def create_app(
             "preferences": prefs.get().to_dict(),
             "gateable_actions": list(GATEABLE_ACTIONS),
             "notification_kinds": list(NOTIFICATION_KINDS),
+            # What the guardrails fall back to when unset (0) here - the
+            # Settings page shows these as placeholders.
+            "guardrail_defaults": {
+                "max_concurrent_instances":
+                    settings.guardrails.max_concurrent_instances,
+                "max_hourly_spend_usd":
+                    settings.guardrails.max_hourly_spend_usd,
+            },
         }
 
     @app.put("/preferences")
@@ -590,6 +633,40 @@ def create_app(
         down to this machine. The same code termination runs — so the report
         you get here is exactly what a termination would do."""
         return {"rescue": await orchestrator.rescue(instance_id)}
+
+    @app.post("/instances/{instance_id}/run")
+    async def run_instance_command(instance_id: str, req: RunCommandRequest):
+        """Run one command on the instance over the managed SSH connection.
+
+        This is the SSH-parity endpoint for agents: everything a shell could
+        do, but through the guarded gateway, so every command lands in the
+        audit log with its exit code. Bounded by a hard timeout; output is
+        capped so a runaway command cannot flood the response. Long-running
+        work belongs in a job (run_job streams logs and survives restarts) -
+        this is for the quick, real commands in between.
+        """
+        conn = orchestrator.connections.get(instance_id)
+        if conn is None or conn.ssh_connection() is None:
+            raise HTTPException(
+                409, f"no connected instance {instance_id}")
+        dispatcher.touch_activity(instance_id)
+        try:
+            exit_code, stdout, stderr = await conn.run(
+                req.command, timeout=req.timeout)
+        except ConnectionError as exc:
+            raise HTTPException(409, str(exc))
+        db.record_audit(
+            "api", "instance_command",
+            f"{instance_id}: {req.command[:200]!r} -> exit {exit_code}",
+        )
+        cap = 64 * 1024
+        return {
+            "instance_id": instance_id,
+            "exit_code": exit_code,
+            "stdout": stdout[-cap:],
+            "stderr": stderr[-cap:],
+            "truncated": len(stdout) > cap or len(stderr) > cap,
+        }
 
     @app.get("/instances/{instance_id}/metrics")
     async def instance_metrics(instance_id: str):
@@ -1310,11 +1387,60 @@ def create_app(
     @app.get("/templates")
     async def list_templates():
         """Valid templates with parameter schemas, plus load errors so a
-        broken YAML file is visible instead of silently missing."""
-        return {
-            "templates": [t.to_api() for t in templates.values()],
-            "errors": template_errors,
-        }
+        broken YAML file is visible instead of silently missing. Custom
+        (user-authored) templates carry their raw YAML for editing."""
+        out = []
+        for t in templates.values():
+            entry = t.to_api()
+            entry["custom"] = t.name in custom_names
+            if entry["custom"]:
+                path = custom_dir / f"{t.name}.yaml"
+                entry["yaml"] = path.read_text() if path.exists() else ""
+            out.append(entry)
+        return {"templates": out, "errors": template_errors}
+
+    @app.post("/templates/custom", status_code=201)
+    async def save_custom_template(req: CustomTemplateRequest):
+        """Create or update a user template from raw YAML.
+
+        Validated by the SAME loader as bundled templates - the mount jail
+        (only /workspace/ephemeral and {persistent}), the parameter schema,
+        and the port rules all apply. A custom template gets no powers a
+        bundled one lacks; it is a recipe, not an escape hatch. Live
+        immediately: the shared dict is reloaded in place, no restart."""
+        from .templates import TemplateError, parse_template
+        try:
+            template = parse_template(req.yaml, source="custom")
+        except (TemplateError, Exception) as exc:
+            raise HTTPException(422, f"template rejected: {exc}")
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        (custom_dir / f"{template.name}.yaml").write_text(req.yaml)
+        reload_templates()
+        db.record_audit(
+            "api", "template_saved",
+            f"custom template '{template.name}' "
+            f"({'overrides bundled' if (bundled_dir / (template.name + '.yaml')).exists() else 'new'})",
+        )
+        entry = templates[template.name].to_api()
+        entry["custom"] = True
+        return {"template": entry}
+
+    @app.delete("/templates/custom/{name}")
+    async def delete_custom_template(name: str):
+        """Remove a user template. Bundled templates cannot be deleted; if
+        this one was shadowing a bundled template, the bundled version comes
+        back on the reload."""
+        if name not in custom_names:
+            raise HTTPException(
+                404 if name not in templates else 400,
+                f"'{name}' is not a custom template"
+                + (" (bundled templates cannot be deleted)"
+                   if name in templates else ""),
+            )
+        (custom_dir / f"{name}.yaml").unlink(missing_ok=True)
+        reload_templates()
+        db.record_audit("api", "template_deleted", f"custom template '{name}'")
+        return {"deleted": name, "restored_bundled": name in templates}
 
     # -- tasks ------------------------------------------------------------------------
 

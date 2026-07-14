@@ -187,6 +187,51 @@ async def run_job(template: str, parameters: dict, note: str = "") -> dict:
 
 
 @mcp.tool()
+async def save_template(yaml_text: str, note: str = "") -> dict:
+    """Create or update a CUSTOM job template from raw YAML, so a workflow
+    you have proven by hand becomes a one-click recipe the user can rerun
+    from the Jobs page without any agent involved. Validated exactly like
+    bundled templates (image, command with {{param}} placeholders, parameter
+    schema; volume mounts only under /workspace/ephemeral or {persistent};
+    ports always loopback-bound). Returns the parsed template or the
+    validation error. Prefer parameterizing over hardcoding: a template with
+    good parameters serves the user forever."""
+    return await _call(
+        "save_template", "POST", "/templates/custom",
+        note=note, args={"yaml": f"({len(yaml_text)} chars)"},
+        body={"yaml": yaml_text},
+    )
+
+
+@mcp.tool()
+async def delete_template(name: str, note: str = "") -> dict:
+    """Delete a CUSTOM template by name. Bundled templates cannot be
+    deleted; if the custom one was overriding a bundled name, the bundled
+    version is restored."""
+    return await _call(
+        "delete_template", "DELETE", f"/templates/custom/{name}",
+        note=note, args={"name": name},
+    )
+
+
+@mcp.tool()
+async def run_command(instance_id: str, command: str, timeout: float = 120,
+                      note: str = "") -> dict:
+    """Run ONE shell command on the instance over the managed SSH connection
+    and return {exit_code, stdout, stderr}. Full shell parity, but audited:
+    every command lands in the user's activity log with its exit code, which
+    raw SSH would not. Bounded by `timeout` (max 600s) - long-running work
+    belongs in a job (run_job streams logs and survives backend restarts).
+    Use this for the quick real commands in between: inspecting files,
+    checking nvidia-smi, preparing directories."""
+    return await _call(
+        "run_command", "POST", f"/instances/{instance_id}/run",
+        note=note, args={"instance_id": instance_id, "command": command[:200]},
+        body={"command": command, "timeout": timeout},
+    )
+
+
+@mcp.tool()
 async def get_job_status(task_id: str, note: str = "") -> dict:
     """Job state (queued|running|succeeded|failed), exit code, and the
     persistent output paths it writes to."""

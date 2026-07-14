@@ -13,6 +13,7 @@ import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import { ParameterForm } from "@/components/ParameterForm";
 import { EstimateWidget } from "@/components/EstimateWidget";
+import { TemplateEditor } from "@/components/TemplateEditor";
 import {
   AutoManageControls,
   type AutoManageState,
@@ -66,7 +67,9 @@ export default function JobsPage() {
   );
   const [targetInstance, setTargetInstance] = useState("");
 
-  useEffect(() => {
+  // Also called by the template editor after a save/delete, so a new custom
+  // template appears in the picker immediately.
+  function loadTemplates() {
     api
       .templates()
       .then((r) => {
@@ -75,8 +78,12 @@ export default function JobsPage() {
         if (r.templates.length > 0) setSelected((v) => v || r.templates[0].name);
       })
       .catch((e) => setError(e.message));
+  }
+
+  useEffect(() => {
+    loadTemplates();
     api.modelPresets().then(setPresets).catch(() => {});
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const template = templates.find((t) => t.name === selected);
   const isVllm = selected === "vllm-serve";
@@ -287,6 +294,10 @@ export default function JobsPage() {
               {file}: {message}
             </p>
           ))}
+        </div>
+
+        <div className="mt-6">
+          <TemplateEditor templates={templates} onChanged={loadTemplates} />
         </div>
       </section>
 

@@ -1909,3 +1909,47 @@ product — was visible on exactly one page.
 Nav went 8 -> 6: Instances · Jobs · Storage | Autopilot | Activity ·
 Settings. Deliberately NOT touched: the Jobs page's density is earned (one
 coherent workflow); Storage's region limitation is a separate problem.
+
+## 2026-07-14 — Phase 39: power without training wheels
+
+Four asks from live testing, one theme: advanced users (and their agents)
+should never hit a wall that exists only for ceremony.
+
+**Guardrail NUMBERS moved to Settings; the guards did not move.** The
+concurrency/budget guards stay in orchestrator.request_launch (hard rule),
+but the limits they enforce now read through the preference store:
+Settings -> Spending guardrails, 0/blank = config.yaml default. Raising the
+instance limit no longer needs a YAML edit + restart. Guard rejection
+messages point at Settings instead of config.yaml.
+
+**Filesystem is optional at launch.** filesystem="" launches a scratch-only
+instance in ANY region with capacity - previously a region without one of
+your filesystems was unlaunchable. Consequences fall out of existing
+machinery, deliberately: jobs mounting {persistent} fail with a clear
+reason; sync has nowhere to go, so the rescue reports sync_error and the
+data-safety policy decides (default: block termination while unsaved files
+exist; to_local download is the net). The launch form says all of this in
+amber BEFORE the click. No new code path touches the guards.
+
+**Custom job templates - the "skills" model.** User/agent-authored YAML in
+custom-templates/ under the data dir, loaded alongside the bundled set into
+ONE shared dict that reloads in place (dispatcher/autopilot/brains all see
+new templates with no restart). Validated by the SAME parser and mount jail
+as bundled templates: a custom template is a recipe, not an escape hatch
+(test: a template mounting /etc is rejected with 422). User templates win
+name collisions; deleting one restores the bundled original. Files, not DB
+rows - portable, committable, backupable. Editor on the Jobs page; agents
+get MCP save_template/delete_template. The design goal is agent-as-
+scaffolding: prove a workflow with the agent once, save it, rerun it
+forever as a form - no tokens, no re-explaining.
+
+**run_command: SSH parity, audited.** The honest answer to "do agents get
+the same tools as SSH?" used to be "no". Now the difference is visibility,
+not capability: POST /instances/{id}/run (MCP run_command) runs one shell
+command over the managed connection, hard-timeout (<=600s), output capped,
+audited with exit code, idle-clock touched. Guards still bind everything.
+The instruction to give agents stays: use the manifold tools, not ssh -
+same power, but on the record.
+
+Docs: codex + gemini MCP registration blocks and the parity section in
+mcp-setup.md; new custom-templates.md authoring guide.

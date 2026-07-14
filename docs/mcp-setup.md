@@ -46,6 +46,37 @@ Restart Claude Desktop; the tools appear under the hammer icon.
 If the backend runs somewhere non-default, set the env var in the same
 block: `"env": {"MANIFOLD_API_URL": "http://localhost:8000"}`.
 
+## Registering in Codex
+
+Add to `~/.codex/config.toml`, with YOUR absolute repo path:
+
+```toml
+[mcp_servers.manifold]
+command = "uv"
+args = ["run", "--directory", "/Users/you/Manifold/backend", "manifold-mcp"]
+```
+
+Then in any codex session: "use the manifold tools to launch an A10 and
+run gpu-smoke". Tell it once per task: **use the manifold tools, not ssh**
+- that is what keeps every action on the audit trail.
+
+## Registering in Gemini CLI
+
+Add to `~/.gemini/settings.json` (create it if needed):
+
+```json
+{
+  "mcpServers": {
+    "manifold": {
+      "command": "uv",
+      "args": ["run", "--directory", "/Users/you/Manifold/backend", "manifold-mcp"]
+    }
+  }
+}
+```
+
+`/mcp` inside gemini lists the tools once it connects.
+
 ## The tools
 
 | Tool | What it does |
@@ -61,10 +92,13 @@ block: `"env": {"MANIFOLD_API_URL": "http://localhost:8000"}`.
 | `list_filesystems()` / `list_persistent_files(prefix)` | Persistent storage, no instance needed |
 | `upload_file(local_path, remote_path)` | Push a file from this machine to the instance (SFTP) |
 | `download_file(remote_path, local_path)` | Pull results back to this machine (SFTP) |
+| `run_command(instance_id, command, timeout=120)` | ONE shell command on the instance, audited with its exit code |
+| `save_template(yaml_text)` / `delete_template(name)` | Author a custom job template (see docs/custom-templates.md) |
 
 Every tool takes an optional `note` — one line of intent that lands in the
-audit log. Everything an agent does is visible on the dashboard's **Agent
-Activity** page as it happens.
+audit log. Everything an agent does is visible live on the dashboard's
+**Activity → Audit trail** page (filter: Agent actions), and any job it
+queues appears on the Jobs page with streaming logs.
 
 ## Worked example
 
@@ -94,6 +128,23 @@ Activity):
 8. `sync_outputs(id, note="save outputs first")` →
    `terminate_instance(id, force=true, note="all synced")` → terminated.
    Billing stopped.
+
+## Do agents get everything SSH would give them?
+
+Yes — the difference is not capability, it is visibility.
+
+- `run_command` is full shell parity: anything an agent could type over
+  raw SSH, it can run through the tool. The difference is that every
+  command lands in the audit log with its exit code, and activity resets
+  the idle clock so the box is not reaped mid-task.
+- Long-running work belongs in `run_job` (or a custom template): jobs
+  stream logs to the dashboard, survive backend restarts, and record
+  their outputs.
+- What agents can NOT do through the tools: bypass a guard. Budget,
+  concurrency, the mount jail, and the termination data rescue bind every
+  tool identically. Raw SSH from your own terminal could sidestep the
+  audit trail — which is exactly why the one instruction worth giving
+  every agent is: **use the manifold tools, not ssh**.
 
 ## Non-MCP agents
 

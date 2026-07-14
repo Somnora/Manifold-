@@ -15,10 +15,18 @@ import { formatMoney } from "@/lib/format";
 //      that are out of capacity are greyed out and unselectable.
 //   2. Pick a region — only the regions where that GPU is available are
 //      selectable; the rest are greyed with "not available for this type".
-//   3. Filesystem narrows to the chosen region (they are region-locked).
+//   3. Filesystem narrows to the chosen region (they are region-locked) —
+//      or "scratch only": no filesystem at all, launchable in ANY region
+//      with capacity. Everything on a scratch-only instance dies with it,
+//      so the form says so in amber before the click, and the data-safety
+//      rescue is the only net (download-to-this-machine, Settings).
 // The form only collects input; every rule (region match, budget,
 // concurrency) is still enforced by the backend and its rejection shown
 // verbatim.
+
+// Sentinel for "launch without a filesystem" ("" = nothing chosen yet).
+const SCRATCH_ONLY = "__scratch_only__";
+
 export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
   const [regions, setRegions] = useState<Region[]>([]);
@@ -115,19 +123,18 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     [filesystems, region],
   );
   useEffect(() => {
-    if (
-      filesystemsInRegion.length > 0 &&
-      !filesystemsInRegion.some((f) => f.name === filesystem)
-    ) {
-      setFilesystem(filesystemsInRegion[0].name);
-    }
+    if (filesystem === SCRATCH_ONLY) return; // an explicit choice sticks
+    if (filesystemsInRegion.some((f) => f.name === filesystem)) return;
+    // Prefer a real filesystem when the region has one; otherwise fall to
+    // scratch-only so a filesystem-less region is still launchable.
+    setFilesystem(filesystemsInRegion[0]?.name ?? SCRATCH_ONLY);
   }, [region, filesystemsInRegion]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const outOfCapacity =
     !!selectedType && selectedType.regions_with_capacity.length === 0;
-  const noFsInRegion = region !== "" && filesystemsInRegion.length === 0;
+  const scratchOnly = filesystem === SCRATCH_ONLY;
   const canLaunch =
-    !!instanceType && !!region && !!filesystem && !outOfCapacity && !noFsInRegion;
+    !!instanceType && !!region && !!filesystem && !outOfCapacity;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -137,7 +144,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       await api.launch({
         instance_type: instanceType,
         region,
-        filesystem,
+        filesystem: scratchOnly ? "" : filesystem,
         connection_mode: mode,
         ssh_key_name: sshKey || undefined,
       });
@@ -213,16 +220,18 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             className={`${field} mt-1`}
             value={filesystem}
             onChange={(e) => setFilesystem(e.target.value)}
-            disabled={filesystemsInRegion.length === 0}
           >
-            {filesystemsInRegion.length === 0 && (
-              <option value="">none in this region</option>
-            )}
             {filesystemsInRegion.map((f) => (
               <option key={f.name} value={f.name}>
                 {f.name}
               </option>
             ))}
+            <option value={SCRATCH_ONLY}>
+              None - scratch only
+              {filesystemsInRegion.length === 0
+                ? " (no filesystem in this region)"
+                : ""}
+            </option>
           </select>
         </label>
         <label className="block text-xs font-medium text-zinc-600">
@@ -262,10 +271,12 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
               {selectedType.description} is out of capacity everywhere right
               now. Pick another GPU, or set a capacity watch below.
             </span>
-          ) : noFsInRegion ? (
+          ) : scratchOnly ? (
             <span className="text-amber-700">
-              No filesystem in this region. Create one in the Lambda console,
-              or pick a region where you already have one.
+              Scratch only: everything on this instance is deleted when it
+              terminates. Transfer your files first, or turn on
+              &ldquo;Download to this machine&rdquo; under Settings &gt; data
+              safety and termination will save them automatically.
             </span>
           ) : selectedType ? (
             <span>

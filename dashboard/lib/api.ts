@@ -169,6 +169,9 @@ export type Template = {
   command: string;
   parameters: TemplateParameter[];
   gpu: { min_vram_gib?: number; recommended_types?: string[] };
+  // User-authored template (editable/deletable); yaml is its raw source.
+  custom?: boolean;
+  yaml?: string;
 };
 
 export type Lifecycle =
@@ -306,12 +309,18 @@ export type Preferences = {
     max_local_gib: number;
     if_unsaveable: "block" | "terminate";
   };
+  // 0 = "use the config.yaml default" (shown as the placeholder).
+  guardrails: {
+    max_concurrent_instances: number;
+    max_hourly_spend_usd: number;
+  };
 };
 
 export type PreferencesPatch = {
   approvals?: Partial<Record<GateableAction, boolean>>;
   notifications?: Partial<Record<NotificationKind | "desktop", boolean>>;
   data_safety?: Partial<Preferences["data_safety"]>;
+  guardrails?: Partial<Preferences["guardrails"]>;
 };
 
 export type Notification = {
@@ -522,7 +531,22 @@ export const api = {
       preferences: Preferences;
       gateable_actions: GateableAction[];
       notification_kinds: NotificationKind[];
+      guardrail_defaults: {
+        max_concurrent_instances: number;
+        max_hourly_spend_usd: number;
+      };
     }>("/preferences"),
+
+  saveCustomTemplate: (yaml: string) =>
+    request<{ template: Template }>("/templates/custom", {
+      method: "POST",
+      body: JSON.stringify({ yaml }),
+    }).then((r) => r.template),
+
+  deleteCustomTemplate: (name: string) =>
+    request<{ deleted: string }>(`/templates/custom/${name}`, {
+      method: "DELETE",
+    }),
 
   updatePreferences: (patch: PreferencesPatch) =>
     request<{ preferences: Preferences }>("/preferences", {
