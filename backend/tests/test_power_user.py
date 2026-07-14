@@ -242,3 +242,81 @@ def test_run_command_executes_and_audits(client):
 def test_run_command_needs_a_connection(client):
     resp = client.post("/instances/ghost/run", json={"command": "ls"})
     assert resp.status_code == 409
+
+
+# -- instance rename -----------------------------------------------------------------
+
+
+def test_rename_instance_overlays_lambda_name(client):
+    instance_id = launch_and_wait(client)
+
+    client.post(f"/instances/{instance_id}/name", json={"name": "render-box"})
+    inst = next(i for i in client.get("/instances").json()["instances"]
+                if i["id"] == instance_id)
+    assert inst["name"] == "render-box"
+
+    # Empty restores Lambda's launch-time name.
+    client.post(f"/instances/{instance_id}/name", json={"name": ""})
+    inst = next(i for i in client.get("/instances").json()["instances"]
+                if i["id"] == instance_id)
+    assert inst["name"] != "render-box"
+
+
+# -- unlimited autopilot steps -------------------------------------------------------
+
+
+def test_unlimited_steps_run(tmp_path):
+    """unlimited_steps=true stores max_steps=0 and the loop keeps going past
+    the finite default until the brain says done."""
+    from fastapi.testclient import TestClient
+    from tests.test_local_hub import DONE, approval_app, wait_run
+
+    wait_line = '{"thought": "poll", "action": "wait", "args": {"seconds": 0}}'
+    app, _, _ = approval_app(tmp_path, [wait_line] * 60 + [DONE])
+    with TestClient(app) as client:
+        run = client.post("/autopilot/runs", json={
+            "goal": "Poll for a while, then stop.",
+            "brain": "local:x/scripted",
+            "unlimited_steps": True,
+            "approve_actions": [],
+        }).json()["run"]
+        assert run["max_steps"] == 0
+
+        done = wait_run(client, run["id"], timeout=20)
+        assert done["status"] == "succeeded"
+        # 61 steps: over the 50-step hard cap a finite run could never pass.
+        assert done["steps_taken"] == 61
+
+
+# -- autopilot authors its own template ------------------------------------------------
+
+
+def test_autopilot_can_save_a_template(tmp_path):
+    """The save_template action: a run whose goal fits no bundled template
+    authors one mid-run, and it persists for the user afterwards."""
+    import json as _json
+    from fastapi.testclient import TestClient
+    from tests.test_local_hub import DONE, approval_app, wait_run
+    from tests.test_power_user import CUSTOM_YAML  # noqa: PLW0406 (self)
+
+    save_line = _json.dumps({
+        "thought": "no bundled template renders sketches; make one",
+        "action": "save_template",
+        "args": {"yaml": CUSTOM_YAML},
+    })
+    app, _, _ = approval_app(tmp_path, [save_line, DONE])
+    with TestClient(app) as client:
+        run = client.post("/autopilot/runs", json={
+            "goal": "Create a sketch-to-3d pipeline template.",
+            "brain": "local:x/scripted",
+            "approve_actions": [],
+        }).json()["run"]
+        done = wait_run(client, run["id"])
+        assert done["status"] == "succeeded"
+        step = next(s for s in done["steps"]
+                    if s["action"] == "save_template")
+        assert step["result"]["saved"] == "sketch-to-3d"
+
+        listed = client.get("/templates").json()["templates"]
+        mine = next(t for t in listed if t["name"] == "sketch-to-3d")
+        assert mine["custom"] is True

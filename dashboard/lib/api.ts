@@ -406,6 +406,12 @@ export const api = {
       timeoutMs: 10 * 60_000,
     }),
 
+  renameInstance: (instanceId: string, name: string) =>
+    request<{ name: string }>(`/instances/${instanceId}/name`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+
   setKeepAlive: (instanceId: string, enabled: boolean) =>
     request<{ keep_alive: boolean }>(`/instances/${instanceId}/keep-alive`, {
       method: "POST",
@@ -518,6 +524,9 @@ export const api = {
     brain?: string; // full brain ref (instance:/local:/api:)
     brain_instance_id?: string; // legacy spelling for instance brains
     max_steps?: number;
+    // No step cap (stored as max_steps 0): the run ends only via
+    // done/cancel/failure. Guards and approval gates still bound the spend.
+    unlimited_steps?: boolean;
     // Which actions pause for approval. Omit to inherit the Settings policy.
     approve_actions?: GateableAction[];
   }) =>

@@ -25,6 +25,7 @@ Safety model — same philosophy as the MCP bridge, one level deeper:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 from typing import Any
@@ -105,6 +106,7 @@ Actions:
 - get_launch_status {"launch_id": str} -> launching|retrying|booting|active|failed
 - list_templates {} -> runnable job templates and their parameters
 - run_job {"template": str, "parameters": {...}} -> queue a job on the connected instance
+- save_template {"yaml": str} -> create a custom job template (image, command with {{param}} placeholders, parameter schema; mounts only under {persistent} or /workspace/ephemeral). Use when the goal needs a job no existing template covers - then run it with run_job. The template stays for the user afterwards, so parameterize it well.
 - get_job_status {"task_id": str} -> queued|running|succeeded|failed + outputs
 - get_job_logs {"task_id": str, "tail": int} -> recent log lines
 - sync_outputs {"instance_id": str} -> save ephemeral scratch to persistent storage
@@ -133,7 +135,8 @@ class Autopilot:
 
     def __init__(self, settings: Settings, orchestrator: Orchestrator,
                  queue: TaskQueue, templates: dict[str, JobTemplate],
-                 db: Database, *, sleep=asyncio.sleep, notifier=None):
+                 db: Database, *, sleep=asyncio.sleep, notifier=None,
+                 template_saver=None):
         self.settings = settings
         self.orchestrator = orchestrator
         self.queue = queue
@@ -144,6 +147,11 @@ class Autopilot:
         # approval and when a run ends. An approval nobody hears about is a
         # stall, not a safety feature.
         self.notifier = notifier
+        # template_saver(yaml_text) -> JobTemplate: the same validated save
+        # path the Jobs page and MCP use. Lets a run author the job it needs
+        # (save_template action) instead of dead-ending when no bundled
+        # template fits; what it saves persists for the user.
+        self._template_saver = template_saver
         self.tasks: dict[str, asyncio.Task] = {}
 
     # -- lifecycle ------------------------------------------------------------------
@@ -170,7 +178,9 @@ class Autopilot:
         self.db.record_audit(
             "autopilot", "run_start",
             f"{run_id}: goal={goal[:120]!r} brain={brain_model} "
-            f"via {brain_ref} (max {max_steps} steps"
+            f"via {brain_ref} "
+            + ("(UNLIMITED steps" if max_steps == 0
+               else f"(max {max_steps} steps")
             + (f", approval required for: {', '.join(sorted(gated))}"
                if gated else ", no approval gates") + ")",
         )
@@ -211,8 +221,14 @@ class Autopilot:
             {"role": "user", "content": "Begin. What is your first action?"},
         ]
         failures = 0
+        # max_steps == 0 means UNLIMITED (an explicit user choice): the run
+        # ends only via done/cancel/failure. Still bounded in every way that
+        # matters - the money is behind approval gates and the launch guards,
+        # each wait is capped, and consecutive failures kill the loop.
+        steps = (itertools.count(1) if max_steps == 0
+                 else range(1, max_steps + 1))
         try:
-            for seq in range(1, max_steps + 1):
+            for seq in steps:
                 try:
                     reply = await asyncio.wait_for(
                         self._chat(client_fn, brain_model,
@@ -267,6 +283,8 @@ class Autopilot:
                                  "content": json.dumps(observation)})
                 messages = self._trim(messages)
 
+            # Only a finite range falls through to here; an unlimited run
+            # exits solely via done/cancel/failure returns above.
             self._finish(run_id, max_steps, "exhausted",
                          error=f"step limit ({max_steps}) reached before done")
         except asyncio.CancelledError:
@@ -408,9 +426,10 @@ class Autopilot:
                 return {"error": f"unknown action '{action}'. Valid: "
                                  "list_instance_types, list_instances, "
                                  "launch_gpu, get_launch_status, "
-                                 "list_templates, run_job, get_job_status, "
-                                 "get_job_logs, sync_outputs, "
-                                 "terminate_instance, wait, done"}
+                                 "list_templates, run_job, save_template, "
+                                 "get_job_status, get_job_logs, "
+                                 "sync_outputs, terminate_instance, wait, "
+                                 "done"}
             return await handler(args)
         except asyncio.CancelledError:
             raise
@@ -488,6 +507,25 @@ class Autopilot:
             return {"error": str(exc)}
         task_id = self.queue.enqueue(template=name, parameters=parameters)
         return {"task": {"id": task_id, "status": "queued"}}
+
+    async def _act_save_template(self, args: dict) -> dict:
+        """Author a custom template mid-run. Same validated path as the Jobs
+        page and MCP - the mount jail and parameter rules bind identically,
+        and the template persists for the user after the run ends."""
+        if self._template_saver is None:
+            return {"error": "template saving is not available in this run"}
+        yaml_text = str(args.get("yaml") or "")
+        if not yaml_text.strip():
+            return {"error": 'save_template needs {"yaml": "<template>"}'}
+        try:
+            template = self._template_saver(yaml_text)
+        except Exception as exc:   # loader errors come back as data
+            return {"error": f"template rejected: {exc}"}
+        return {
+            "saved": template.name,
+            "parameters": [p.name for p in template.parameters],
+            "hint": "run it with run_job now if the goal needs it",
+        }
 
     async def _act_get_job_status(self, args: dict) -> dict:
         task = self.queue.get(str(args["task_id"]))

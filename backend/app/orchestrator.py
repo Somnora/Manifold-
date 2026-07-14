@@ -578,6 +578,9 @@ class Orchestrator:
                 )
 
         result = []
+        # User display names overlay Lambda's launch-time names (which
+        # cannot be changed after launch).
+        aliases = self.db.instance_names()
         for inst in listed:
             if inst.status in gone_statuses:
                 continue   # Lambda can report these for a while; not a card
@@ -585,7 +588,7 @@ class Orchestrator:
             launch = self.db.find_launch_by_instance(inst.id)
             result.append({
                 "id": inst.id,
-                "name": inst.name,
+                "name": aliases.get(inst.id) or inst.name,
                 "status": inst.status,
                 "ip": inst.ip,
                 "region": inst.region,

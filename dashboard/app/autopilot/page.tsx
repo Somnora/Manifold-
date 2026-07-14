@@ -42,6 +42,7 @@ export default function AutopilotPage() {
   const [brain, setBrain] = useState("");
   const [goal, setGoal] = useState("");
   const [maxSteps, setMaxSteps] = useState(20);
+  const [unlimited, setUnlimited] = useState(false);
   // Which actions pause for approval. Seeded from the Settings policy, and
   // overridable for this one run.
   const [gates, setGates] = useState<GateableAction[] | null>(null);
@@ -85,7 +86,8 @@ export default function AutopilotPage() {
       await api.startAutopilot({
         goal: goal.trim(),
         brain,
-        max_steps: maxSteps,
+        max_steps: unlimited ? undefined : maxSteps,
+        unlimited_steps: unlimited,
         approve_actions: gates ?? [],
       });
       setGoal("");
@@ -131,25 +133,51 @@ export default function AutopilotPage() {
               </label>
               <label className="block text-xs font-medium text-zinc-600">
                 Step limit
-                <input
-                  type="number"
-                  min={1}
-                  max={50}
-                  className="mt-1 block w-24 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
-                  value={maxSteps}
-                  onChange={(e) => setMaxSteps(Number(e.target.value))}
-                />
+                <span className="mt-1 flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    disabled={unlimited}
+                    className="block w-24 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm disabled:opacity-40"
+                    value={maxSteps}
+                    onChange={(e) => setMaxSteps(Number(e.target.value))}
+                  />
+                  <label
+                    className="flex cursor-pointer items-center gap-1.5 text-xs font-normal text-zinc-600"
+                    title="The run ends only when the agent finishes, fails, or you cancel it. Spend is still bounded by your guardrails and approval gates - this only unbounds the number of turns."
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 accent-teal-400"
+                      checked={unlimited}
+                      onChange={(e) => setUnlimited(e.target.checked)}
+                    />
+                    unlimited
+                  </label>
+                </span>
               </label>
             </div>
             <textarea
               className="w-full rounded border border-zinc-300 px-2.5 py-1.5 text-sm"
-              rows={2}
+              rows={3}
               placeholder='e.g. "Run the gpu-smoke job on this instance and report whether the GPU is healthy, then stop."'
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
               required
               minLength={4}
             />
+            <p className="text-[11px] text-zinc-400">
+              The goal IS the agent&apos;s briefing - it starts knowing your
+              instances, templates, and guards, and nothing else. Good goals
+              name the outcome, the data&apos;s location on the filesystem, and
+              the bounds: &ldquo;Synthesize 500 Q&amp;A pairs from{" "}
+              <span className="font-mono">datasets/scrape.jsonl</span> using
+              the cheapest GPU that fits, save to{" "}
+              <span className="font-mono">outputs/qa/</span>, terminate when
+              done.&rdquo; If no template fits the work, the agent can author
+              a custom one mid-run (it stays in your Jobs page afterwards).
+            </p>
             <div className="rounded border border-zinc-200 bg-zinc-50 p-2.5">
               <p className="text-xs font-medium text-zinc-600">
                 Ask me before the agent...
@@ -321,7 +349,8 @@ function RunCard({ run, onChanged }: { run: AgentRun; onChanged: () => void }) {
         </div>
         <div className="flex shrink-0 items-center gap-3 text-xs text-zinc-500">
           <span>
-            {run.steps_taken}/{run.max_steps} steps
+            {run.steps_taken}/{run.max_steps === 0 ? "∞" : run.max_steps}{" "}
+            steps
           </span>
           <span>{formatDate(run.created_at)}</span>
           {run.status === "running" && (

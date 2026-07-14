@@ -109,6 +109,10 @@ class AutopilotRequest(BaseModel):
     brain: str | None = None
     brain_instance_id: str | None = None
     max_steps: int | None = Field(default=None, ge=1)
+    # True removes the step cap entirely (stored as max_steps=0): the run
+    # ends only via done/cancel/failure. Spend stays bounded by the guards
+    # and any approval gates; this only unbounds the TURN count.
+    unlimited_steps: bool = False
     # Which actions pause for a human Approve/Deny. None = use the saved
     # policy from Settings (launch-only by default). An explicit list is a
     # per-run override; [] means fully autonomous within the guards.
@@ -143,6 +147,11 @@ class CustomTemplateRequest(BaseModel):
 class RunCommandRequest(BaseModel):
     command: str = Field(min_length=1, max_length=8192)
     timeout: float = Field(default=120.0, gt=0, le=600)
+
+
+class RenameRequest(BaseModel):
+    # Empty restores the Lambda launch-time name.
+    name: str = Field(default="", max_length=64)
 
 
 class ChatRequest(BaseModel):
@@ -303,13 +312,26 @@ def create_app(
 
     reload_templates()
 
+    def save_custom_template_text(yaml_text: str):
+        """The ONE validated path for saving a custom template, shared by
+        the Jobs-page route, the MCP tool, and the autopilot action. Raises
+        TemplateError/YAMLError with the loader's message on a bad template;
+        on success the template is on disk and live in the shared dict."""
+        from .templates import parse_template
+        template = parse_template(yaml_text, source="custom")
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        (custom_dir / f"{template.name}.yaml").write_text(yaml_text)
+        reload_templates()
+        return templates[template.name]
+
     queue = SQLiteTaskQueue(db)
     dispatcher = Dispatcher(
         settings, orchestrator, queue, templates, db, lambda_client,
         image_checker=image_checker, notifier=notifier,
     )
     autopilot = Autopilot(settings, orchestrator, queue, templates, db,
-                          notifier=notifier)
+                          notifier=notifier,
+                          template_saver=save_custom_template_text)
     from .brains import BrainRegistry
     brains = BrainRegistry(settings, orchestrator, queue, templates)
 
@@ -617,6 +639,16 @@ def create_app(
     async def set_keep_alive(instance_id: str, req: KeepAliveRequest):
         """Switch idle auto-termination off (enabled=true) or back on."""
         return dispatcher.set_keep_alive(instance_id, req.enabled)
+
+    @app.post("/instances/{instance_id}/name")
+    async def rename_instance(instance_id: str, req: RenameRequest):
+        """Set the display name Manifold shows for this instance. Lambda
+        fixes the real name at launch, so this is a local overlay; an empty
+        name restores Lambda's."""
+        db.set_instance_name(instance_id, req.name.strip())
+        db.record_audit("dashboard", "instance_renamed",
+                        f"{instance_id} -> {req.name.strip()!r}")
+        return {"instance_id": instance_id, "name": req.name.strip()}
 
     @app.delete("/instances/{instance_id}")
     async def terminate_instance(instance_id: str, force: bool = False):
@@ -1408,14 +1440,10 @@ def create_app(
         and the port rules all apply. A custom template gets no powers a
         bundled one lacks; it is a recipe, not an escape hatch. Live
         immediately: the shared dict is reloaded in place, no restart."""
-        from .templates import TemplateError, parse_template
         try:
-            template = parse_template(req.yaml, source="custom")
-        except (TemplateError, Exception) as exc:
+            template = save_custom_template_text(req.yaml)
+        except Exception as exc:
             raise HTTPException(422, f"template rejected: {exc}")
-        custom_dir.mkdir(parents=True, exist_ok=True)
-        (custom_dir / f"{template.name}.yaml").write_text(req.yaml)
-        reload_templates()
         db.record_audit(
             "api", "template_saved",
             f"custom template '{template.name}' "
@@ -1669,9 +1697,12 @@ def create_app(
         else:
             gated = prefs.get().approvals.gated_actions()
 
-        cap = settings.autopilot.max_steps_cap
-        max_steps = min(req.max_steps or settings.autopilot.max_steps_default,
-                        cap)
+        if req.unlimited_steps:
+            max_steps = 0    # unlimited: an explicit user choice
+        else:
+            cap = settings.autopilot.max_steps_cap
+            max_steps = min(
+                req.max_steps or settings.autopilot.max_steps_default, cap)
         run_id = autopilot.start_run(
             goal=req.goal,
             brain_ref=ref,

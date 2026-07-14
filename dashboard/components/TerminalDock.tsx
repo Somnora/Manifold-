@@ -9,10 +9,14 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { TerminalPanel } from "@/components/TerminalPanel";
+import { ChatPanel } from "@/components/ChatPanel";
+import { RecentFiles } from "@/components/RecentFiles";
+import { FileNavigator } from "@/components/FileNavigator";
 
-// The terminal dock: one shared surface for every shell - the local machine
-// and any docked instance terminals - snappable to the BOTTOM or the RIGHT
-// side of the viewport, with two arrangements:
+// The dock: one shared surface for every instance-scoped work panel -
+// local shells, instance shells, chat, recent files, and the file browser -
+// snappable to the BOTTOM or the RIGHT side of the viewport, with two
+// arrangements:
 //
 //   tabs   one shell visible, the rest mounted-but-hidden behind tabs
 //   split  all shells visible: side by side when the dock is at the bottom,
@@ -32,9 +36,11 @@ import { TerminalPanel } from "@/components/TerminalPanel";
 //   survives tab switches, dock hides, and page navigation. A session ends
 //   only when its tab's x is clicked or the shell exits.
 
+export type PanelKind = "local" | "instance" | "chat" | "files" | "browse";
+
 type Session = {
   id: string;
-  kind: "local" | "instance";
+  kind: PanelKind;
   instanceId?: string;
   label: string;
 };
@@ -46,7 +52,13 @@ type DockState = {
   open: boolean;
   sessions: Session[];
   toggleLocal: () => void;
+  // Another shell to the same place: a second Local Machine tab, or a
+  // second SSH tab on the same instance.
+  addLocal: () => void;
   dockInstance: (instanceId: string, name: string) => void;
+  // Chat / recent files / file browser for an instance, as a dock tab.
+  dockPanel: (kind: "chat" | "files" | "browse", instanceId: string,
+              name: string) => void;
 };
 
 const DockContext = createContext<DockState | null>(null);
@@ -60,7 +72,15 @@ export function useTerminalDock(): DockState {
 const LOCAL: Session = {
   id: "local",
   kind: "local",
-  label: "This machine",
+  label: "Local Machine",
+};
+
+const PANEL_TAG: Record<PanelKind, { tag: string; tone: string }> = {
+  local: { tag: ">_", tone: "text-teal-400" },
+  instance: { tag: "gpu", tone: "text-emerald-500" },
+  chat: { tag: "chat", tone: "text-sky-500" },
+  files: { tag: "files", tone: "text-indigo-400" },
+  browse: { tag: "fs", tone: "text-amber-500" },
 };
 
 const MIN_HEIGHT = 180;
@@ -119,6 +139,55 @@ export function TerminalDockProvider({
     setActive(id);
     setOpen(true);
   }, []);
+
+  const addLocal = useCallback(() => {
+    const n = sessions.filter((x) => x.kind === "local").length + 1;
+    const id = n === 1 ? "local" : `local-${Date.now()}`;
+    setSessions((s) => [
+      ...s,
+      { ...LOCAL, id, label: n === 1 ? LOCAL.label : `${LOCAL.label} ${n}` },
+    ]);
+    setActive(id);
+    setOpen(true);
+  }, [sessions]);
+
+  // A second shell to the same target: duplicates get a fresh id (a fresh
+  // WebSocket, a fresh pty) and a numbered label.
+  const duplicate = useCallback(
+    (s: Session) => {
+      const id = `${s.id}~${Date.now()}`;
+      const base = s.label.replace(/ \d+$/, "");
+      const n =
+        sessions.filter(
+          (x) => x.kind === s.kind && x.instanceId === s.instanceId,
+        ).length + 1;
+      setSessions((all) => [...all, { ...s, id, label: `${base} ${n}` }]);
+      setActive(id);
+    },
+    [sessions],
+  );
+
+  const dockPanel = useCallback(
+    (kind: "chat" | "files" | "browse", instanceId: string, name: string) => {
+      const id = `${kind}:${instanceId}`;
+      setSessions((s) =>
+        s.some((x) => x.id === id)
+          ? s
+          : [
+              ...s,
+              {
+                id,
+                kind,
+                instanceId,
+                label: name || instanceId.slice(0, 12),
+              },
+            ],
+      );
+      setActive(id);
+      setOpen(true);
+    },
+    [],
+  );
 
   const closeSession = useCallback(
     (id: string) => {
@@ -186,7 +255,7 @@ export function TerminalDockProvider({
 
   return (
     <DockContext.Provider
-      value={{ open, sessions, toggleLocal, dockInstance }}
+      value={{ open, sessions, toggleLocal, addLocal, dockInstance, dockPanel }}
     >
       {children}
 
@@ -240,29 +309,45 @@ export function TerminalDockProvider({
                       title={
                         s.kind === "local"
                           ? "Shell on this machine"
-                          : `SSH shell on ${s.label}`
+                          : `${PANEL_TAG[s.kind].tag} · ${s.label}`
                       }
                     >
                       <span
-                        className={`mr-1.5 font-mono text-[10px] ${
-                          s.kind === "local"
-                            ? "text-teal-400"
-                            : "text-emerald-500"
-                        }`}
+                        className={`mr-1.5 font-mono text-[10px] ${PANEL_TAG[s.kind].tone}`}
                       >
-                        {s.kind === "local" ? ">_" : "gpu"}
+                        {PANEL_TAG[s.kind].tag}
                       </span>
                       {s.label}
                     </button>
+                    {(s.kind === "local" || s.kind === "instance") && (
+                      <button
+                        onClick={() => duplicate(s)}
+                        title="Open another shell here (new tab)"
+                        className="px-1 py-1 font-mono text-[10px] opacity-60 hover:opacity-100"
+                      >
+                        +
+                      </button>
+                    )}
                     <button
                       onClick={() => closeSession(s.id)}
-                      title="Close this shell (ends the session)"
+                      title={
+                        s.kind === "local" || s.kind === "instance"
+                          ? "Close this shell (ends the session)"
+                          : "Close this panel"
+                      }
                       className="px-1.5 py-1 opacity-60 hover:opacity-100"
                     >
                       ×
                     </button>
                   </span>
                 ))}
+                <button
+                  onClick={addLocal}
+                  title="Open another Local Machine shell"
+                  className="rounded border border-dashed border-zinc-300 px-2 py-1 font-mono text-[11px] text-zinc-500 hover:bg-zinc-100"
+                >
+                  + {">_"}
+                </button>
 
                 <span className="ml-auto flex items-center gap-1">
                   {sessions.length > 1 && (
@@ -314,16 +399,7 @@ export function TerminalDockProvider({
                         : `h-full min-h-0 ${active === s.id ? "" : "hidden"}`
                     }
                   >
-                    <TerminalPanel
-                      fill
-                      instanceId={s.instanceId}
-                      wsPath={s.kind === "local" ? "/local/terminal" : undefined}
-                      label={
-                        s.kind === "local"
-                          ? "Shell on this machine (loopback-only)"
-                          : `${s.label} (SSH via the managed connection)`
-                      }
-                    />
+                    <SessionBody session={s} />
                   </div>
                 ))}
               </div>
@@ -332,6 +408,34 @@ export function TerminalDockProvider({
           document.body,
         )}
     </DockContext.Provider>
+  );
+}
+
+// One dock tab's content, by kind. Terminals fill their pane exactly;
+// chat/files/browse are ordinary flow components, so they get a scroll
+// container - however tall the panel grows, the dock pane scrolls inside
+// itself and never pushes the tab strip away.
+function SessionBody({ session: s }: { session: Session }) {
+  if (s.kind === "local" || s.kind === "instance") {
+    return (
+      <TerminalPanel
+        fill
+        instanceId={s.instanceId}
+        wsPath={s.kind === "local" ? "/local/terminal" : undefined}
+        label={
+          s.kind === "local"
+            ? "Shell on this machine (loopback-only)"
+            : `${s.label} (SSH via the managed connection)`
+        }
+      />
+    );
+  }
+  return (
+    <div className="h-full overflow-y-auto rounded border border-zinc-200 bg-white px-3 pb-3">
+      {s.kind === "chat" && <ChatPanel instanceId={s.instanceId!} />}
+      {s.kind === "files" && <RecentFiles instanceId={s.instanceId!} />}
+      {s.kind === "browse" && <FileNavigator instanceId={s.instanceId!} />}
+    </div>
   );
 }
 

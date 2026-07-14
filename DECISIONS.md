@@ -1953,3 +1953,34 @@ same power, but on the record.
 
 Docs: codex + gemini MCP registration blocks and the parity section in
 mcp-setup.md; new custom-templates.md authoring guide.
+
+## 2026-07-14 — Phase 39 additions from the live test pass
+
+**The dock generalized to all instance panels.** Chat, recent Files, and the
+file Browser open in the dock (tabs or split, bottom or right) instead of
+unrolling inside the instance card - one surface for everything
+instance-scoped, and it survives page navigation. Multiple shells: a "+"
+on any terminal tab duplicates it (fresh pty, numbered label), and a
+"+ >_" button adds more Local Machine tabs. Local tab renamed
+"Local Machine".
+
+**Instance rename is a local overlay.** Lambda fixes an instance's name at
+launch; instance_names in SQLite overlays it everywhere Manifold shows
+names. Empty restores Lambda's. No Lambda API call involved.
+
+**Unlimited autopilot steps: max_steps=0.** The unlimited toggle stores 0
+and the loop switches to itertools.count - the run ends only via
+done/cancel/failure. Deliberately NOT a bigger cap: the money is already
+bounded by guards + approval gates + the wait cap + consecutive-failure
+kill; the step cap only bounded TURNS, and for long unattended goals that
+was the artificial wall. Finite runs keep the 50-step hard cap.
+
+**Autopilot can author templates mid-run (save_template action).** Same
+validated path as the Jobs page and MCP (one save_custom_template_text
+helper in the app factory feeds all three), so the mount jail binds the
+agent identically. What a run saves persists for the user - agent as
+scaffolding, again.
+
+**Template editor contrast bug:** the dark theme remaps the zinc scale, so
+text-zinc-100 on bg-zinc-950 was ink-on-ink. Terminal-style editors now use
+the terminal's own literal hex palette, not remapped tokens.

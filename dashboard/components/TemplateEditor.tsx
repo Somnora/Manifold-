@@ -157,12 +157,16 @@ export function TemplateEditor({
 
       {open && (
         <div className="mt-3 space-y-2">
+          {/* Literal hex colors, deliberately: the dark theme REMAPS the
+              zinc scale (zinc-100 is near-black here), so text-zinc-100 on
+              bg-zinc-950 rendered ink-on-ink. This box is a terminal-style
+              editor; give it the terminal's own fixed palette. */}
           <textarea
             value={yaml}
             onChange={(e) => setYaml(e.target.value)}
             rows={16}
             spellCheck={false}
-            className="w-full rounded border border-zinc-300 bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-100"
+            className="w-full rounded border border-zinc-300 bg-[#09090b] p-3 font-mono text-xs leading-relaxed text-[#e4e4e7] caret-teal-400 placeholder:text-[#71717a]"
           />
           <div className="flex items-center justify-between gap-3">
             <p className="text-[11px] text-zinc-400">

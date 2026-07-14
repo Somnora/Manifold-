@@ -11,9 +11,6 @@ import {
 import { StatusBadge } from "@/components/Badge";
 import { TelemetryChart } from "@/components/TelemetryChart";
 import { useTerminalDock } from "@/components/TerminalDock";
-import { RecentFiles } from "@/components/RecentFiles";
-import { FileNavigator } from "@/components/FileNavigator";
-import { ChatPanel } from "@/components/ChatPanel";
 import { formatBytes, formatMoney } from "@/lib/format";
 
 export function InstanceCard({
@@ -24,10 +21,11 @@ export function InstanceCard({
   onChanged: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
-  const { dockInstance } = useTerminalDock();
-  const [showFiles, setShowFiles] = useState(false);
-  const [showBrowse, setShowBrowse] = useState(false);
-  const [showChat, setShowChat] = useState(false);
+  // Terminal / Chat / Files / Browse all open in the DOCK (snappable bottom
+  // or right, tabs or split) instead of unrolling inside this card.
+  const { dockInstance, dockPanel } = useTerminalDock();
+  const [renaming, setRenaming] = useState(false);
+  const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState<"" | "terminating" | "rescuing">("");
   // Set when termination was REFUSED: the rescue ran and some file still
   // could not be saved. `blockedRescue` says what it did manage to save.
@@ -117,7 +115,59 @@ export function InstanceCard({
       <div className="flex items-start justify-between gap-4">
         <div>
           <div className="flex items-center gap-2">
-            <h3 className="font-medium">{instance.name || instance.id}</h3>
+            {renaming ? (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  try {
+                    await api.renameInstance(instance.id, newName.trim());
+                    setRenaming(false);
+                    onChanged();
+                  } catch (err) {
+                    setError(
+                      err instanceof ApiError ? err.message : String(err),
+                    );
+                  }
+                }}
+                className="flex items-center gap-1.5"
+              >
+                <input
+                  autoFocus
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  maxLength={64}
+                  placeholder={instance.name || instance.id}
+                  className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-sm font-medium"
+                />
+                <button
+                  type="submit"
+                  className="rounded bg-zinc-900 px-2 py-0.5 text-xs font-medium text-white hover:bg-zinc-700"
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRenaming(false)}
+                  className="text-xs text-zinc-500 hover:text-zinc-800"
+                >
+                  Cancel
+                </button>
+              </form>
+            ) : (
+              <>
+                <h3 className="font-medium">{instance.name || instance.id}</h3>
+                <button
+                  onClick={() => {
+                    setNewName(instance.name || "");
+                    setRenaming(true);
+                  }}
+                  title="Rename this instance (display name; empty restores Lambda's)"
+                  className="text-xs text-zinc-400 hover:text-zinc-700"
+                >
+                  rename
+                </button>
+              </>
+            )}
             <StatusBadge status={instance.status} />
           </div>
           <p className="mt-1 text-sm text-zinc-500">
@@ -128,45 +178,23 @@ export function InstanceCard({
         <div className="flex items-center gap-2 text-right">
           {everConnected && (
             <>
-              <button
-                onClick={() =>
-                  dockInstance(instance.id, instance.name || instance.id)
-                }
-                title="Open this instance's shell in the terminal dock, next to your local terminal"
-                className="rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-              >
-                Terminal
-              </button>
-              <button
-                onClick={() => setShowFiles((s) => !s)}
-                className={`rounded border px-3 py-1 text-xs font-medium ${
-                  showFiles
-                    ? "border-zinc-900 bg-zinc-900 text-white"
-                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
-                }`}
-              >
-                Files
-              </button>
-              <button
-                onClick={() => setShowBrowse((s) => !s)}
-                className={`rounded border px-3 py-1 text-xs font-medium ${
-                  showBrowse
-                    ? "border-zinc-900 bg-zinc-900 text-white"
-                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
-                }`}
-              >
-                Browse
-              </button>
-              <button
-                onClick={() => setShowChat((s) => !s)}
-                className={`rounded border px-3 py-1 text-xs font-medium ${
-                  showChat
-                    ? "border-zinc-900 bg-zinc-900 text-white"
-                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
-                }`}
-              >
-                Chat
-              </button>
+              {(
+                [
+                  ["Terminal", () => dockInstance(instance.id, instance.name || instance.id)],
+                  ["Chat", () => dockPanel("chat", instance.id, instance.name || instance.id)],
+                  ["Files", () => dockPanel("files", instance.id, instance.name || instance.id)],
+                  ["Browse", () => dockPanel("browse", instance.id, instance.name || instance.id)],
+                ] as [string, () => void][]
+              ).map(([label, action]) => (
+                <button
+                  key={label}
+                  onClick={action}
+                  title={`Open ${label.toLowerCase()} in the dock (snap it bottom or right)`}
+                  className="rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                >
+                  {label}
+                </button>
+              ))}
             </>
           )}
           {confirming ? (
@@ -269,18 +297,10 @@ export function InstanceCard({
 
       {everConnected && <TelemetryChart instanceId={instance.id} />}
 
-      {/* The instance shell lives in the terminal dock (Terminal button
-          above) rather than inline - it survives page navigation there and
-          snaps next to the local terminal. Remaining panels stay mounted
-          through transient reconnects; each surfaces its own connection
-          state rather than being torn down (which flapped). */}
-      {showFiles && everConnected && (
-        <RecentFiles instanceId={instance.id} />
-      )}
-      {showBrowse && everConnected && (
-        <FileNavigator instanceId={instance.id} />
-      )}
-      {showChat && everConnected && <ChatPanel instanceId={instance.id} />}
+      {/* Terminal, Chat, Files, and Browse all live in the DOCK (buttons
+          above): they survive page navigation there, snap bottom or right,
+          and sit side by side with the local shell instead of stretching
+          this card. */}
 
       {blockedFiles && (
         <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-3">
