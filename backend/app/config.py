@@ -96,6 +96,13 @@ class SSHSettings:
 @dataclass(frozen=True)
 class TaskSettings:
     poll_seconds: float = 1.0
+    # First-job GPU preflight: on A100 SXM boxes CUDA cannot initialize
+    # until nvidia-fabricmanager finishes starting - minutes after boot,
+    # while nvidia-smi already looks healthy. The dispatcher probes until
+    # the fabric state is settled (bounded by the timeout, then dispatches
+    # anyway) instead of burning billed minutes on a doomed container.
+    gpu_ready_timeout_seconds: float = 180.0
+    gpu_ready_poll_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -298,6 +305,10 @@ def load_settings(
         ),
         tasks=TaskSettings(
             poll_seconds=float(tasks.get("poll_seconds", 1.0)),
+            gpu_ready_timeout_seconds=float(
+                tasks.get("gpu_ready_timeout_seconds", 180)),
+            gpu_ready_poll_seconds=float(
+                tasks.get("gpu_ready_poll_seconds", 10)),
         ),
         idle=IdleSettings(
             timeout_seconds=float(idle.get("timeout_seconds", 1800)),

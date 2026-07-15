@@ -50,6 +50,14 @@ connection:
 tasks:
   # How often the dispatcher looks for queued tasks and a connected instance.
   poll_seconds: 1.0
+  # First-job GPU preflight. A100 SXM boxes cannot initialize CUDA until
+  # nvidia-fabricmanager finishes starting (minutes after boot, while
+  # nvidia-smi already looks fine) - a job dispatched in that window dies
+  # with "No CUDA GPUs are available" after burning billed minutes. The
+  # dispatcher waits (up to the timeout) for the fabric state to settle
+  # before the FIRST job on each instance, then dispatches anyway.
+  gpu_ready_timeout_seconds: 180
+  gpu_ready_poll_seconds: 10
 
 idle:
   # No running job and no terminal activity for this long -> the backend

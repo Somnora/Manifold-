@@ -2069,3 +2069,19 @@ closing the app = a fresh start, matching the requested scope. No ?session=
 param keeps the old ephemeral contract for any other client. Security
 posture unchanged: same origin allowlist, same loopback-only listen, the
 session layer is transport glue below those checks.
+
+**First-job GPU preflight (dispatcher._ensure_gpu_ready).** Field case: an
+A100 SXM4 job dispatched 2.5 min after cloud-init finished died with "No
+CUDA GPUs are available" and burned ~5 billed minutes. Cause: on SXM boxes
+CUDA cannot initialize until nvidia-fabricmanager finishes starting -
+minutes after boot - while nvidia-smi already looks healthy, so every
+hand-check passes. The dispatcher now runs `nvidia-smi -q` before the FIRST
+job on each instance and waits until the Fabric State line settles
+(Completed / absent on PCIe boxes), bounded by
+tasks.gpu_ready_timeout_seconds (180s) polling every 10s. Fail-open on
+purpose: a probe error or timeout logs an honest line and dispatches anyway
+- a wrong probe must never brick dispatch; pre-preflight behavior is the
+floor. Readiness is cached per instance in memory only: a backend restart
+re-probes once (seconds), which also re-covers an instance that was
+mid-boot during the restart. Parsing lives in a pure gpu_readiness()
+function tested against captured nvidia-smi output from both phases.
