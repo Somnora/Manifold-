@@ -180,5 +180,6 @@ def test_mcp_server_still_structurally_thin():
             imported.update(a.name for a in node.names)
         elif isinstance(node, ast.ImportFrom):
             imported.add(("." * node.level) + (node.module or ""))
-    assert imported <= {"__future__", "os", "typing", "httpx",
+    # asyncio: stdlib retry plumbing for wait_for_launch, not backend access.
+    assert imported <= {"__future__", "asyncio", "os", "typing", "httpx",
                         "mcp.server.fastmcp"}

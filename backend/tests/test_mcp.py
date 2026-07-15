@@ -4,6 +4,7 @@ Tools are exercised against the real app wired through an in-process ASGI
 transport — the same HTTP surface a live backend serves over the socket.
 """
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -64,7 +65,10 @@ def test_mcp_server_is_structurally_thin():
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             imported.add(("." * node.level) + module)
-    allowed = {"__future__", "os", "typing", "httpx", "mcp.server.fastmcp"}
+    # asyncio is stdlib plumbing (retry sleep/deadline in wait_for_launch),
+    # not a path into backend internals.
+    allowed = {"__future__", "asyncio", "os", "typing", "httpx",
+               "mcp.server.fastmcp"}
     assert imported <= allowed, (
         f"MCP server imports beyond the thin-client allowlist: "
         f"{imported - allowed}"
@@ -151,6 +155,72 @@ async def test_wait_for_launch_blocks_until_ready(mcp_wired):
     assert settled["settled"] is True
     assert settled["phase"] == "ready"
     assert settled["status"] == "active"
+
+
+class _FlakyClient:
+    """Duck-types the two AsyncClient methods the bridge uses. The first
+    `fail_first` request() calls raise ConnectError (a backend restart
+    dropping the socket mid-park); the rest delegate to the real client."""
+
+    def __init__(self, inner: httpx.AsyncClient, fail_first: int):
+        self._inner = inner
+        self._failures_left = fail_first
+        self.transport_errors_raised = 0
+
+    async def request(self, *args, **kwargs):
+        if self._failures_left > 0:
+            self._failures_left -= 1
+            self.transport_errors_raised += 1
+            raise httpx.ConnectError("connection dropped (backend restarting)")
+        return await self._inner.request(*args, **kwargs)
+
+    async def post(self, *args, **kwargs):   # _audit
+        return await self._inner.post(*args, **kwargs)
+
+
+async def test_wait_for_launch_absorbs_a_restart_mid_park(mcp_wired, monkeypatch):
+    """A --reload restart drops the long-poll socket. The wait tool must
+    reconnect and return the settled launch, not surface 'unreachable' for a
+    launch that is actually fine."""
+    launch = await mcp_server.launch_gpu(
+        instance_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data", note="restart-mid-wait test",
+    )
+    flaky = _FlakyClient(mcp_server._client, fail_first=1)
+    monkeypatch.setattr(mcp_server, "_client", flaky)
+    monkeypatch.setattr(mcp_server.asyncio, "sleep",
+                        _instant_sleep)   # don't spend real retry seconds
+    settled = await mcp_server.wait_for_launch(
+        launch["launch"]["id"], timeout=10, note="await across restart")
+    assert flaky.transport_errors_raised == 1        # the drop really happened
+    assert settled["settled"] is True
+    assert settled["status"] == "active"
+    # The transport hiccup was absorbed, not surfaced. (The row's own `error`
+    # column exists but holds no launch failure.)
+    assert not settled.get("unreachable")
+    assert not settled.get("error")
+
+
+async def test_wait_for_launch_calm_when_backend_stays_down(mcp_wired, monkeypatch):
+    """If the backend never answers within the window, the tool returns a
+    structured 'restarting, call again' record - not a scary hard error.
+    (Real retry sleep here - patching it to zero would hot-spin the loop.)"""
+    flaky = _FlakyClient(mcp_server._client, fail_first=10_000)
+    monkeypatch.setattr(mcp_server, "_client", flaky)
+    result = await mcp_server.wait_for_launch(
+        "some-launch", timeout=1, note="backend down")
+    assert result["settled"] is False
+    assert result["phase"] == "backend_restarting"
+    assert "call wait_for_launch again" in result["phase_detail"].lower()
+
+
+_real_sleep = asyncio.sleep
+
+
+async def _instant_sleep(_seconds):
+    # Zero-length but still a REAL yield to the event loop, so the coroutines
+    # the test is waiting on (launch pipeline, server-side park) can run.
+    await _real_sleep(0)
 
 
 async def test_every_tool_call_is_audited(mcp_wired):

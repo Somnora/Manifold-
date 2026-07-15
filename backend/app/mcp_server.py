@@ -17,6 +17,7 @@ Config: MANIFOLD_API_URL (default http://localhost:8000).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -72,16 +73,29 @@ async def _call(
     args: dict[str, Any] | None = None,
     body: dict | None = None,
     params: dict | None = None,
+    request_timeout: float | None = None,
 ) -> dict:
     """One guarded backend call + its audit entry. Backend rejections come
     back as {"error": <the backend's own message>} so the agent sees the
-    same truth a human sees in the dashboard."""
+    same truth a human sees in the dashboard. Transport failures (backend
+    down or restarting) additionally carry `unreachable: true`, so a caller
+    can tell "the backend said no" from "the backend didn't answer".
+
+    `request_timeout` overrides the client's default 60s ceiling for calls
+    that legitimately hold the socket longer (the wait_for_launch long-poll
+    parks server-side for up to 300s)."""
     args = args or {}
     try:
-        resp = await _http().request(method, path, json=body, params=params)
+        resp = await _http().request(
+            method, path, json=body, params=params,
+            **({"timeout": request_timeout} if request_timeout else {}),
+        )
         payload = resp.json() if resp.content else {}
     except httpx.HTTPError as exc:
-        result = {"error": f"Manifold backend unreachable at {API_URL}: {exc}"}
+        result = {
+            "error": f"Manifold backend unreachable at {API_URL}: {exc}",
+            "unreachable": True,
+        }
         await _audit(tool, args, note, result["error"])
         return result
     if resp.status_code >= 400:
@@ -148,12 +162,40 @@ async def wait_for_launch(launch_id: str, timeout: float = 120,
     get_launch_status. This is the efficient way to await a slow SXM4 boot:
     ONE call parks server-side instead of dozens of get_launch_status polls.
     If it returns still booting (settled=false), the instance is fine - just
-    call again to keep waiting."""
-    return await _call(
-        "wait_for_launch", "GET", f"/launches/{launch_id}/wait",
-        note=note, args={"launch_id": launch_id, "timeout": timeout},
-        params={"timeout": timeout},
-    )
+    call again to keep waiting. A backend restart mid-wait (dev --reload) is
+    absorbed: the wait reconnects and keeps parking; the launch itself is
+    resumed by the backend and keeps booting either way."""
+    timeout = max(1.0, min(float(timeout), 300.0))
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = max(1.0, deadline - loop.time())
+        result = await _call(
+            "wait_for_launch", "GET", f"/launches/{launch_id}/wait",
+            note=note, args={"launch_id": launch_id, "timeout": timeout},
+            params={"timeout": remaining},
+            # The server parks up to `remaining`; give the socket headroom
+            # past that so a legitimate long park is not misread as death.
+            request_timeout=remaining + 15.0,
+        )
+        # A restart mid-park drops the socket. The launch is unharmed (the
+        # backend resumes it on startup), so reconnect and keep waiting
+        # instead of alarming the caller with a transport error.
+        if not result.get("unreachable"):
+            return result
+        if loop.time() >= deadline:
+            return {
+                "status": "unknown",
+                "settled": False,
+                "phase": "backend_restarting",
+                "phase_detail": (
+                    "The Manifold backend was unreachable for the whole wait "
+                    "window (it may be restarting). The launch itself is not "
+                    "affected - the backend resumes in-flight boots on "
+                    "startup. Call wait_for_launch again."
+                ),
+            }
+        await asyncio.sleep(2.0)
 
 
 @mcp.tool()

@@ -2039,3 +2039,15 @@ and every reader stays clean without opting in.
 gpu_1x_a100_sxm4 as a default fallback. Left fallback_instance_types empty:
 substituting a different (pricier) type than the user asked for should be
 their opt-in, not a shipped default. The config comment shows the example.
+
+**wait_for_launch absorbs a backend restart mid-park (client-side retry).**
+Field follow-up: a --reload restart during the long-poll dropped the socket
+and the tool surfaced "backend unreachable" for a launch that was actually
+fine (the backend resumes it on startup). The MCP tool now distinguishes
+transport failure (`unreachable: true` from _call) from backend rejection,
+reconnects, and keeps parking inside its own timeout window; if the backend
+never answers it returns a calm structured `phase: backend_restarting`
+record that says to call again. This retry is transport resilience in a
+read-only poll, NOT client-side business logic - no guard is involved. Same
+fix also raised the per-request socket timeout above the server park time
+(the shared client's 60s default would have cut off a 120s park).
