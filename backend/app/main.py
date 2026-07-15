@@ -64,6 +64,7 @@ from .image_checker import MockImageChecker, RealImageChecker
 from .storage import MockStorage, S3AdapterStorage, StorageClient
 from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
+from .terminal_sessions import TerminalSession, TerminalSessionManager
 
 logger = logging.getLogger("manifold.main")
 
@@ -339,6 +340,10 @@ def create_app(
                           template_saver=save_custom_template_text)
     from .brains import BrainRegistry
     brains = BrainRegistry(settings, orchestrator, queue, templates)
+    # Shells outlive their WebSocket (a refresh reattaches instead of
+    # re-setting up whatever was running); see terminal_sessions.py.
+    term_sessions = TerminalSessionManager(
+        grace_seconds=settings.hub.terminal_grace_seconds)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -361,9 +366,11 @@ def create_app(
         if orphaned:
             logger.info("marked %d orphaned autopilot run(s) failed", orphaned)
         dispatcher.start()
+        term_sessions.start()
         yield
         await autopilot.stop()
         await dispatcher.stop()
+        await term_sessions.stop()
         await orchestrator.shutdown()
         await lambda_client.close()
         db.close()
@@ -372,6 +379,7 @@ def create_app(
     app.state.orchestrator = orchestrator
     app.state.settings = settings
     app.state.dispatcher = dispatcher
+    app.state.terminal_sessions = term_sessions
     app.state.queue = queue
     app.state.brains = brains
     app.state.autopilot = autopilot
@@ -719,16 +727,70 @@ def create_app(
             raise HTTPException(409, f"no managed connection to {instance_id}")
         return await sidecar.metrics()
 
+    async def _drive_terminal(
+        ws: WebSocket,
+        session: TerminalSession,
+        *,
+        persistent: bool,
+        on_input=None,
+    ) -> None:
+        """Shared WS half of every terminal: attach (replays scrollback),
+        forward input/resize, and on the way out decide the shell's fate. A
+        plain socket drop (refresh, frozen tab) DETACHES a persistent session
+        - the shell keeps running for a reattach; an explicit {"type":
+        "close"} from the panel's x button kills it."""
+        await session.attach(ws)
+        killed = False
+        try:
+            while True:
+                msg = await ws.receive_json()
+                if on_input:
+                    on_input()
+                kind = msg.get("type")
+                if kind == "input":
+                    session.write_input(msg.get("data", ""))
+                elif kind == "resize":
+                    session.resize(
+                        int(msg.get("cols", 80)), int(msg.get("rows", 24)))
+                elif kind == "close":
+                    killed = True
+                    term_sessions.kill(session.id)
+                    await ws.close()
+                    return
+        except (WebSocketDisconnect, KeyError, ValueError, OSError):
+            pass
+        finally:
+            if not killed:
+                if persistent and not session.exited:
+                    session.detach(ws)
+                else:
+                    term_sessions.kill(session.id)
+
     @app.websocket("/instances/{instance_id}/terminal")
     async def instance_terminal(ws: WebSocket, instance_id: str):
         """Browser terminal: xterm.js <-> this WS <-> SSH shell session.
 
         Rides the managed connection — no ttyd, nothing new listening on
-        the instance. Protocol: client sends JSON {type: "input"|"resize"},
-        server sends raw text frames of terminal output. All traffic counts
-        as activity for idle detection.
+        the instance. Protocol: client sends JSON {type: "input"|"resize"|
+        "close"}, server sends raw text frames of terminal output. All
+        traffic counts as activity for idle detection.
+
+        Pass ?session=<id> to make the shell survive the socket: reconnect
+        with the same id (after a refresh) and it reattaches with scrollback
+        instead of starting over. No session id = the old ephemeral behavior.
         """
         await ws.accept()
+        sid = ws.query_params.get("session", "")
+        key = f"inst:{instance_id}:{sid}" if sid else ""
+        touch = lambda: dispatcher.touch_activity(instance_id)  # noqa: E731
+
+        existing = term_sessions.get(key) if key else None
+        if existing is not None:
+            touch()
+            await _drive_terminal(ws, existing, persistent=True,
+                                  on_input=touch)
+            return
+
         conn = orchestrator.connections.get(instance_id)
         ssh = conn.ssh_connection() if conn else None
         if ssh is None:
@@ -742,37 +804,27 @@ def create_app(
         process = await ssh.create_process(
             term_type="xterm-256color", term_size=(80, 24)
         )
-        dispatcher.touch_activity(instance_id)
+        touch()
+        session = TerminalSession(
+            key or f"inst:{instance_id}:ephemeral-{id(process)}",
+            write_input=lambda data: process.stdin.write(data),
+            resize=lambda cols, rows: process.change_terminal_size(cols, rows),
+            close=process.close,
+            on_output=touch,
+        )
 
         async def pump_output():
-            try:
-                while True:
-                    data = await process.stdout.read(4096)
-                    if not data:
-                        break
-                    dispatcher.touch_activity(instance_id)
-                    await ws.send_text(data)
-                await ws.send_text("\r\n[manifold] shell exited\r\n")
-                await ws.close()
-            except (WebSocketDisconnect, RuntimeError):
-                pass
-
-        output_task = asyncio.create_task(pump_output())
-        try:
             while True:
-                msg = await ws.receive_json()
-                dispatcher.touch_activity(instance_id)
-                if msg.get("type") == "input":
-                    process.stdin.write(msg.get("data", ""))
-                elif msg.get("type") == "resize":
-                    process.change_terminal_size(
-                        int(msg.get("cols", 80)), int(msg.get("rows", 24))
-                    )
-        except (WebSocketDisconnect, KeyError, ValueError):
-            pass
-        finally:
-            output_task.cancel()
-            process.close()
+                data = await process.stdout.read(4096)
+                if not data:
+                    break
+                await session.feed(data)
+            await session.mark_exited()
+
+        session.pump_task = asyncio.create_task(pump_output())
+        term_sessions.register(session)
+        await _drive_terminal(ws, session, persistent=bool(sid),
+                              on_input=touch)
 
     @app.websocket("/local/terminal")
     async def local_terminal(ws: WebSocket):
@@ -800,6 +852,14 @@ def create_app(
             await ws.close()
             return
 
+        await ws.accept()
+        sid = ws.query_params.get("session", "")
+        key = f"local:{sid}" if sid else ""
+        existing = term_sessions.get(key) if key else None
+        if existing is not None:
+            await _drive_terminal(ws, existing, persistent=True)
+            return
+
         import fcntl
         import pty
         import shutil
@@ -807,7 +867,6 @@ def create_app(
         import struct
         import termios
 
-        await ws.accept()
         shell = os.environ.get("SHELL") or shutil.which("zsh") or "/bin/sh"
         pid, fd = pty.fork()
         if pid == 0:                       # child: become the user's shell
@@ -827,34 +886,11 @@ def create_app(
 
         loop.add_reader(fd, on_readable)
 
-        async def pump_output():
-            try:
-                while True:
-                    data = await out_queue.get()
-                    if data is None:
-                        break
-                    await ws.send_text(data.decode(errors="replace"))
-                await ws.send_text("\r\n[manifold] shell exited\r\n")
-                await ws.close()
-            except (WebSocketDisconnect, RuntimeError):
-                pass
+        def resize_pty(cols: int, rows: int) -> None:
+            size = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
 
-        output_task = asyncio.create_task(pump_output())
-        db.record_audit("dashboard", "local_terminal_open", shell)
-        try:
-            while True:
-                msg = await ws.receive_json()
-                if msg.get("type") == "input":
-                    os.write(fd, msg.get("data", "").encode())
-                elif msg.get("type") == "resize":
-                    size = struct.pack(
-                        "HHHH", int(msg.get("rows", 24)),
-                        int(msg.get("cols", 80)), 0, 0)
-                    fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
-        except (WebSocketDisconnect, KeyError, ValueError, OSError):
-            pass
-        finally:
-            output_task.cancel()
+        def close_pty() -> None:
             try:
                 loop.remove_reader(fd)
             except Exception:
@@ -864,6 +900,26 @@ def create_app(
                 os.close(fd)
             except OSError:
                 pass
+
+        session = TerminalSession(
+            key or f"local:ephemeral-{pid}",
+            write_input=lambda data: os.write(fd, data.encode()),
+            resize=resize_pty,
+            close=close_pty,
+        )
+
+        async def pump_output():
+            while True:
+                data = await out_queue.get()
+                if data is None:
+                    break
+                await session.feed(data.decode(errors="replace"))
+            await session.mark_exited()
+
+        session.pump_task = asyncio.create_task(pump_output())
+        term_sessions.register(session)
+        db.record_audit("dashboard", "local_terminal_open", shell)
+        await _drive_terminal(ws, session, persistent=bool(sid))
 
     # -- chat with a served model -----------------------------------------------
 

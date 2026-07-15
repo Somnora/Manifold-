@@ -2051,3 +2051,21 @@ record that says to call again. This retry is transport resilience in a
 read-only poll, NOT client-side business logic - no guard is involved. Same
 fix also raised the per-request socket timeout above the server park time
 (the shared client's 60s default would have cut off a 120s park).
+
+**Terminal sessions survive a page refresh (terminal_sessions.py).** The
+dock already kept shells alive across navigation, but the WS handler OWNED
+the pty/SSH process, so a refresh (the freeze-then-reload case) killed the
+shell and any Claude session running in it. Now the process, its output
+pump, and a ~200k-char scrollback buffer live in a TerminalSessionManager
+keyed by a client-chosen session id; the dock persists its tabs/layout in
+sessionStorage and reconnects with the same ids, so a refresh reattaches
+every shell with scrollback replayed. Lifecycle: a bare socket drop
+DETACHES (shell keeps running); the tab's x sends {"type":"close"} which
+kills; the shell exiting ends it; a detached session is reaped after
+hub.terminal_grace_seconds (default 900) so closed-for-good tabs don't
+leak shells; backend shutdown kills all. sessionStorage (per-tab, dies
+with it) was chosen over localStorage deliberately: refresh = restore,
+closing the app = a fresh start, matching the requested scope. No ?session=
+param keeps the old ephemeral contract for any other client. Security
+posture unchanged: same origin allowlist, same loopback-only listen, the
+session layer is transport glue below those checks.

@@ -35,6 +35,13 @@ import { FileNavigator } from "@/components/FileNavigator";
 //   closed), so a shell - and anything running in it, codex included -
 //   survives tab switches, dock hides, and page navigation. A session ends
 //   only when its tab's x is clicked or the shell exits.
+// - The dock ALSO survives a page refresh: the tab list and layout live in
+//   sessionStorage, and each shell's process lives on the backend keyed by
+//   its session id (terminal_sessions.py), so reloading a frozen app
+//   reattaches every shell - scrollback and all - instead of starting
+//   Claude setup over. sessionStorage is per-tab and dies with it, which is
+//   exactly the wanted scope: refresh = keep, close the app = fresh start
+//   (the backend reaps the detached shells after a grace window).
 
 export type PanelKind = "local" | "instance" | "chat" | "files" | "browse";
 
@@ -83,6 +90,8 @@ const PANEL_TAG: Record<PanelKind, { tag: string; tone: string }> = {
   browse: { tag: "fs", tone: "text-amber-500" },
 };
 
+const DOCK_STORE = "manifold-dock";
+
 const MIN_HEIGHT = 180;
 const MIN_WIDTH = 360;
 const DEFAULT_HEIGHT = 320;
@@ -103,9 +112,55 @@ export function TerminalDockProvider({
   const [arrangement, setArrangement] = useState<Arrangement>("tabs");
   const [height, setHeight] = useState(DEFAULT_HEIGHT);
   const [width, setWidth] = useState(DEFAULT_WIDTH);
-  // Portals need document; render only after mount.
-  const [onClient, setOnClient] = useState(false);
-  useEffect(() => setOnClient(true), []);
+  // Portals need document, and the save effect must not run until the
+  // stored state has been restored (or it would clobber it with defaults).
+  const [hydrated, setHydrated] = useState(false);
+
+  // Restore the dock from sessionStorage after a refresh; each terminal
+  // panel then reattaches to its still-running backend shell by id.
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(DOCK_STORE);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        if (Array.isArray(saved.sessions) && saved.sessions.length > 0) {
+          setSessions(saved.sessions);
+          setActive(saved.active ?? saved.sessions[0].id);
+          setOpen(!!saved.open);
+        }
+        if (saved.position === "right" || saved.position === "bottom")
+          setPosition(saved.position);
+        if (saved.arrangement === "tabs" || saved.arrangement === "split")
+          setArrangement(saved.arrangement);
+        if (typeof saved.height === "number") setHeight(saved.height);
+        if (typeof saved.width === "number") setWidth(saved.width);
+      }
+    } catch {
+      // Bad/absent stored state: start clean.
+    }
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      sessionStorage.setItem(
+        DOCK_STORE,
+        JSON.stringify({
+          sessions,
+          active,
+          open,
+          position,
+          arrangement,
+          height,
+          width,
+        }),
+      );
+    } catch {
+      // Storage full/blocked: the dock still works, it just won't survive
+      // a refresh.
+    }
+  }, [hydrated, sessions, active, open, position, arrangement, height, width]);
 
   const toggleLocal = useCallback(() => {
     setSessions((s) => (s.some((x) => x.id === "local") ? s : [LOCAL, ...s]));
@@ -259,7 +314,7 @@ export function TerminalDockProvider({
     >
       {children}
 
-      {onClient &&
+      {hydrated &&
         sessions.length > 0 &&
         createPortal(
           <div
@@ -422,6 +477,9 @@ function SessionBody({ session: s }: { session: Session }) {
         fill
         instanceId={s.instanceId}
         wsPath={s.kind === "local" ? "/local/terminal" : undefined}
+        // The dock tab id doubles as the backend session id, so a refresh
+        // reattaches this panel to the same still-running shell.
+        sessionId={s.id}
         label={
           s.kind === "local"
             ? "Shell on this machine (loopback-only)"

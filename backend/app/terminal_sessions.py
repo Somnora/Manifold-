@@ -1,0 +1,194 @@
+"""Terminal sessions that survive their WebSocket.
+
+The dock already keeps shells alive across page NAVIGATION (panels stay
+mounted), but a browser refresh tears the whole page down: the WS drops,
+and the shell died with it because the connection handler owned the
+process. So a frozen tab + refresh meant setting up Claude in the
+terminal all over again.
+
+Now the process, its output pump, and a scrollback buffer live here,
+keyed by a client-chosen session id. The dashboard reconnects with the
+same id after a refresh, the scrollback is replayed, and the shell
+carries on - whatever was running in it never noticed. A session ends
+when:
+
+- the user closes its tab (the client sends {"type": "close"}),
+- the shell itself exits,
+- nothing reattaches within the grace window (a tab that was closed
+  outright, not refreshed - otherwise every closed tab would leak a
+  live shell), or
+- the backend shuts down.
+
+This module is transport-glue only: it never decides WHAT may run a
+shell (the endpoints in main.py keep their origin checks and the
+managed-connection requirement).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Callable
+
+logger = logging.getLogger("manifold.terminal")
+
+# ~ a few thousand lines of replay; xterm's own scrollback is 5000 lines.
+SCROLLBACK_CHARS = 200_000
+
+
+class TerminalSession:
+    """One live shell + its recent output, attachable by at most one WS.
+
+    The shell-specific mechanics (pty fd vs asyncssh process) are injected
+    as callables, so local and instance shells share every behavior here.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        write_input: Callable[[str], None],
+        resize: Callable[[int, int], None],
+        close: Callable[[], None],
+        on_output: Callable[[], None] | None = None,
+    ):
+        self.id = session_id
+        self._write_input = write_input
+        self._resize = resize
+        self._close = close
+        self._on_output = on_output      # e.g. idle-detection activity touch
+        self._scrollback: list[str] = []
+        self._scrollback_len = 0
+        self._ws = None                  # the currently attached WebSocket
+        self.exited = False
+        # Born detached; the creating handler attaches right away.
+        self.detached_at: float | None = time.monotonic()
+        self.pump_task: asyncio.Task | None = None
+
+    # -- output path (called only by the session's pump task) -----------------
+
+    async def feed(self, text: str) -> None:
+        """Record output and forward it to the attached terminal, if any."""
+        self._scrollback.append(text)
+        self._scrollback_len += len(text)
+        while (self._scrollback_len > SCROLLBACK_CHARS
+               and len(self._scrollback) > 1):
+            self._scrollback_len -= len(self._scrollback.pop(0))
+        if self._on_output:
+            self._on_output()
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.send_text(text)
+            except Exception:
+                # The browser vanished mid-send (refresh); keep the shell.
+                self.detach(ws)
+
+    async def mark_exited(self) -> None:
+        """The shell ended on its own; tell whoever is watching."""
+        self.exited = True
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.send_text("\r\n[manifold] shell exited\r\n")
+                await ws.close()
+            except Exception:
+                pass
+
+    # -- attach / detach -------------------------------------------------------
+
+    async def attach(self, ws) -> None:
+        """Adopt `ws` as this session's terminal, replaying the scrollback.
+        A second tab attaching the same id steals the session (one keyboard
+        per shell; the newest view wins)."""
+        old, self._ws = self._ws, None
+        if old is not None:
+            try:
+                await old.send_text(
+                    "\r\n[manifold] this session was attached elsewhere\r\n")
+                await old.close()
+            except Exception:
+                pass
+        if self._scrollback:
+            await ws.send_text("".join(self._scrollback))
+        self._ws = ws
+        self.detached_at = None
+
+    def detach(self, ws=None) -> None:
+        """Let go of the terminal but keep the shell running. `ws` guards a
+        stale handler (whose session was stolen) from detaching the thief."""
+        if ws is not None and ws is not self._ws:
+            return
+        self._ws = None
+        self.detached_at = time.monotonic()
+
+    # -- input path (called by the WS handler) ---------------------------------
+
+    def write_input(self, data: str) -> None:
+        self._write_input(data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self._resize(cols, rows)
+
+    def kill(self) -> None:
+        """End the shell for real (explicit close, reap, or shutdown)."""
+        if self.pump_task is not None:
+            self.pump_task.cancel()
+        try:
+            self._close()
+        except Exception:
+            pass
+
+
+class TerminalSessionManager:
+    """Registry + reaper. `grace_seconds` bounds how long a DETACHED session
+    waits for a reattach (refresh takes seconds; a closed tab never comes
+    back). An attached session lives until it is closed or its shell exits."""
+
+    def __init__(self, grace_seconds: float = 900.0):
+        self.sessions: dict[str, TerminalSession] = {}
+        self.grace_seconds = grace_seconds
+        self._reap_task: asyncio.Task | None = None
+
+    def get(self, session_id: str) -> TerminalSession | None:
+        session = self.sessions.get(session_id)
+        if session is not None and session.exited:
+            self.sessions.pop(session_id, None)
+            return None
+        return session
+
+    def register(self, session: TerminalSession) -> None:
+        self.sessions[session.id] = session
+
+    def kill(self, session_id: str) -> bool:
+        session = self.sessions.pop(session_id, None)
+        if session is None:
+            return False
+        session.kill()
+        return True
+
+    def start(self) -> None:
+        self._reap_task = asyncio.create_task(self._reap_loop())
+
+    async def stop(self) -> None:
+        if self._reap_task is not None:
+            self._reap_task.cancel()
+            self._reap_task = None
+        for session_id in list(self.sessions):
+            self.kill(session_id)
+
+    async def _reap_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            now = time.monotonic()
+            for session_id, session in list(self.sessions.items()):
+                if session.exited:
+                    self.sessions.pop(session_id, None)
+                elif (session.detached_at is not None
+                      and now - session.detached_at > self.grace_seconds):
+                    logger.info(
+                        "reaping terminal session %s (detached %.0fs)",
+                        session_id, now - session.detached_at,
+                    )
+                    self.kill(session_id)

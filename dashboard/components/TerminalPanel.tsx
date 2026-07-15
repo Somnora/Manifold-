@@ -8,12 +8,19 @@ import { wsBase } from "@/lib/backend";
 // A real shell in the dashboard: xterm.js <-> backend WS. Two flavors of
 // the same wire protocol: an instance shell (SSH session over the managed
 // connection) or, with wsPath="/local/terminal", a shell on THIS machine
-// (the local half of the hub). Closing the panel closes the shell.
+// (the local half of the hub).
+//
+// With a sessionId, the SHELL lives on the backend keyed by that id: a
+// page refresh (the freeze-then-reload case) only drops the socket, and
+// remounting with the same id reattaches to the same shell with its
+// scrollback replayed - Claude keeps running through it. Unmounting the
+// panel (the tab's x) sends an explicit close, which really ends the shell.
 export function TerminalPanel({
   instanceId,
   wsPath,
   label,
   fill,
+  sessionId,
 }: {
   instanceId?: string;
   wsPath?: string;
@@ -21,6 +28,7 @@ export function TerminalPanel({
   // fill: size to the parent instead of the self-resizable h-80 box. Used
   // by the terminal drawer, whose own top-edge handle does the resizing.
   fill?: boolean;
+  sessionId?: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<"connecting" | "open" | "closed">(
@@ -71,7 +79,10 @@ export function TerminalPanel({
       };
 
       const path = wsPath ?? `/instances/${instanceId}/terminal`;
-      const ws = new WebSocket(`${wsBase()}${path}`);
+      const qs = sessionId
+        ? `?session=${encodeURIComponent(sessionId)}`
+        : "";
+      const ws = new WebSocket(`${wsBase()}${path}${qs}`);
 
       ws.onopen = () => {
         setStatus("open");
@@ -102,6 +113,13 @@ export function TerminalPanel({
         observer.disconnect();
         window.removeEventListener("resize", doFit);
         dataSub.dispose();
+        // Unmount = the user closed this tab (the dock never unmounts a
+        // panel otherwise; a page refresh tears the socket without running
+        // this). Tell the backend to really end the shell - a bare socket
+        // close would leave it parked awaiting a reattach.
+        if (sessionId && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "close" }));
+        }
         ws.close();
         term.dispose();
       };
@@ -111,7 +129,7 @@ export function TerminalPanel({
       disposed = true;
       cleanup?.();
     };
-  }, [instanceId, wsPath]);
+  }, [instanceId, wsPath, sessionId]);
 
   return (
     <div

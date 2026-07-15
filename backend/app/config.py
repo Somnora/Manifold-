@@ -165,6 +165,11 @@ class HubSettings:
     cli_brains: tuple[str, ...] = ("claude", "codex", "gemini")
     # The in-dashboard terminal on THIS machine (loopback + origin-checked).
     local_terminal: bool = True
+    # How long a terminal session whose browser tab went away (refresh,
+    # freeze, crash) keeps its shell alive waiting for a reattach. A refresh
+    # reattaches in seconds; a tab closed for good never does, and its shell
+    # is reaped after this window instead of leaking.
+    terminal_grace_seconds: float = 900.0
 
 
 @dataclass(frozen=True)
@@ -326,6 +331,8 @@ def load_settings(
                 str(n) for n in hub.get("cli_brains") or []
             ) or ("claude", "codex", "gemini"),
             local_terminal=bool(hub.get("local_terminal", True)),
+            terminal_grace_seconds=float(
+                hub.get("terminal_grace_seconds", 900)),
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
