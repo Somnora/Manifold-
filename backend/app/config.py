@@ -66,7 +66,10 @@ class LaunchPolicy:
     backoff_base_seconds: float = 5.0
     backoff_max_seconds: float = 120.0
     fallback_instance_types: tuple[str, ...] = ()
-    boot_timeout_seconds: float = 900.0
+    # SXM4/large multi-GPU instances routinely take 15-30+ minutes to reach
+    # 'active' on Lambda's side. 900s (15 min) failed real launches that were
+    # still booting; 2400s (40 min) is the observed ceiling with headroom.
+    boot_timeout_seconds: float = 2400.0
     boot_poll_seconds: float = 10.0
 
 
@@ -285,7 +288,7 @@ def load_settings(
             backoff_base_seconds=float(launch.get("backoff_base_seconds", 5)),
             backoff_max_seconds=float(launch.get("backoff_max_seconds", 120)),
             fallback_instance_types=tuple(launch.get("fallback_instance_types") or ()),
-            boot_timeout_seconds=float(launch.get("boot_timeout_seconds", 900)),
+            boot_timeout_seconds=float(launch.get("boot_timeout_seconds", 2400)),
             boot_poll_seconds=float(launch.get("boot_poll_seconds", 10)),
         ),
         tasks=TaskSettings(

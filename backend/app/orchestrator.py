@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -109,6 +110,61 @@ class LaunchPlan:
     types_to_try: list[str]          # requested type first, then fallbacks
     prices: dict[str, int]           # cents/hour per candidate type
     name: str
+
+
+# A launch a poller can stop watching: nothing further will change on its own.
+SETTLED_LAUNCH_STATUSES = frozenset({"active", "failed", "terminated"})
+
+# Coarse, stable phase label + one-line human summary for each launch status,
+# so a client shows a real step (and, while booting, a countdown) instead of
+# an empty error string.
+_LAUNCH_PHASES = {
+    "launching": ("requesting_capacity",
+                  "Asking Lambda for a matching instance"),
+    "retrying":  ("retrying_capacity",
+                  "No capacity yet; backing off and retrying"),
+    "booting":   ("waiting_for_active",
+                  "Instance created; waiting for it to boot and get an IP"),
+    "active":    ("ready", "SSH is up; the instance is ready"),
+    "failed":    ("failed", "Launch did not complete"),
+    "terminated": ("terminated", "Instance has been terminated"),
+}
+
+
+def launch_progress(launch: dict, boot_timeout_seconds: float,
+                    now_iso: str) -> dict:
+    """Return `launch` enriched with structured progress fields.
+
+    Pure (the caller supplies `now_iso`): `phase` is a stable machine label,
+    `phase_detail` a one-line human summary, and `settled` tells a poller it
+    can stop. While booting we add `boot_elapsed_seconds` / `boot_timeout_
+    seconds` / `boot_remaining_seconds` so a client renders a countdown rather
+    than a blank.
+    """
+    status = launch.get("status", "")
+    phase, detail = _LAUNCH_PHASES.get(status, (status or "unknown", ""))
+    enriched = dict(launch)
+    enriched["phase"] = phase
+    enriched["settled"] = status in SETTLED_LAUNCH_STATUSES
+    if status == "booting" and launch.get("launched_at"):
+        try:
+            elapsed = (datetime.fromisoformat(now_iso)
+                       - datetime.fromisoformat(launch["launched_at"])
+                       ).total_seconds()
+        except ValueError:
+            elapsed = None
+        if elapsed is not None:
+            elapsed = max(0.0, elapsed)
+            remaining = max(0.0, boot_timeout_seconds - elapsed)
+            enriched["boot_elapsed_seconds"] = round(elapsed)
+            enriched["boot_timeout_seconds"] = round(boot_timeout_seconds)
+            enriched["boot_remaining_seconds"] = round(remaining)
+            inst = launch.get("lambda_instance_id") or "instance"
+            detail = (f"{inst} booting; waited {round(elapsed)}s of "
+                      f"{round(boot_timeout_seconds)}s "
+                      f"(~{round(remaining)}s left before timeout)")
+    enriched["phase_detail"] = detail
+    return enriched
 
 
 class Orchestrator:
@@ -810,6 +866,97 @@ class Orchestrator:
             )
         return adopted
 
+    async def resume_pending_launches(self) -> int:
+        """Pick back up launches left mid-boot by a backend restart (--reload).
+
+        A launch in 'booting' has a real instance on Lambda, but the in-memory
+        boot-waiter died with the old process. Without this, the instance boots
+        to 'active' and nothing dials SSH or closes out the launch: it hangs in
+        'booting' forever while it bills. We re-attach - instances that adopt
+        already reconnected are marked ready; ones still booting get a fresh
+        wait-then-connect task (a fresh timeout window, so a restart never
+        shortens a genuine boot). Best-effort; never blocks startup. Call it
+        AFTER adopt_running_instances so already-active launches are settled,
+        not re-dialed.
+        """
+        resumed = 0
+        for launch in self.db.list_launches():
+            if launch["status"] != "booting":
+                continue
+            if launch["id"] in self._launch_tasks:
+                continue  # its waiter is already running in this process
+            instance_id = launch.get("lambda_instance_id")
+            if not instance_id:
+                # 'booting' with no instance id shouldn't happen in normal
+                # flow; fail it rather than leave a zombie that never settles.
+                self.db.update_launch(
+                    launch["id"], status="failed",
+                    error="launch was interrupted before an instance id was "
+                          "recorded; nothing to resume",
+                )
+                continue
+            if instance_id in self.connections:
+                # adopt_running_instances already reconnected this one, so the
+                # boot finished during the downtime; just close the record.
+                self.db.update_launch(
+                    launch["id"], status="active", active_at=utcnow())
+                resumed += 1
+                continue
+            plan = self._plan_from_launch(launch)
+            if plan is None:
+                continue
+            self._launch_tasks[launch["id"]] = asyncio.create_task(
+                self._resume_launch(plan, instance_id))
+            resumed += 1
+        if resumed:
+            self.db.record_audit(
+                "backend", "resume_pending_launches",
+                f"resumed {resumed} launch(es) left mid-boot by a restart",
+            )
+        return resumed
+
+    def _plan_from_launch(self, launch: dict) -> LaunchPlan | None:
+        """Reconstruct the minimal LaunchPlan needed to resume a boot wait.
+
+        The instance is already created, so the launch-time fields (ssh key,
+        fallback candidates, prices) no longer matter; only launch_id and
+        connection_mode drive the wait-then-connect tail.
+        """
+        mode = launch.get("connection_mode") or self.settings.default_connection_mode
+        if mode not in self.managers:
+            logger.warning("cannot resume launch %s: unknown connection mode %r",
+                           launch["id"], mode)
+            return None
+        launched_type = (launch.get("launched_type")
+                         or launch.get("requested_type") or "")
+        return LaunchPlan(
+            launch_id=launch["id"],
+            region=launch.get("region") or "",
+            filesystem=launch.get("filesystem") or "",
+            connection_mode=mode,
+            ssh_key_name="",   # already used at launch; unused by the tail
+            types_to_try=[launched_type] if launched_type else [],
+            prices={},
+            name=launch.get("requested_type") or launch["id"],
+        )
+
+    async def _resume_launch(self, plan: LaunchPlan, instance_id: str) -> None:
+        """The tail of _run_launch (wait for active, then connect), run on its
+        own after a restart to finish an interrupted boot."""
+        try:
+            instance = await self._wait_until_active(plan, instance_id)
+            if instance is None:
+                return
+            await self._establish_connection(plan, instance)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("resume of launch %s crashed", plan.launch_id)
+            self.db.update_launch(
+                plan.launch_id, status="failed",
+                error=f"internal error during resume: {exc}",
+            )
+
     # -- test/introspection helpers ----------------------------------------------
 
     async def wait_for_launch(self, launch_id: str, timeout: float = 10.0) -> dict:
@@ -821,6 +968,31 @@ class Orchestrator:
         if task is not None:
             await asyncio.wait_for(asyncio.shield(task), timeout)
         return self.db.get_launch(launch_id)
+
+    async def wait_until_settled(
+        self, launch_id: str, timeout: float, poll: float = 2.0
+    ) -> dict | None:
+        """Block up to `timeout` seconds until a launch settles (active,
+        failed, or terminated), then return its record; return the current
+        record if the window elapses first, or None if the id is unknown.
+
+        Polls the DB rather than an in-memory task, so it also serves launches
+        resumed after a restart. This is the server-side long-poll behind the
+        MCP wait tool: one blocking call replaces dozens of get_launch_status
+        round-trips (and the tokens they burn) while a slow SXM4 instance boots.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while True:
+            launch = self.db.get_launch(launch_id)
+            if launch is None:
+                return None
+            if launch["status"] in SETTLED_LAUNCH_STATUSES:
+                return launch
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return launch
+            await asyncio.sleep(min(poll, remaining))
 
     def connection_state(self, instance_id: str) -> ConnectionState | None:
         conn = self.connections.get(instance_id)

@@ -137,6 +137,13 @@ export type Launch = {
   launched_at: string | null;
   active_at: string | null;
   terminated_at: string | null;
+  // Structured progress (backend-computed; see launch_progress).
+  phase?: string;
+  phase_detail?: string;
+  settled?: boolean;
+  boot_elapsed_seconds?: number;
+  boot_timeout_seconds?: number;
+  boot_remaining_seconds?: number;
 };
 
 export type StoredFile = {

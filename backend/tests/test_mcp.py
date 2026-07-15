@@ -139,6 +139,20 @@ async def test_terminate_blocked_returns_file_list(mcp_wired, mock_client):
     assert mock_client.instances[instance_id].status == "terminated"
 
 
+async def test_wait_for_launch_blocks_until_ready(mcp_wired):
+    """wait_for_launch parks server-side and returns the settled, enriched
+    record in one call - no client poll loop."""
+    launch = await mcp_server.launch_gpu(
+        instance_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data", note="wait tool test",
+    )
+    settled = await mcp_server.wait_for_launch(
+        launch["launch"]["id"], timeout=5, note="await boot")
+    assert settled["settled"] is True
+    assert settled["phase"] == "ready"
+    assert settled["status"] == "active"
+
+
 async def test_every_tool_call_is_audited(mcp_wired):
     await mcp_server.list_templates(note="looking for whisper")
     await mcp_server.launch_gpu(

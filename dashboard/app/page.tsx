@@ -158,7 +158,22 @@ export default function InstancesPage() {
   );
 }
 
+function mmss(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
 function PendingLaunchCard({ launch }: { launch: Launch }) {
+  const booting =
+    launch.phase === "waiting_for_active" &&
+    launch.boot_elapsed_seconds != null &&
+    launch.boot_timeout_seconds != null;
+  const pct = booting
+    ? Math.min(
+        100,
+        (launch.boot_elapsed_seconds! / launch.boot_timeout_seconds!) * 100,
+      )
+    : 0;
   return (
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
       <div className="flex items-center justify-between">
@@ -170,6 +185,30 @@ function PendingLaunchCard({ launch }: { launch: Launch }) {
         </div>
         <span className="text-xs text-zinc-500">attempt {launch.attempts}</span>
       </div>
+      {booting && (
+        <div className="mt-2">
+          <div className="flex items-center justify-between text-xs text-amber-800">
+            <span>Booting on Lambda</span>
+            <span className="tabular-nums">
+              {mmss(launch.boot_elapsed_seconds!)} /{" "}
+              {mmss(launch.boot_timeout_seconds!)}
+            </span>
+          </div>
+          <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-amber-200">
+            <div
+              className="h-full rounded-full bg-amber-500 transition-all"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <p className="mt-1 text-[11px] text-amber-700">
+            Large GPU instances can take 15-40 minutes to boot. Safe to leave
+            this running.
+          </p>
+        </div>
+      )}
+      {!booting && launch.phase_detail && (
+        <p className="mt-2 text-xs text-amber-800">{launch.phase_detail}</p>
+      )}
       {launch.error && (
         <p className="mt-2 text-xs text-amber-800">{launch.error}</p>
       )}

@@ -36,7 +36,7 @@ from .sidecar_client import SidecarError
 
 from .config import Settings, load_settings
 from .connections import MockSSHConnection
-from .db import Database
+from .db import Database, utcnow
 from .config import update_env_file
 from .lambda_api import (
     FilesystemInfo,
@@ -52,7 +52,12 @@ from .agent import Autopilot, find_serving_task
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .notifications import NotificationCenter, os_notify
-from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
+from .orchestrator import (
+    LaunchRejected,
+    Orchestrator,
+    TerminationBlocked,
+    launch_progress,
+)
 from .preferences import GATEABLE_ACTIONS, PreferenceStore
 from .sidecar_client import MockSidecarClient
 from .image_checker import MockImageChecker, RealImageChecker
@@ -343,6 +348,13 @@ def create_app(
         adopted = await orchestrator.adopt_running_instances()
         if adopted:
             logger.info("reconnect-on-startup: adopted %d instance(s)", adopted)
+        # A launch left mid-boot by the restart (common under --reload) has a
+        # real instance still booting on Lambda; resume its wait so it does not
+        # hang in 'booting' forever while it bills. Runs after adopt so already-
+        # active launches are just settled, not re-dialed.
+        resumed = await orchestrator.resume_pending_launches()
+        if resumed:
+            logger.info("resumed %d launch(es) left mid-boot", resumed)
         # An agent loop is in-memory; a run left 'running' by a previous
         # process is dead. Say so instead of showing it running forever.
         orphaned = db.fail_orphaned_agent_runs()
@@ -1788,14 +1800,35 @@ def create_app(
 
     @app.get("/launches")
     async def list_launches():
-        return {"launches": db.list_launches()}
+        now = utcnow()
+        boot_timeout = settings.launch.boot_timeout_seconds
+        return {"launches": [
+            launch_progress(l, boot_timeout, now) for l in db.list_launches()
+        ]}
 
     @app.get("/launches/{launch_id}")
     async def get_launch(launch_id: str):
         launch = db.get_launch(launch_id)
         if launch is None:
             raise HTTPException(404, f"launch {launch_id} not found")
-        return launch
+        return launch_progress(
+            launch, settings.launch.boot_timeout_seconds, utcnow()
+        )
+
+    @app.get("/launches/{launch_id}/wait")
+    async def wait_launch(launch_id: str, timeout: float = 120.0):
+        """Long-poll: block until the launch settles (active/failed/terminated)
+        or `timeout` seconds pass, then return the (enriched) record. Replaces
+        a poll loop of get_launch_status calls while a slow instance boots. The
+        per-call wait is capped so the HTTP request never hangs indefinitely; a
+        caller that is still booting simply calls again."""
+        timeout = max(1.0, min(float(timeout), 300.0))
+        launch = await orchestrator.wait_until_settled(launch_id, timeout)
+        if launch is None:
+            raise HTTPException(404, f"launch {launch_id} not found")
+        return launch_progress(
+            launch, settings.launch.boot_timeout_seconds, utcnow()
+        )
 
     # -- cost/utilization intelligence (read-only; advisory) -----------------------
 

@@ -82,7 +82,8 @@ Add to `~/.gemini/settings.json` (create it if needed):
 | Tool | What it does |
 | --- | --- |
 | `launch_gpu(instance_type, region, filesystem, connection_mode?)` | Launch through ALL guards; returns a launch id |
-| `get_launch_status(launch_id)` | Poll: launching → retrying → booting → active/failed |
+| `get_launch_status(launch_id)` | One snapshot: phase + boot countdown while it boots |
+| `wait_for_launch(launch_id, timeout=120)` | Block until active/failed instead of polling (best for slow SXM4 boots) |
 | `list_instances()` | Live instances + SSH connection state |
 | `terminate_instance(id, force=false)` | force=false returns the unsaved-file list instead of terminating |
 | `sync_outputs(instance_id)` | rsync ephemeral scratch → persistent filesystem |

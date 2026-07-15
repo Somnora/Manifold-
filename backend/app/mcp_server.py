@@ -30,8 +30,10 @@ mcp = FastMCP(
     instructions=(
         "Manifold orchestrates Lambda Cloud GPU instances through a guarded "
         "local backend. Launches are asynchronous: launch_gpu returns a "
-        "launch id immediately; poll get_launch_status until status is "
-        "'active' or 'failed'. Termination may be blocked by a safety hook "
+        "launch id immediately; then call wait_for_launch to block until it is "
+        "'active' or 'failed' (one call, not a poll loop - large GPU instances "
+        "can take 15-40 min to boot), or get_launch_status for a single "
+        "snapshot. Termination may be blocked by a safety hook "
         "if unsaved files exist on the instance; sync_outputs saves them. "
         "Pass a short `note` with each call saying why — it lands in the "
         "audit log the user reviews."
@@ -125,10 +127,32 @@ async def launch_gpu(
 @mcp.tool()
 async def get_launch_status(launch_id: str, note: str = "") -> dict:
     """Progress of an asynchronous launch: launching -> retrying (capacity)
-    -> booting -> active | failed, with attempts and error detail."""
+    -> booting -> active | failed. Returns a stable `phase`
+    (requesting_capacity | retrying_capacity | waiting_for_active | ready |
+    failed | terminated), a human `phase_detail`, and `settled` (true once
+    nothing more will change). While booting it also returns
+    boot_elapsed_seconds / boot_timeout_seconds / boot_remaining_seconds.
+    For a slow boot, prefer wait_for_launch: one blocking call instead of a
+    poll loop."""
     return await _call(
         "get_launch_status", "GET", f"/launches/{launch_id}",
         note=note, args={"launch_id": launch_id},
+    )
+
+
+@mcp.tool()
+async def wait_for_launch(launch_id: str, timeout: float = 120,
+                          note: str = "") -> dict:
+    """Block until a launch settles (active | failed | terminated) or up to
+    `timeout` seconds (max 300) pass, then return the same enriched record as
+    get_launch_status. This is the efficient way to await a slow SXM4 boot:
+    ONE call parks server-side instead of dozens of get_launch_status polls.
+    If it returns still booting (settled=false), the instance is fine - just
+    call again to keep waiting."""
+    return await _call(
+        "wait_for_launch", "GET", f"/launches/{launch_id}/wait",
+        note=note, args={"launch_id": launch_id, "timeout": timeout},
+        params={"timeout": timeout},
     )
 
 

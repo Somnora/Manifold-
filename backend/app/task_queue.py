@@ -14,6 +14,23 @@ import abc
 from .db import Database, utcnow
 
 
+def collapse_progress(line: str) -> str:
+    """Render a captured stdout line the way a terminal would.
+
+    Progress bars (pip, training loops, huggingface downloads, rsync) redraw
+    one line by emitting `\\r` and overwriting from the start. When we capture
+    stdout by splitting on `\\n` only, all of a bar's intermediate frames
+    arrive glued into ONE line, separated by `\\r` - thousands of characters
+    of "10%\\r11%\\r12%..." that a terminal never actually shows and that
+    bloats the log and burns agent tokens on read. A terminal only ever
+    displays the segment after the last `\\r`, so that is what we store.
+    """
+    line = line.rstrip("\r")
+    if "\r" in line:
+        line = line.rsplit("\r", 1)[-1]
+    return line
+
+
 class TaskQueue(abc.ABC):
     @abc.abstractmethod
     def enqueue(self, *, template: str, parameters: dict,
@@ -95,7 +112,7 @@ class SQLiteTaskQueue(TaskQueue):
         )
 
     def append_log(self, task_id: str, line: str) -> None:
-        self._db.append_task_log(task_id, line)
+        self._db.append_task_log(task_id, collapse_progress(line))
 
     def get_logs(self, task_id: str, tail: int | None = None) -> list[dict]:
         return self._db.get_task_logs(task_id, tail)

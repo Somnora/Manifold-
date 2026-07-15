@@ -18,7 +18,9 @@ launch:
   # pass the budget guard or it is skipped.
   fallback_instance_types: []
   # How long to wait for a launched instance to reach "active" with an IP.
-  boot_timeout_seconds: 900
+  # SXM4/large multi-GPU boots routinely run 15-30+ min on Lambda's side;
+  # 900s cut those off mid-boot. 2400s (40 min) covers the observed worst case.
+  boot_timeout_seconds: 2400
   boot_poll_seconds: 10
 
 ssh:

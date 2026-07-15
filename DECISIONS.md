@@ -1984,3 +1984,58 @@ scaffolding, again.
 **Template editor contrast bug:** the dark theme remaps the zinc scale, so
 text-zinc-100 on bg-zinc-950 was ink-on-ink. Terminal-style editors now use
 the terminal's own literal hex palette, not remapped tokens.
+
+---
+
+## 2026-07-14 — Phase 40: field hardening for slow real boots
+
+From a field report by an agent orchestrator that ran the sprite-to-3D
+workflow on real GPUs. Five backend fixes, all against the same failure:
+large SXM4 instances take much longer to boot than the code assumed.
+
+**Boot timeout 900s -> 2400s (config default AND config.yaml).** 15 minutes
+cut off real launches that were still booting on Lambda's side; SXM4/large
+multi-GPU boots were observed at 15-30+ min. 2400s (40 min) covers the worst
+case with headroom. This is a ceiling, not a wait we always incur.
+
+**The boot waiter now survives a backend restart (--reload).** The launch
+pipeline runs in an in-memory asyncio task; a `--reload` restart (every
+backend file save in dev) killed it mid-boot. The instance kept booting to
+'active' on Lambda, but nothing dialed SSH or closed the launch record: it
+hung in 'booting' forever while it billed. Fix: `resume_pending_launches()`
+runs at startup (after adopt), finds every 'booting' launch, and either marks
+it active (if adopt already reconnected the now-live instance) or spawns a
+fresh wait-then-connect task. Fresh timeout window on resume is deliberate -
+a restart must never SHORTEN a genuine boot, which was the whole bug.
+Alternative (persist the coroutine / seed elapsed from launched_at) was
+rejected: it risks instantly timing out an instance that is still booting,
+reintroducing the failure.
+
+**Server-side long-poll: wait_for_launch (MCP) / GET /launches/{id}/wait.**
+An agent polling get_launch_status every few seconds burned ~40 round-trips
+(and their tokens) per slow boot. `wait_until_settled` parks server-side up
+to a capped timeout (<=300s/call) and returns when the launch settles. It
+polls the DB, not the in-memory task, so it also serves resumed launches.
+The cap keeps a single HTTP request from hanging forever; a still-booting
+caller just calls again.
+
+**Structured launch phase (launch_progress, pure).** Every launch record now
+carries a stable `phase` (requesting_capacity | retrying_capacity |
+waiting_for_active | ready | failed | terminated), a human `phase_detail`,
+`settled`, and while booting a `boot_elapsed/timeout/remaining_seconds`
+countdown. Replaces the empty connection_error a poller used to see mid-boot.
+The dashboard's Pending-launch card renders the countdown with a note that a
+long boot is normal, so a 40-min boot doesn't look frozen.
+
+**Log progress-bar collapse (collapse_progress).** Tools redraw progress bars
+with `\r`; captured by newline only, all the intermediate frames arrive glued
+into one multi-KB line that a terminal never shows and that burns agent
+tokens on read. We now store only the segment after the last `\r` (the
+terminal-visible frame), at the single append_log chokepoint. Chose write-
+time over a read-time clean=true flag: the raw frames have zero value stored,
+and every reader stays clean without opting in.
+
+**Not done: no forced fallback instance type.** The report suggested adding
+gpu_1x_a100_sxm4 as a default fallback. Left fallback_instance_types empty:
+substituting a different (pricier) type than the user asked for should be
+their opt-in, not a shipped default. The config comment shows the example.
