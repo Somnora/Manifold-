@@ -4,6 +4,7 @@ import io
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 import app.mcp_server as mcp_server
 from tests.test_reconcile import launch_connected
@@ -167,6 +168,125 @@ async def test_mcp_upload_download_roundtrip(mcp_wired_client, mock_client,
 async def test_mcp_upload_missing_local_file(mcp_wired_client):
     result = await mcp_server.upload_file("/no/such/file.png")
     assert "local file not found" in result["error"]
+
+
+# -- persistent-file browse when the S3 "Files" keys are absent -------------------
+#
+# Field case (2026-07-15, real A10): list_persistent_files failed with a
+# cryptic "Expecting value: line 1 column 1 (char 0)". Root cause: the S3
+# "Files" API keys were empty in .env, so the storage factory raised; the
+# route let that become a 500 plain-text page, and the MCP _call helper
+# crashed decoding that page as JSON. Both layers are hardened here.
+
+def _raises_missing_creds(fs):
+    raise ValueError("S3 adapter credentials are not configured in .env")
+
+
+def test_storage_browse_without_s3_credentials_is_clean_503(
+        tmp_path, mock_client, mock_sidecar):
+    """Empty S3 keys yield an actionable 503, not an opaque 500 whose
+    plain-text body decodes to nothing downstream."""
+    from app.main import create_app
+    from tests.conftest import make_settings, mock_connect_fn
+    app = create_app(
+        make_settings(tmp_path),
+        lambda_client=mock_client,
+        storage_factory=_raises_missing_creds,
+        connect_fn=mock_connect_fn,
+        sidecar_factory=lambda conn: mock_sidecar,
+    )
+    with TestClient(app) as c:
+        resp = c.get("/storage/files",
+                     params={"filesystem": "manifold-data", "prefix": ""})
+    assert resp.status_code == 503
+    assert "credentials" in resp.json()["detail"]
+
+
+@pytest.fixture
+async def mcp_client_no_s3(tmp_path, mock_client, mock_sidecar):
+    """MCP module wired to an app whose storage factory raises (no S3 keys)."""
+    from asgi_lifespan import LifespanManager
+    from app.main import create_app
+    from tests.conftest import make_settings, mock_connect_fn
+    app = create_app(
+        make_settings(tmp_path),
+        lambda_client=mock_client,
+        storage_factory=_raises_missing_creds,
+        connect_fn=mock_connect_fn,
+        sidecar_factory=lambda conn: mock_sidecar,
+    )
+    async with LifespanManager(app) as manager:
+        old = mcp_server._client
+        mcp_server._client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=manager.app),
+            base_url="http://manifold.test",
+        )
+        yield app
+        await mcp_server._client.aclose()
+        mcp_server._client = old
+
+
+async def test_mcp_list_persistent_files_surfaces_clean_error(mcp_client_no_s3):
+    """No connected instance AND no S3 keys: the agent sees the real reason
+    (plus a pointer to the keyless route), not a JSON-decode crash."""
+    result = await mcp_server.list_persistent_files(filesystem="manifold-data")
+    assert "error" in result
+    assert "credentials" in result["error"]
+    # The backend answered (a 503) - this is a rejection, not unreachability.
+    assert not result.get("unreachable")
+    # And it tells the agent how to browse without keys.
+    assert "SSH" in result.get("hint", "")
+
+
+async def test_mcp_list_persistent_files_browses_over_ssh_without_s3(
+        mcp_wired_client, mock_client):
+    """With a box up that mounts the filesystem, browsing rides the SSH
+    connection (the sidecar) and needs no S3 keys — the connected instance is
+    preferred even though S3 is configured here."""
+    app = mcp_wired_client
+    await _launch_connected_async(app, mock_client)
+
+    # Top level of the mounted filesystem: served from the sidecar tree.
+    result = await mcp_server.list_persistent_files(note="browse persistent")
+    assert "error" not in result
+    assert "ssh" in result["source"]                 # keyless instance path
+    assert result["filesystem"] == "manifold-data"
+    names = [e["name"] for e in result["entries"]]
+    assert "outputs" in names and "datasets" in names
+    assert "files" not in result                     # NOT the S3 shape
+
+    # `prefix` is filesystem-relative, exactly like the S3 path.
+    sub = await mcp_server.list_persistent_files(prefix="outputs")
+    assert "error" not in sub
+    assert [e["name"] for e in sub["entries"]] == ["transcripts"]
+
+
+async def test_call_degrades_on_non_json_error_body():
+    """A 500 that escapes a route is a Starlette plain-text page; _call must
+    surface it as a clean error instead of crashing on the JSON decode."""
+    async def plain_500(scope, receive, send):
+        # Audit posts must not interfere; answer them with valid JSON.
+        if scope["path"] == "/audit/agent":
+            status, body = 200, b"{}"
+        else:
+            status, body = 500, b"Internal Server Error"
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": body})
+
+    old = mcp_server._client
+    mcp_server._client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=plain_500),
+        base_url="http://manifold.test",
+    )
+    try:
+        result = await mcp_server._call("probe", "GET", "/x", note="")
+    finally:
+        await mcp_server._client.aclose()
+        mcp_server._client = old
+    assert "error" in result
+    assert "Internal Server Error" in result["error"]
+    assert not result.get("unreachable")
 
 
 def test_mcp_server_still_structurally_thin():

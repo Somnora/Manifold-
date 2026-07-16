@@ -42,10 +42,14 @@ export function TerminalPanel({
     let cleanup: (() => void) | undefined;
 
     // xterm touches the DOM at import time in some builds; load it client-side.
+    // The WebGL addon is optional: if the chunk or a WebGL context can't be
+    // had (headless, blocklisted GPU), the terminal still runs on the DOM
+    // renderer — so its import never blocks or breaks the shell.
     (async () => {
-      const [{ Terminal }, { FitAddon }] = await Promise.all([
+      const [{ Terminal }, { FitAddon }, webglMod] = await Promise.all([
         import("@xterm/xterm"),
         import("@xterm/addon-fit"),
+        import("@xterm/addon-webgl").catch(() => null),
       ]);
       if (disposed) return;
 
@@ -61,21 +65,58 @@ export function TerminalPanel({
       term.loadAddon(fit);
       term.open(el);
 
+      // GPU-accelerated rendering: WebGL draws glyphs on the GPU instead of
+      // the DOM renderer's per-cell layout, which is what keeps the terminal
+      // responsive under heavy output. Must load AFTER open() (it hooks the
+      // live renderer). If the context is ever lost (tab backgrounded, GPU
+      // reset) we dispose the addon and xterm silently reverts to the DOM
+      // renderer, so a lost context degrades instead of going blank.
+      if (webglMod) {
+        try {
+          const webgl = new webglMod.WebglAddon();
+          webgl.onContextLoss(() => webgl.dispose());
+          term.loadAddon(webgl);
+        } catch {
+          // No usable WebGL context: stay on the DOM renderer.
+        }
+      }
+
       // Fit to the host element's real box, then keep the prompt in view.
       // The host has NO padding of its own (padding lives on the wrapper),
       // so FitAddon's row math is exact and the last row never clips.
+      //
+      // Coalesced to one run per animation frame: the ResizeObserver and the
+      // dock's resize drag can both fire this dozens of times a second, and
+      // an unthrottled fit.fit() (a full reflow) plus a resize send per tick
+      // was a real source of jank. We also skip the PTY resize unless the
+      // grid actually changed, so a drag no longer spams change_terminal_size.
+      let fitQueued = false;
+      let lastCols = 0;
+      let lastRows = 0;
       const doFit = () => {
-        try {
-          fit.fit();
-        } catch {
-          return;
-        }
-        term.scrollToBottom();
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }),
-          );
-        }
+        if (fitQueued) return;
+        fitQueued = true;
+        requestAnimationFrame(() => {
+          fitQueued = false;
+          try {
+            fit.fit();
+          } catch {
+            return;
+          }
+          if (term.cols === lastCols && term.rows === lastRows) return;
+          lastCols = term.cols;
+          lastRows = term.rows;
+          term.scrollToBottom();
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "resize",
+                cols: term.cols,
+                rows: term.rows,
+              }),
+            );
+          }
+        });
       };
 
       const path = wsPath ?? `/instances/${instanceId}/terminal`;
@@ -91,7 +132,13 @@ export function TerminalPanel({
         term.focus();
       };
       ws.onmessage = (event) => {
-        term.write(event.data as string, () => term.scrollToBottom());
+        // xterm auto-scrolls on write when the viewport is already at the
+        // bottom, so it follows live output on its own. The old per-message
+        // scrollToBottom() callback forced a synchronous reflow on EVERY
+        // chunk (even on hidden tabs) — the main cause of the freeze under
+        // heavy output. Dropping it also lets a user scroll up to read
+        // without being yanked back down.
+        term.write(event.data as string);
       };
       ws.onclose = () => setStatus("closed");
       ws.onerror = () => setStatus("closed");

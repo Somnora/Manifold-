@@ -81,6 +81,7 @@ Add to `~/.gemini/settings.json` (create it if needed):
 
 | Tool | What it does |
 | --- | --- |
+| `list_launch_options()` | Ranked {type, region, filesystem} targets that have capacity NOW, co-located with your data first — call before `launch_gpu` |
 | `launch_gpu(instance_type, region, filesystem, connection_mode?)` | Launch through ALL guards; returns a launch id |
 | `get_launch_status(launch_id)` | One snapshot: phase + boot countdown while it boots |
 | `wait_for_launch(launch_id, timeout=120)` | Block until active/failed instead of polling (best for slow SXM4 boots) |
@@ -90,7 +91,7 @@ Add to `~/.gemini/settings.json` (create it if needed):
 | `list_templates()` | Job templates with parameter schemas |
 | `run_job(template, parameters)` | Enqueue a job; validated immediately |
 | `get_job_status(id)` / `get_job_logs(id, tail=100)` | Progress and live logs |
-| `list_filesystems()` / `list_persistent_files(prefix)` | Persistent storage, no instance needed |
+| `list_filesystems()` / `list_persistent_files(prefix)` | Persistent storage; browses over SSH (no S3 keys) when a box is up, else via the S3 Files API |
 | `upload_file(local_path, remote_path)` | Push a file from this machine to the instance (SFTP) |
 | `download_file(remote_path, local_path)` | Pull results back to this machine (SFTP) |
 | `run_command(instance_id, command, timeout=120)` | ONE shell command on the instance, audited with its exit code |
@@ -112,8 +113,9 @@ Activity):
 
 1. `list_templates(note="find transcription template")` → sees
    `whisper-batch` with parameters `input_dir`, `model_size`, `language`.
-2. `list_filesystems()` → `manifold-data` in `us-east-1`; the inbox lives
-   at `<filesystem>/inbox`.
+2. `list_launch_options(note="where can I launch, near my data")` → the top
+   target is `gpu_1x_a10` in `us-east-1` on `manifold-data` (co-located with
+   the inbox, and available right now), so no region is guessed blind.
 3. `launch_gpu(instance_type="gpu_1x_a10", region="us-east-1",
    filesystem="manifold-data", note="GPU for whisper batch")` → launch id.
    If this had breached the budget or concurrency cap, the tool would have

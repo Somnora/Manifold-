@@ -2085,3 +2085,139 @@ floor. Readiness is cached per instance in memory only: a backend restart
 re-probes once (seconds), which also re-covers an instance that was
 mid-boot during the restart. Parsing lives in a pure gpu_readiness()
 function tested against captured nvidia-smi output from both phases.
+
+## 2026-07-15 — sdxl-generate uses python3; storage-browse errors made legible
+
+Two field findings from dogfooding the templates on a real A10 (us-west-1),
+both on the phase-40 field-hardening branch.
+
+**sdxl-generate ran `python`, but its image only ships `python3`.** The
+template's command was `... && exec python -c "$PYCODE" ...`. The
+`huggingface/transformers-pytorch-gpu:latest` image has `/usr/bin/python3`
+and no `python` symlink, so every run died with `exec: python: not found`
+(exit 127) AFTER pulling the multi-GB image and running pip - real GPU
+minutes for a guaranteed failure. Fixed to `python3`. Verified end-to-end on
+the A10: two 1024x1024 PNGs written to the persistent filesystem, exit 0.
+Only this template was affected - whisper-batch uses `pytorch/pytorch`
+(has `python`, proven by the sprite-to-3d field run) and the python:3.11-slim
+templates have both. **Alternative considered:** pin the image to a digest so
+`:latest` cannot drift again. Deferred - the interpreter fix is the correct
+minimal change, and a pinned tag has its own staleness cost (older CUDA); the
+comment already flags `:latest` as a pin-later hot-path candidate.
+
+**list_persistent_files crashed with "Expecting value: line 1 column 1".**
+The S3 "Files" API keys (separate from the Lambda API key) were empty in
+.env, so the storage factory raised ValueError; the `/storage/files` route
+let that become a Starlette 500 *plain-text* page; and the MCP `_call` helper
+ran `resp.json()` on that plain text, raising an opaque JSON-decode error
+that surfaced to the agent. Hardened at both layers: `_storage_for` now
+catches the credential ValueError and returns a clear 503 ("...credentials
+are not configured in .env"), and `_call` wraps the JSON decode so ANY
+non-JSON body (a 500 page, a proxy error) degrades to `{"error": <status /
+body text>}` instead of crashing. The decode guard helps every tool, not
+just this one. Underlying cause is config, not code: filling the S3 keys in
+.env turns the persistent-file browser back on. **Why surface, not silence:**
+a guiding LLM that gets "credentials are not configured" can tell the user
+what to fix; "Expecting value: line 1 column 1" tells no one anything.
+
+## 2026-07-15 — Launch-target discovery, actionable capacity failures, quieter pull logs
+
+Repair pass on the friction found while dogfooding a launch over MCP: I
+guessed a region with no A10 (5 failed attempts), then guessed one where the
+user had no filesystem. The backend already knew both facts — capacity per
+region (`regions_with_capacity` on each instance type) and region per
+filesystem — but nothing put them together or exposed them to an agent.
+
+**`launch_options(types, filesystems)` — a pure cross-reference.** Returns
+launchable `{instance_type, region, filesystem}` targets Lambda can satisfy
+NOW, ranked: co-located with EXISTING data first (a filesystem with bytes in
+that region), then co-located with an empty filesystem, then scratch-only
+(capacity but no filesystem there), cheaper first within each band; plus an
+`unavailable` list of types with no capacity anywhere. Exposed as
+`GET /launch-options` and the MCP tool `list_launch_options`, whose docstring
+(and `launch_gpu`'s) tell an agent to call it FIRST and copy a target. A
+launch needs type+region+filesystem to line up (types are capacity-gated per
+region; filesystems are region-locked), so handing back only combinations
+that already line up removes the blind guess. **Why a pure function + thin
+route:** same pattern as `launch_progress` / `gpu_readiness` — the ranking is
+unit-tested against the mock catalog with no I/O, and the route/tool are
+one-liners. **Not changed:** `launch_gpu` still takes explicit args (a spend
+action must not auto-pick); discovery informs the choice, it doesn't make it.
+The dashboard already greys out impossible regions from `/instance-types`;
+wiring a co-located "recommended" picker into the form is a possible
+follow-up, not done here.
+
+**Capacity exhaustion now names where to go.** The final "no capacity"
+message used to end with "add fallback types in config.yaml" — useless to an
+agent that can't edit YAML. `_capacity_hint` (best-effort; a catalog error
+just yields no hint, never masks the failure) now appends the regions where
+the requested types DO have capacity right now, e.g. "Available right now:
+gpu_1x_a10 in us-west-2. Relaunch there ... or call list-launch-options".
+
+**Docker pull churn dropped from stored job logs.** A `docker pull` in
+captured (non-TTY) output emits one line per layer per state — dozens of
+`<hash>: Waiting / Downloading / Pull complete` that buried the real job
+output and burned agent tokens on every `get_job_logs`. `is_docker_pull_noise`
+(pure, regex on the `<12-hex>: <verb>` shape) drops them in `append_log`. The
+lines that carry signal — `Pulling from ...`, `Digest:`, `Status: Downloaded
+...`, and all job output — are NOT matched, and the full docker output still
+lands in the per-task log file archived on the instance. Chose drop-at-store
+over a stateful collapser: stateless, testable, and the archived file is the
+escape hatch if the raw pull is ever needed.
+
+## 2026-07-15 — Keyless agent file browsing: SSH first, S3 only as fallback
+
+The MCP `list_persistent_files` tool browsed ONLY through Lambda's S3 "Files"
+API, so an account with no S3 keys in .env (a real user case: they don't have
+and won't add them) could not browse persistent files from an agent at all —
+even with a box up. But the dashboard's per-instance Files panel browses the
+same files over the managed SSH connection through the sidecar, needing no
+keys. The tool now uses that path first: if a connected instance mounts the
+target filesystem, it browses via `/instances/{id}/files/list` (sidecar, local
+-disk speed, no keys) and returns `{source, filesystem, root, path, entries}`;
+only when nothing suitable is connected does it fall back to `/storage/files`
+(S3, which CAN browse with no instance running but needs keys). When even that
+fails for lack of keys, the error carries a `hint` pointing at the keyless
+route. `prefix` stays filesystem-relative on both paths — the sidecar's
+persistent root is `/lambda/nfs` (the filesystem's parent), so the tool
+prepends the filesystem name to the sidecar path to match the S3 semantics.
+
+**Why the tool, not the /storage/files route:** the route is a thin S3 shim
+and routes hold no business logic (project rule); the tool is already the
+place that composes multiple backend calls (it picks a filesystem, picks an
+instance), and choosing WHICH existing guarded endpoint to hit keeps the MCP
+client thin without importing backend internals. The dashboard Storage page
+(the standalone no-instance browser) still needs S3 keys and now returns the
+clean 503 added earlier; wiring its UI toward the per-instance panel when a
+box is up is a possible follow-up.
+
+## 2026-07-15 — Terminal freeze: stop forcing a reflow per output chunk
+
+The in-dock terminal froze under output volume (Claude streaming, build logs)
+and janked while resizing. All three causes were front-end, not the (sound)
+backend session layer:
+
+1. **Per-chunk scrollToBottom.** `ws.onmessage` did
+   `term.write(data, () => term.scrollToBottom())` — a synchronous reflow on
+   EVERY WebSocket frame, including on hidden tabs. Under a firehose that is
+   hundreds of forced layouts a second, which pins the main thread. xterm
+   already auto-scrolls on write when the viewport is at the bottom, so the
+   callback was redundant; dropping it fixes the freeze AND lets a user scroll
+   up to read without being yanked back down.
+2. **Unthrottled fit.** The ResizeObserver ran `doFit` (a full `fit.fit()`
+   reflow + a PTY resize send) on every animation frame during a resize.
+   `doFit` now coalesces to one run per frame and skips the PTY resize unless
+   the cols/rows grid actually changed — no more change_terminal_size spam.
+3. **Unthrottled drag.** The dock resize handle called setHeight/setWidth on
+   every pointermove, re-rendering the dock and firing every terminal's
+   ResizeObserver each time. The drag now coalesces to one state update per
+   animation frame.
+
+4. **DOM renderer.** xterm's default renderer lays out every cell in the DOM.
+   Added `@xterm/addon-webgl` (0.19.0, pairs with xterm 6.0), loaded after
+   `term.open()` so it hooks the live renderer, to draw glyphs on the GPU —
+   the throughput ceiling-raiser under heavy output. It degrades safely: the
+   import is `.catch(() => null)` (a missing/blocked chunk never breaks the
+   shell), construction is wrapped in try/catch (no usable WebGL context ->
+   stay on the DOM renderer), and `onContextLoss` disposes the addon so a lost
+   GPU context reverts to DOM instead of going blank.

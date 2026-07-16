@@ -15,9 +15,14 @@ image: huggingface/transformers-pytorch-gpu:latest
 # so a multi-word prompt is not split apart. Inside the quotes the host
 # shell leaves $PYCODE literal for the container to expand. See DECISIONS.md
 # 2026-07-12 (env-script quoting).
+#
+# Interpreter is `python3`, NOT `python`: the HF :latest image ships only
+# /usr/bin/python3 (no `python` symlink), so `exec python` died with
+# "exec: python: not found" (exit 127) after the image pull. Verified on a
+# real A10 2026-07-15. See DECISIONS.md (sdxl-generate python3).
 command: >
   bash -c 'pip install -q diffusers accelerate safetensors &&
-  exec python -c "$PYCODE" "$@"' manifold {{prompt}} {{count}} {{steps}} {{run_name}}
+  exec python3 -c "$PYCODE" "$@"' manifold {{prompt}} {{count}} {{steps}} {{run_name}}
 
 parameters:
   - name: prompt

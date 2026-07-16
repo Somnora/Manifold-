@@ -10,8 +10,30 @@ database as everything else, so history survives restarts for free.
 from __future__ import annotations
 
 import abc
+import re
 
 from .db import Database, utcnow
+
+
+# One line per layer per state during a `docker pull` in captured (non-TTY)
+# output: dozens of "<hash>: Waiting / Downloading / Pull complete" lines that
+# bury a job's real output and burn agent tokens on every log read. They carry
+# nothing the surviving lines don't - "Pulling from ...", "Digest: ...", and
+# "Status: Downloaded ..." are NOT matched here, so image identity and the
+# pull's start/finish still show. The full docker output is also archived to
+# the per-task log file on the instance.
+_DOCKER_LAYER_NOISE = re.compile(
+    r"^[0-9a-f]{12}: "
+    r"(Waiting|Downloading|Verifying Checksum|Download complete|Extracting|"
+    r"Pull complete|Already exists|Pulling fs layer|Preparing|"
+    r"Retrying in \d+ seconds?)\b"
+)
+
+
+def is_docker_pull_noise(line: str) -> bool:
+    """True when a captured stdout line is per-layer `docker pull` churn that
+    is safe to drop from the stored job log (see the pattern above)."""
+    return bool(_DOCKER_LAYER_NOISE.match(line))
 
 
 def collapse_progress(line: str) -> str:
@@ -112,7 +134,10 @@ class SQLiteTaskQueue(TaskQueue):
         )
 
     def append_log(self, task_id: str, line: str) -> None:
-        self._db.append_task_log(task_id, collapse_progress(line))
+        line = collapse_progress(line)
+        if is_docker_pull_noise(line):
+            return   # per-layer pull churn: dropped, never stored
+        self._db.append_task_log(task_id, line)
 
     def get_logs(self, task_id: str, tail: int | None = None) -> list[dict]:
         return self._db.get_task_logs(task_id, tail)

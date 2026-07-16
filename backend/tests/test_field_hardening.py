@@ -12,7 +12,11 @@ from app.connections import ConnectionState
 from app.lambda_api import InstanceInfo, MockLambdaClient
 from app.main import create_app
 from app.orchestrator import Orchestrator, launch_progress
-from app.task_queue import SQLiteTaskQueue, collapse_progress
+from app.task_queue import (
+    SQLiteTaskQueue,
+    collapse_progress,
+    is_docker_pull_noise,
+)
 from tests.conftest import make_settings, mock_connect_fn, wait_for_launch_status
 
 
@@ -50,6 +54,50 @@ def test_job_logs_collapse_carriage_returns_end_to_end(db):
     # None of the intermediate frames were stored.
     assert not any("\r" in ln for ln in lines)
     assert not any("epoch 1" in ln for ln in lines)
+
+
+# -- docker pull noise (pure) ----------------------------------------------------
+
+def test_docker_layer_lines_are_noise():
+    for line in (
+        "980c13e156f9: Waiting",
+        "2b441cc2eb0c: Downloading [===>    ]  5.2MB/12MB",
+        "46c9c54348df: Verifying Checksum",
+        "3713021b0277: Download complete",
+        "b6ceb6c620b6: Extracting [====>   ]",
+        "39b4878ee125: Pull complete",
+        "be37c9137332: Already exists",
+        "273246b59ac2: Pulling fs layer",
+    ):
+        assert is_docker_pull_noise(line), line
+
+
+def test_meaningful_pull_lines_survive():
+    # Image identity and the pull's start/finish must NOT be dropped.
+    for line in (
+        "latest: Pulling from huggingface/transformers-pytorch-gpu",
+        "Digest: sha256:4c7317881a534b22e18add49c925096fa902651fb0571c69f3",
+        "Status: Downloaded newer image for huggingface/transformers:latest",
+        "saved /data/output/sdxl-0.png",
+        "CUDA Version 12.6.0",
+    ):
+        assert not is_docker_pull_noise(line), line
+
+
+def test_append_log_drops_docker_churn_end_to_end(db):
+    queue = SQLiteTaskQueue(db)
+    task_id = queue.enqueue(template="sdxl-generate", parameters={})
+    queue.append_log(task_id, "latest: Pulling from library/x")
+    queue.append_log(task_id, "980c13e156f9: Waiting")
+    queue.append_log(task_id, "980c13e156f9: Pull complete")
+    queue.append_log(task_id, "Status: Downloaded newer image for x:latest")
+    queue.append_log(task_id, "saved /data/output/sdxl-0.png")
+    lines = [row["line"] for row in queue.get_logs(task_id)]
+    assert "latest: Pulling from library/x" in lines
+    assert "Status: Downloaded newer image for x:latest" in lines
+    assert "saved /data/output/sdxl-0.png" in lines
+    # The per-layer churn never reached the store.
+    assert not any("Waiting" in ln or "Pull complete" in ln for ln in lines)
 
 
 # -- launch_progress (pure) ------------------------------------------------------

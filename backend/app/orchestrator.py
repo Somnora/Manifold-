@@ -54,7 +54,13 @@ from .connections import (
     backoff_delay,
 )
 from .db import Database, utcnow
-from .lambda_api import InstanceInfo, LambdaAPIError, LambdaClient
+from .lambda_api import (
+    FilesystemInfo,
+    InstanceInfo,
+    InstanceTypeInfo,
+    LambdaAPIError,
+    LambdaClient,
+)
 from .model_client import ModelClient, RealModelClient
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 
@@ -165,6 +171,79 @@ def launch_progress(launch: dict, boot_timeout_seconds: float,
                       f"(~{round(remaining)}s left before timeout)")
     enriched["phase_detail"] = detail
     return enriched
+
+
+def launch_options(
+    instance_types: dict[str, InstanceTypeInfo],
+    filesystems: list[FilesystemInfo],
+) -> dict:
+    """Cross-reference the live catalog with the user's filesystems into a
+    ranked list of launchable targets. Pure — no I/O.
+
+    A launch must name a (type, region, filesystem) that all line up: the type
+    needs current capacity in that region, and Lambda filesystems are
+    region-locked, so a persistent launch can only use a filesystem that lives
+    in the launch's region. Guessing a region blind is how a launch hits
+    "no capacity" or a region-mismatch rejection. Each returned target is a
+    combination Lambda can actually satisfy right now, so a caller can pick the
+    top one instead of guessing.
+
+    Ranking puts the targets the user most likely wants first:
+      1. co-located with EXISTING data (a filesystem with bytes_used > 0 in
+         that region) — keeps a job next to the files it reads/writes;
+      2. co-located with an empty filesystem in that region;
+      3. scratch-only (capacity, but no filesystem there — everything is
+         ephemeral);
+    and within each band, cheaper first. `unavailable` lists types with zero
+    regions reporting capacity right now.
+    """
+    fs_by_region: dict[str, list[FilesystemInfo]] = {}
+    for fs in filesystems:
+        fs_by_region.setdefault(fs.region, []).append(fs)
+
+    targets: list[dict] = []
+    unavailable: list[str] = []
+    for name, t in instance_types.items():
+        if not t.regions_with_capacity:
+            unavailable.append(name)
+            continue
+        price = t.price_cents_per_hour / 100
+        for region in t.regions_with_capacity:
+            here = fs_by_region.get(region, [])
+            if here:
+                # Most-populated filesystem first, so "where my data is" wins.
+                for fs in sorted(here, key=lambda f: -f.bytes_used):
+                    targets.append({
+                        "instance_type": name,
+                        "gpu": t.gpu_description,
+                        "price_usd_per_hour": price,
+                        "region": region,
+                        "filesystem": fs.name,
+                        "filesystem_bytes_used": fs.bytes_used,
+                        "colocated": True,
+                    })
+            else:
+                targets.append({
+                    "instance_type": name,
+                    "gpu": t.gpu_description,
+                    "price_usd_per_hour": price,
+                    "region": region,
+                    "filesystem": None,
+                    "filesystem_bytes_used": 0,
+                    "colocated": False,
+                })
+
+    def rank(o: dict) -> tuple:
+        return (
+            not o["colocated"],                 # co-located first
+            o["filesystem_bytes_used"] == 0,    # existing data before empty
+            o["price_usd_per_hour"],            # then cheaper
+            o["instance_type"],
+            o["region"],
+        )
+
+    targets.sort(key=rank)
+    return {"targets": targets, "unavailable": sorted(unavailable)}
 
 
 class Orchestrator:
@@ -762,13 +841,38 @@ class Orchestrator:
                     round_no, policy.backoff_base_seconds, policy.backoff_max_seconds
                 )
                 await asyncio.sleep(delay)
+        hint = await self._capacity_hint(plan)
         self.db.update_launch(
             plan.launch_id, status="failed",
             error=f"No capacity after {attempts} attempts across "
                   f"{', '.join(plan.types_to_try)} in {plan.region}. "
-                  f"Try again later or add fallback types in config.yaml.",
+                  + (hint or "Try again later, launch in another region, or "
+                             "add fallback types in config.yaml."),
         )
         return None
+
+    async def _capacity_hint(self, plan: "LaunchPlan") -> str:
+        """Best-effort: name where the requested types DO have capacity right
+        now, so the failure is actionable instead of a dead end. Never masks
+        the real failure — any catalog error just yields no hint."""
+        try:
+            types = await self.client.list_instance_types()
+        except Exception:
+            return ""
+        elsewhere: list[str] = []
+        for name in plan.types_to_try:
+            info = types.get(name)
+            regions = [r for r in (info.regions_with_capacity if info else [])
+                       if r != plan.region]
+            if regions:
+                elsewhere.append(f"{name} in {', '.join(sorted(regions))}")
+        if not elsewhere:
+            return ("None of those types have capacity in any region right "
+                    "now — try again later.")
+        return ("Available right now: " + "; ".join(elsewhere)
+                + ". Relaunch there (a persistent filesystem must be in the "
+                  "same region), or call list-launch-options for co-located "
+                  "targets.")
 
     async def _wait_until_active(
         self, plan: LaunchPlan, instance_id: str

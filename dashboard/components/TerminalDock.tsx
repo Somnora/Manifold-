@@ -274,7 +274,15 @@ export function TerminalDockProvider({
   const startDrag = useCallback(
     (e: React.PointerEvent) => {
       e.preventDefault();
-      const move = (ev: PointerEvent) => {
+      // Coalesce pointer moves to one state update per frame. Each setHeight/
+      // setWidth re-renders the dock and fires every terminal's ResizeObserver
+      // (a fit reflow apiece), so an un-throttled drag was a jank multiplier.
+      let raf = 0;
+      let pending: PointerEvent | null = null;
+      const apply = () => {
+        raf = 0;
+        const ev = pending;
+        if (!ev) return;
         if (position === "bottom") {
           const h = window.innerHeight - ev.clientY;
           setHeight(
@@ -293,7 +301,12 @@ export function TerminalDockProvider({
           );
         }
       };
+      const move = (ev: PointerEvent) => {
+        pending = ev;
+        if (!raf) raf = requestAnimationFrame(apply);
+      };
       const stop = () => {
+        if (raf) cancelAnimationFrame(raf);
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", stop);
         document.body.style.userSelect = "";

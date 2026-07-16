@@ -90,7 +90,17 @@ async def _call(
             method, path, json=body, params=params,
             **({"timeout": request_timeout} if request_timeout else {}),
         )
-        payload = resp.json() if resp.content else {}
+        # A healthy backend answers JSON. A 500 that escaped the route,
+        # though, is a Starlette plain-text "Internal Server Error" page —
+        # calling .json() on that raises a cryptic "Expecting value" decode
+        # error that would surface to the agent instead of the real status.
+        # Fall back to the body text so the status-code branch below can
+        # report something actionable.
+        try:
+            payload = resp.json() if resp.content else {}
+        except ValueError:
+            payload = {"detail": (resp.text or "").strip()[:300]
+                       or f"HTTP {resp.status_code} (non-JSON response)"}
     except httpx.HTTPError as exc:
         result = {
             "error": f"Manifold backend unreachable at {API_URL}: {exc}",
@@ -114,6 +124,31 @@ async def _call(
 
 
 @mcp.tool()
+async def list_launch_options(note: str = "") -> dict:
+    """Launchable {instance_type, region, filesystem} targets Lambda can
+    satisfy RIGHT NOW, ranked best-first. CALL THIS BEFORE launch_gpu: it is
+    the only way to see which instance types have capacity in which regions,
+    and it keeps you from guessing a region that has no capacity or no
+    filesystem.
+
+    A launch needs the three to line up — the type must have capacity in the
+    region, and a persistent filesystem is region-locked, so it can only be
+    used from its own region. Each returned target is a combination that lines
+    up, so you can copy one straight into launch_gpu.
+
+    `targets` is ranked: co-located with your EXISTING data first (a filesystem
+    that already holds files, so a job runs next to what it reads/writes), then
+    co-located with an empty filesystem, then scratch-only (capacity but no
+    filesystem there — everything on it is ephemeral), and cheaper first within
+    each band. A target's `filesystem` is null for a scratch-only launch; pass
+    "" as launch_gpu's filesystem for those. `unavailable` lists types with no
+    capacity anywhere right now (retry later or pick another from `targets`)."""
+    return await _call(
+        "list_launch_options", "GET", "/launch-options", note=note,
+    )
+
+
+@mcp.tool()
 async def launch_gpu(
     instance_type: str,
     region: str,
@@ -124,7 +159,12 @@ async def launch_gpu(
     """Launch a GPU instance. Flows through ALL backend guards (budget,
     concurrency, region-filesystem match); a rejection returns the guard's
     message in `error`. Returns a launch record — poll get_launch_status
-    with its `id` until status is 'active' (SSH up) or 'failed'."""
+    with its `id` until status is 'active' (SSH up) or 'failed'.
+
+    Call list_launch_options FIRST and pass one of its targets: it returns
+    only {type, region, filesystem} combinations that have capacity right now
+    and are co-located with your data, which avoids a blind region guess that
+    fails on capacity or a region-filesystem mismatch."""
     body = {
         "instance_type": instance_type,
         "region": region,
@@ -327,12 +367,61 @@ async def list_filesystems(note: str = "") -> dict:
     return await _call("list_filesystems", "GET", "/filesystems", note=note)
 
 
+async def _connected_instance_for_fs(filesystem: str | None) -> tuple | None:
+    """A connected instance that mounts `filesystem` (or any, if None), as
+    (instance_id, filesystem_name). None when nothing suitable is connected.
+    Lets file browsing ride the SSH connection with no S3 keys."""
+    listing = await _call("list_persistent_files", "GET", "/instances", note="")
+    for inst in listing.get("instances", []):
+        if inst.get("connection_state") != "connected":
+            continue
+        mounts = inst.get("filesystems") or []
+        if filesystem is None:
+            if mounts:
+                return inst["id"], mounts[0]
+        elif filesystem in mounts:
+            return inst["id"], filesystem
+    return None
+
+
 @mcp.tool()
 async def list_persistent_files(
     prefix: str = "", filesystem: str | None = None, note: str = ""
 ) -> dict:
-    """Browse persistent-filesystem files (works with no instance running).
-    If `filesystem` is omitted and exactly one exists, it is used."""
+    """Browse one directory level of a persistent filesystem.
+
+    Prefers a RUNNING instance: if one is connected and mounts the target
+    filesystem, this browses over its SSH connection (via the sidecar, at
+    local-disk speed and needing NO S3 keys) — the same path the dashboard's
+    per-instance Files panel uses. It returns {source, filesystem, root, path,
+    entries:[{name, is_dir, size_bytes, modified}]}. `prefix` is relative to
+    the filesystem, e.g. "outputs/images".
+
+    Only when no connected instance mounts the filesystem does it fall back to
+    Lambda's S3 "Files" API — which CAN browse with nothing running, but needs
+    S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY in .env and returns {filesystem,
+    files:[...]}. If `filesystem` is omitted and exactly one exists (or one
+    instance is connected), it is used."""
+    # 1) Keyless path: a connected instance that mounts this filesystem.
+    hit = await _connected_instance_for_fs(filesystem)
+    if hit is not None:
+        instance_id, fs_name = hit
+        # The sidecar's persistent root is /lambda/nfs (the filesystem's
+        # PARENT), so its first path segment is the filesystem name; prepend
+        # it to keep `prefix` filesystem-relative like the S3 path.
+        sub = "/".join(p for p in [fs_name, prefix.strip("/")] if p)
+        result = await _call(
+            "list_persistent_files", "GET",
+            f"/instances/{instance_id}/files/list",
+            note=note, args={"filesystem": fs_name, "prefix": prefix},
+            params={"root_name": "persistent", "path": sub},
+        )
+        if "error" not in result:
+            result["filesystem"] = fs_name
+            result["source"] = f"instance:{instance_id} (ssh, no S3 keys)"
+        return result
+
+    # 2) S3 fallback (needs keys; works with no instance running).
     if filesystem is None:
         listing = await _call(
             "list_persistent_files", "GET", "/filesystems", note="",
@@ -346,11 +435,18 @@ async def list_persistent_files(
                          {"prefix": prefix}, note, result["error"])
             return result
         filesystem = names[0]
-    return await _call(
+    result = await _call(
         "list_persistent_files", "GET", "/storage/files",
         note=note, args={"filesystem": filesystem, "prefix": prefix},
         params={"filesystem": filesystem, "prefix": prefix},
     )
+    # No S3 keys AND no connected instance: point at the keyless route.
+    if result.get("error") and "credential" in result["error"].lower():
+        result["hint"] = (
+            "No S3 Files keys configured. Launch or connect an instance that "
+            "mounts this filesystem, then this browses it over SSH with no keys."
+        )
+    return result
 
 
 async def _pick_instance(instance_id: str | None, tool: str, note: str,

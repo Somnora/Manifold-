@@ -56,6 +56,7 @@ from .orchestrator import (
     LaunchRejected,
     Orchestrator,
     TerminationBlocked,
+    launch_options,
     launch_progress,
 )
 from .preferences import GATEABLE_ACTIONS, PreferenceStore
@@ -597,6 +598,16 @@ def create_app(
             }
             for name, t in sorted(types.items())
         }
+
+    @app.get("/launch-options")
+    async def launch_options_route():
+        """Launchable (type, region, filesystem) targets that Lambda can
+        satisfy right now, ranked so options co-located with the user's
+        existing data come first. The launch form and any agent use this to
+        pick an available, co-located target instead of guessing a region."""
+        types = await lambda_client.list_instance_types()
+        filesystems = await lambda_client.list_filesystems()
+        return launch_options(types, filesystems)
 
     @app.get("/regions")
     async def list_regions():
@@ -1972,7 +1983,14 @@ def create_app(
             )
         fs = filesystems[filesystem]
         if fs.id not in storage_cache:
-            storage_cache[fs.id] = storage_factory(fs)
+            try:
+                storage_cache[fs.id] = storage_factory(fs)
+            except ValueError as exc:
+                # Browsing persistent files rides the Lambda S3 "Files" API,
+                # whose access keys live in .env separately from the Lambda
+                # API key. Without them the factory raises; surface that as a
+                # clear 503 instead of an opaque 500 that decodes to nothing.
+                raise HTTPException(503, str(exc)) from exc
         return storage_cache[fs.id]
 
     @app.get("/storage/files")
