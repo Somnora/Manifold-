@@ -2221,3 +2221,32 @@ backend session layer:
    shell), construction is wrapped in try/catch (no usable WebGL context ->
    stay on the DOM renderer), and `onContextLoss` disposes the addon so a lost
    GPU context reverts to DOM instead of going blank.
+
+## 2026-07-16 — Terminal flow control: the real fix for freeze-under-output
+
+The earlier terminal-perf pass (dropping the per-chunk scrollToBottom reflow,
+throttling fit, WebGL) helped but did not stop the freeze: with a full-screen
+TUI (Claude Code) streaming, output outran xterm and its write buffer grew
+without bound until the tab choked. Diagnosis confirmed by the user: JUST the
+terminal froze (rest of the app responsive), under heavy output, not the dev
+server / drive. So the missing piece was backpressure.
+
+Watermark flow control end to end:
+- The browser acks how many chars it has actually RENDERED (xterm's write
+  callback is the "parsed" signal), batched ~8 KB to avoid a message per
+  chunk, carrying no scrollToBottom so the reflow stays gone.
+- TerminalSession tracks outstanding (sent - acked) chars and a `_writable`
+  event: cleared at FLOW_HIGH_WATER (128 KB behind), set again at
+  FLOW_LOW_WATER (16 KB). feed() records scrollback FIRST (a reattach always
+  replays everything), then sends and accounts — only delivery is paced.
+- Each pump calls await_writable() BEFORE reading more, so the pause lands at
+  the source: the SSH channel window fills and the remote shell throttles; the
+  local pty pump uses a bounded queue that, when full, stops reading the fd so
+  the kernel pty buffer backpressures the local shell.
+- await_writable() is bounded by FLOW_WAIT_TIMEOUT (5 s): a client that never
+  acks (an old cached tab) degrades to unpaced output, never a stalled shell.
+  attach/detach reset the accounting so a fresh or absent viewer starts clean.
+
+Chose true backpressure over dropping/coalescing output: a TUI's escape
+stream can't be dropped without corrupting the screen, so the producer must
+be slowed, not the bytes thinned.

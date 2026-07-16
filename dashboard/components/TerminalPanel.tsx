@@ -131,14 +131,24 @@ export function TerminalPanel({
         requestAnimationFrame(doFit);
         term.focus();
       };
+      // Flow control: ack how many chars we've actually rendered so the
+      // backend can pause a firehose (or a full-screen TUI like Claude Code)
+      // instead of letting xterm's write buffer grow without bound — the
+      // remaining cause of the freeze under heavy output. The write callback
+      // fires once xterm has parsed the chunk (the right "rendered" signal)
+      // and carries NO scrollToBottom, so it doesn't bring back the per-chunk
+      // reflow; xterm still auto-scrolls when the viewport is at the bottom.
+      // Acks are batched (~8 KB) to avoid a message per chunk.
+      let unacked = 0;
       ws.onmessage = (event) => {
-        // xterm auto-scrolls on write when the viewport is already at the
-        // bottom, so it follows live output on its own. The old per-message
-        // scrollToBottom() callback forced a synchronous reflow on EVERY
-        // chunk (even on hidden tabs) — the main cause of the freeze under
-        // heavy output. Dropping it also lets a user scroll up to read
-        // without being yanked back down.
-        term.write(event.data as string);
+        const data = event.data as string;
+        term.write(data, () => {
+          unacked += data.length;
+          if (unacked >= 8192 && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ack", bytes: unacked }));
+            unacked = 0;
+          }
+        });
       };
       ws.onclose = () => setStatus("closed");
       ws.onerror = () => setStatus("closed");

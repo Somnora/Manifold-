@@ -12,6 +12,8 @@ import time
 import pytest
 
 from app.terminal_sessions import (
+    FLOW_HIGH_WATER,
+    FLOW_LOW_WATER,
     SCROLLBACK_CHARS,
     TerminalSession,
     TerminalSessionManager,
@@ -66,6 +68,68 @@ async def test_scrollback_is_bounded():
         await session.feed(chunk)
     total = sum(len(c) for c in session._scrollback)
     assert total <= SCROLLBACK_CHARS
+
+
+# -- flow control (freeze-under-heavy-output fix) --------------------------------
+
+async def _feed_past_high_water(session):
+    ws = FakeWS()
+    await session.attach(ws)                 # resets flow; writable set
+    chunk = "x" * 20_000
+    while session._outstanding < FLOW_HIGH_WATER:
+        await session.feed(chunk)
+    return ws
+
+
+async def test_flow_control_pauses_over_high_water_and_resumes_on_ack():
+    session, _ = make_session()
+    await _feed_past_high_water(session)
+    # Browser hasn't acked and is now HIGH behind: the pump would pause.
+    assert not session._writable.is_set()
+    # It catches up (acks everything): writing resumes.
+    session.ack(session._outstanding)
+    assert session._writable.is_set()
+
+
+async def test_partial_ack_stays_paused_until_below_low_water():
+    session, _ = make_session()
+    await _feed_past_high_water(session)
+    over = session._outstanding
+    session.ack(over - FLOW_LOW_WATER - 1)   # still just above LOW
+    assert session._outstanding > FLOW_LOW_WATER
+    assert not session._writable.is_set()
+    session.ack(FLOW_LOW_WATER)              # now below LOW
+    assert session._writable.is_set()
+
+
+async def test_silent_client_does_not_wedge_the_shell(monkeypatch):
+    # A client that never acks (old cached tab) must degrade to unpaced
+    # output, never a stalled shell: await_writable returns via its timeout.
+    monkeypatch.setattr("app.terminal_sessions.FLOW_WAIT_TIMEOUT", 0.01)
+    session, _ = make_session()
+    await _feed_past_high_water(session)
+    assert not session._writable.is_set()
+    await session.await_writable()           # returns despite no ack
+    assert session._writable.is_set()
+
+
+async def test_detach_clears_any_flow_pause():
+    session, _ = make_session()
+    ws = await _feed_past_high_water(session)
+    assert not session._writable.is_set()
+    session.detach(ws)                        # no browser -> never stay paused
+    assert session._writable.is_set()
+    assert session._outstanding == 0
+
+
+async def test_reattach_resets_flow_accounting():
+    session, _ = make_session()
+    await _feed_past_high_water(session)
+    assert not session._writable.is_set()
+    fresh = FakeWS()
+    await session.attach(fresh)              # a new viewer starts clean
+    assert session._writable.is_set()
+    assert session._outstanding == 0
 
 
 async def test_second_attach_steals_the_session():

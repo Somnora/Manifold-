@@ -763,6 +763,9 @@ def create_app(
                 elif kind == "resize":
                     session.resize(
                         int(msg.get("cols", 80)), int(msg.get("rows", 24)))
+                elif kind == "ack":
+                    # Flow control: the browser rendered this many more chars.
+                    session.ack(int(msg.get("bytes", 0)))
                 elif kind == "close":
                     killed = True
                     term_sessions.kill(session.id)
@@ -826,6 +829,10 @@ def create_app(
 
         async def pump_output():
             while True:
+                # Backpressure: if the browser is behind, pause BEFORE reading
+                # more so the SSH channel window fills and the remote shell
+                # throttles itself, instead of buffering unboundedly here.
+                await session.await_writable()
                 data = await process.stdout.read(4096)
                 if not data:
                     break
@@ -884,9 +891,20 @@ def create_app(
             os.execvp(shell, [shell, "-l"])
 
         loop = asyncio.get_event_loop()
-        out_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Bounded so a firehose can't grow unboundedly here: when it fills, we
+        # stop reading the pty (below), leaving output in the kernel's pty
+        # buffer, whose backpressure eventually throttles the local shell.
+        out_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+        reader_paused = False
 
         def on_readable():
+            nonlocal reader_paused
+            if out_queue.full():
+                # The pump is behind; pause reading and let the pty buffer
+                # hold the data. pump_output re-arms us after it drains one.
+                loop.remove_reader(fd)
+                reader_paused = True
+                return
             try:
                 data = os.read(fd, 4096)
             except OSError:
@@ -920,8 +938,15 @@ def create_app(
         )
 
         async def pump_output():
+            nonlocal reader_paused
             while True:
+                # Backpressure: hold off while the browser is behind, so the
+                # queue stays full and the pty reader stays paused.
+                await session.await_writable()
                 data = await out_queue.get()
+                if reader_paused and not session.exited:
+                    reader_paused = False
+                    loop.add_reader(fd, on_readable)
                 if data is None:
                     break
                 await session.feed(data.decode(errors="replace"))

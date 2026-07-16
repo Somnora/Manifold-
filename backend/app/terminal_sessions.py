@@ -36,6 +36,15 @@ logger = logging.getLogger("manifold.terminal")
 # ~ a few thousand lines of replay; xterm's own scrollback is 5000 lines.
 SCROLLBACK_CHARS = 200_000
 
+# Flow control watermarks (chars ~= bytes for terminal output). The browser
+# acks what it has actually rendered; we stop feeding when it falls HIGH
+# behind and resume at LOW, so a firehose or a full-screen TUI (Claude Code)
+# can't outrun xterm's write buffer and freeze the tab. A client that never
+# acks (an old cached tab) is covered by the wait timeout below.
+FLOW_HIGH_WATER = 128 * 1024
+FLOW_LOW_WATER = 16 * 1024
+FLOW_WAIT_TIMEOUT = 5.0
+
 
 class TerminalSession:
     """One live shell + its recent output, attachable by at most one WS.
@@ -65,11 +74,40 @@ class TerminalSession:
         # Born detached; the creating handler attaches right away.
         self.detached_at: float | None = time.monotonic()
         self.pump_task: asyncio.Task | None = None
+        # Flow control: bytes sent to the browser but not yet acked as
+        # rendered. `_writable` is clear while the browser is >HIGH behind.
+        self._outstanding = 0
+        self._writable = asyncio.Event()
+        self._writable.set()
+
+    # -- flow control ----------------------------------------------------------
+
+    async def await_writable(self) -> None:
+        """Block while the attached browser is too far behind, so the producer
+        (SSH channel / PTY) backpressures instead of overrunning xterm's write
+        buffer. Bounded by FLOW_WAIT_TIMEOUT so a client that never acks (an
+        old cached tab) degrades to unpaced output, never a stalled shell."""
+        if self._writable.is_set():
+            return
+        try:
+            await asyncio.wait_for(self._writable.wait(), FLOW_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._writable.set()   # assume the client can't ack; don't wedge
+
+    def ack(self, rendered: int) -> None:
+        """The browser reports `rendered` more chars actually drawn."""
+        self._outstanding = max(0, self._outstanding - rendered)
+        if self._outstanding <= FLOW_LOW_WATER:
+            self._writable.set()
 
     # -- output path (called only by the session's pump task) -----------------
 
     async def feed(self, text: str) -> None:
-        """Record output and forward it to the attached terminal, if any."""
+        """Record output and forward it to the attached terminal, if any.
+
+        Scrollback is recorded FIRST (so a reattach always replays the full
+        output), then the send is paced by flow control — only the delivery to
+        a slow browser waits, never the recording."""
         self._scrollback.append(text)
         self._scrollback_len += len(text)
         while (self._scrollback_len > SCROLLBACK_CHARS
@@ -81,6 +119,11 @@ class TerminalSession:
         if ws is not None:
             try:
                 await ws.send_text(text)
+                # Count what the browser now owes an ack for; once it is HIGH
+                # behind, the pump's next await_writable() pauses reading.
+                self._outstanding += len(text)
+                if self._outstanding >= FLOW_HIGH_WATER:
+                    self._writable.clear()
             except Exception:
                 # The browser vanished mid-send (refresh); keep the shell.
                 self.detach(ws)
@@ -114,6 +157,10 @@ class TerminalSession:
             await ws.send_text("".join(self._scrollback))
         self._ws = ws
         self.detached_at = None
+        # Fresh viewer: reset flow accounting (the scrollback replay above is
+        # a one-shot bulk render, not something to pace or wait on).
+        self._outstanding = 0
+        self._writable.set()
 
     def detach(self, ws=None) -> None:
         """Let go of the terminal but keep the shell running. `ws` guards a
@@ -121,6 +168,9 @@ class TerminalSession:
         if ws is not None and ws is not self._ws:
             return
         self._ws = None
+        # No browser to pace to: never leave the pump blocked on flow control.
+        self._outstanding = 0
+        self._writable.set()
         self.detached_at = time.monotonic()
 
     # -- input path (called by the WS handler) ---------------------------------
