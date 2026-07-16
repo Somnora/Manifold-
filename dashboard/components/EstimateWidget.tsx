@@ -96,7 +96,7 @@ export function EstimateWidget({
           <span className="text-indigo-400">estimating…</span>
         ) : est.confidence === "none" ? (
           <span>
-            Runs until you stop it —{" "}
+            Runs until you stop it:{" "}
             <span className="font-medium">
               {rate != null ? `${formatMoney(rate)}/hr while running` : "cost depends on runtime"}
             </span>

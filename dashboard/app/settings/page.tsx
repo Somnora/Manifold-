@@ -137,7 +137,7 @@ function LambdaKeyForm({ onSaved }: { onSaved: () => void }) {
       setNotice(
         `Key validated (${result.instance_types_visible} instance types visible)` +
           (result.applied_live
-            ? " and applied — the launch form is live now."
+            ? " and applied; the launch form is live now."
             : " and saved for real mode."),
       );
       setKey("");

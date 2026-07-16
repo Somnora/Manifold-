@@ -188,7 +188,7 @@ export function ChatPanel({ instanceId }: { instanceId: string }) {
           page (look for the model shards downloading).
           {model.status_detail ? (
             <span className="mt-1 block text-xs text-amber-700">
-              Not answering yet — normal while it loads (probe:{" "}
+              Not answering yet; normal while it loads (probe:{" "}
               {model.status_detail}).
             </span>
           ) : null}
@@ -250,7 +250,7 @@ export function ChatPanel({ instanceId }: { instanceId: string }) {
           m.kind === "tool" ? (
             <p key={i} className="text-xs text-zinc-400">
               <span className="font-mono">
-                tool: {m.action} {m.ok ? "ok" : `failed${m.error ? ` — ${m.error}` : ""}`}
+                tool: {m.action} {m.ok ? "ok" : `failed${m.error ? `: ${m.error}` : ""}`}
               </span>
             </p>
           ) : (

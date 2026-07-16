@@ -209,7 +209,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
                   ? r.hasFs
                     ? " · has filesystem"
                     : ""
-                  : " — not available for this type"}
+                  : " (not available for this type)"}
               </option>
             ))}
           </select>
@@ -283,7 +283,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
               <span className="font-medium text-zinc-700">
                 {formatMoney(selectedType.price_usd_per_hour)}/hr
               </span>{" "}
-              — {selectedType.gpu_description || selectedType.description}:{" "}
+              {selectedType.gpu_description || selectedType.description}:{" "}
               {selectedType.specs.gpus} GPU, {selectedType.specs.vcpus} vCPU,{" "}
               {selectedType.specs.memory_gib} GiB RAM
             </span>

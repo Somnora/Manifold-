@@ -39,7 +39,7 @@ from pydantic import BaseModel
 # "Directory not empty" — which reads like a bug rather than "a job is still
 # using this". Recognize that shape and say what is actually wrong.
 _BUSY_HINT = (
-    "a running job still has these files open — NFS keeps hidden .nfs* "
+    "a running job still has these files open; NFS keeps hidden .nfs* "
     "placeholders until that process exits. Stop the job using this path, "
     "then delete again."
 )

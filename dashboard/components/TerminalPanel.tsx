@@ -244,7 +244,7 @@ export function TerminalPanel({
             title={
               renderer === "webgl"
                 ? "GPU (WebGL) renderer active"
-                : "DOM renderer (slow under heavy output) — WebGL unavailable; see console"
+                : "DOM renderer (slow under heavy output); WebGL unavailable, see console"
             }
             className={`font-mono ${
               renderer === "webgl" ? "text-zinc-500" : "text-amber-500"
