@@ -9,6 +9,10 @@
 # Files panel and download from there.
 name: sdxl-generate
 description: Generate images from a prompt with SDXL (diffusers)
+# `:latest` floats — the loader flags it (floating_tag_warning). Last image
+# VERIFIED working on a real A10 (2026-07-15) was digest
+# sha256:4c7317881a534b22e18add49c925096fa902651fb0571c69f3cad58af3ea2c0f;
+# if a future pull breaks, pin to that digest (@sha256:...) to recover.
 image: huggingface/transformers-pytorch-gpu:latest
 
 # Params go OUTSIDE the single quotes as positional args (reached via "$@"),

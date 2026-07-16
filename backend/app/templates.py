@@ -18,11 +18,14 @@ the dispatcher — nothing a template says can open a public listener.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger("manifold.templates")
 
 EPHEMERAL_ROOT = "/workspace/ephemeral"
 PERSISTENT_TOKEN = "{persistent}"
@@ -30,6 +33,33 @@ PERSISTENT_TOKEN = "{persistent}"
 PARAMETER_TYPES = ("string", "integer", "number", "boolean")
 
 PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def floating_tag_warning(image: str) -> str | None:
+    """Return a drift warning if `image` rides an unpinned tag, else None.
+
+    A floating tag (:latest, :main-latest, or no tag at all) is not an error,
+    but it drifts under the template: sdxl-generate broke exactly this way
+    when its `:latest` base silently dropped the `python` symlink, so a job
+    that had worked for weeks began failing after the image pull. We surface
+    the risk (in the Jobs page and to any agent reading list_templates)
+    without forcing a pin — pinning trades drift for staleness (a frozen base
+    misses CUDA/security updates and can fall out of step with the packages a
+    template pip-installs at start), so it stays the author's call.
+
+    A tag counts as PINNED when it is a @sha256 digest or contains a digit (a
+    version, e.g. 2.4.0-cuda12.4 or 5.5.0-tf2). A digit-less tag (latest,
+    main, nightly, stable) or no tag at all floats.
+    """
+    last = image.rsplit("/", 1)[-1]        # final path component; drops any
+    if "@" in last:                        # registry:port on the host part
+        return None                        # repo@sha256:... — fully pinned
+    tag = last.rsplit(":", 1)[-1] if ":" in last else ""
+    if tag == "":
+        return "image has no tag (defaults to :latest) and will drift"
+    if not any(ch.isdigit() for ch in tag):
+        return f"image tag ':{tag}' is floating and may drift"
+    return None
 
 
 class TemplateError(Exception):
@@ -78,6 +108,9 @@ class JobTemplate:
     # Safe under the hard rule: host networking lets a container dial
     # loopback, it does not create any new listener.
     network: str = ""
+    # Non-fatal advisories surfaced to the Jobs page and list_templates (e.g.
+    # a floating image tag that may drift). Computed at parse time.
+    warnings: list[str] = field(default_factory=list)
 
     def to_api(self) -> dict:
         return {
@@ -85,6 +118,7 @@ class JobTemplate:
             "description": self.description,
             "image": self.image,
             "command": self.command,
+            "warnings": self.warnings,
             "parameters": [
                 {
                     "name": p.name,
@@ -186,10 +220,16 @@ def parse_template(text: str, source: str = "<inline>") -> JobTemplate:
             f"exclusive (host networking has no port mappings)"
         )
 
+    image = str(raw["image"])
+    warnings = []
+    drift = floating_tag_warning(image)
+    if drift:
+        warnings.append(drift)
+
     return JobTemplate(
-        name=name, description=str(raw["description"]), image=str(raw["image"]),
+        name=name, description=str(raw["description"]), image=image,
         command=command, parameters=parameters, volumes=volumes, ports=ports,
-        env=env, gpu=gpu, network=network,
+        env=env, gpu=gpu, network=network, warnings=warnings,
     )
 
 
@@ -210,6 +250,8 @@ def load_templates(directory: Path) -> tuple[dict[str, JobTemplate], dict[str, s
                 raise TemplateError(
                     f"duplicate template name '{template.name}' in {path.name}"
                 )
+            for w in template.warnings:
+                logger.warning("template '%s': %s", template.name, w)
             templates[template.name] = template
         except (TemplateError, yaml.YAMLError) as exc:
             errors[path.name] = str(exc)

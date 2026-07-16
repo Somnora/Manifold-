@@ -2250,3 +2250,26 @@ Watermark flow control end to end:
 Chose true backpressure over dropping/coalescing output: a TUI's escape
 stream can't be dropped without corrupting the screen, so the producer must
 be slowed, not the bytes thinned.
+
+## 2026-07-16 — Rolling-tag drift: surface it, don't force a pin
+
+sdxl-generate broke because its `:latest` base silently dropped the `python`
+symlink — image drift, not an authoring error. Several templates ride
+floating tags (vllm/sglang `:latest`, axolotl `main-latest`), so the same
+class of failure can recur and only shows up after a job burns GPU minutes.
+
+`floating_tag_warning(image)` (pure) flags any unpinned tag: a tag counts as
+PINNED when it is a @sha256 digest or contains a digit (a version, e.g.
+2.4.0-cuda12.4 or 5.5.0-tf2); a digit-less tag (latest, main, nightly) or no
+tag at all floats. It parses the ref carefully so a registry:port on the host
+is not mistaken for a tag. The result rides a new non-fatal `warnings` field
+on JobTemplate, surfaced three ways: logged at load, returned by
+`to_api()` (so `/templates` and MCP `list_templates` carry it), and shown as
+an amber advisory under the Jobs-page template picker.
+
+**Surface, not pin:** hard-pinning every image to a digest trades drift for
+staleness — a frozen base misses CUDA/security fixes and falls out of step
+with the packages a template pip-installs at start — so it stays the author's
+call. As a recovery breadcrumb, sdxl-generate records the digest of the image
+we VERIFIED on a real A10 (2026-07-15) in a comment, so if a future pull
+breaks, pinning to that digest restores a known-good state immediately.

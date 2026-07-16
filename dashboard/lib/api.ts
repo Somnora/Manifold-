@@ -176,6 +176,8 @@ export type Template = {
   command: string;
   parameters: TemplateParameter[];
   gpu: { min_vram_gib?: number; recommended_types?: string[] };
+  // Non-fatal advisories (e.g. a floating image tag that may drift).
+  warnings?: string[];
   // User-authored template (editable/deletable); yaml is its raw source.
   custom?: boolean;
   yaml?: string;

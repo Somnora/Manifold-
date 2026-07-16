@@ -200,6 +200,11 @@ export default function JobsPage() {
                     Needs a GPU with ≥{template.gpu.min_vram_gib} GiB VRAM.
                   </p>
                 ) : null}
+                {template.warnings?.map((w) => (
+                  <p key={w} className="mt-1 text-amber-700">
+                    ⚠ {w}
+                  </p>
+                ))}
               </div>
 
               {/* Rent a GPU just for this job (launch -> run -> sync ->
