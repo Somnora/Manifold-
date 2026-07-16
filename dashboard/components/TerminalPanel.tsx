@@ -34,6 +34,11 @@ export function TerminalPanel({
   const [status, setStatus] = useState<"connecting" | "open" | "closed">(
     "connecting",
   );
+  // Which renderer actually took: "webgl" draws glyphs on the GPU; "dom" is
+  // xterm's fallback, which is MUCH slower under heavy output. Shown in the
+  // header because a silent fallback is indistinguishable from a bug — if
+  // the terminal is sluggish, this says whether the GPU path is even live.
+  const [renderer, setRenderer] = useState<"webgl" | "dom">("dom");
 
   useEffect(() => {
     const el = containerRef.current;
@@ -49,7 +54,10 @@ export function TerminalPanel({
       const [{ Terminal }, { FitAddon }, webglMod] = await Promise.all([
         import("@xterm/xterm"),
         import("@xterm/addon-fit"),
-        import("@xterm/addon-webgl").catch(() => null),
+        import("@xterm/addon-webgl").catch((err) => {
+          console.warn("[manifold] WebGL addon failed to load:", err);
+          return null;
+        }),
       ]);
       if (disposed) return;
 
@@ -74,10 +82,21 @@ export function TerminalPanel({
       if (webglMod) {
         try {
           const webgl = new webglMod.WebglAddon();
-          webgl.onContextLoss(() => webgl.dispose());
+          webgl.onContextLoss(() => {
+            console.warn("[manifold] WebGL context lost; falling back to DOM");
+            webgl.dispose();
+            setRenderer("dom");
+          });
           term.loadAddon(webgl);
-        } catch {
-          // No usable WebGL context: stay on the DOM renderer.
+          setRenderer("webgl");
+        } catch (err) {
+          // No usable WebGL context (blocklisted GPU, too many live contexts,
+          // headless). Stay on the DOM renderer — but say so, loudly: a
+          // silent fallback here looks exactly like "the fix didn't work".
+          console.warn(
+            "[manifold] WebGL renderer unavailable, using the slower DOM "
+            + "renderer:", err,
+          );
         }
       }
 
@@ -201,16 +220,33 @@ export function TerminalPanel({
           {label ?? "Terminal (SSH via the managed connection)"}
           {fill ? "" : " · drag the bottom-right corner to resize"}
         </span>
-        <span
-          className={`text-xs ${
-            status === "open"
-              ? "text-emerald-400"
-              : status === "closed"
-                ? "text-red-400"
-                : "text-zinc-400"
-          }`}
-        >
-          {status}
+        <span className="flex items-center gap-1.5 text-xs">
+          {/* amber `dom` = the GPU renderer did not take, so heavy output
+              will be slow; see the console for why. */}
+          <span
+            title={
+              renderer === "webgl"
+                ? "GPU (WebGL) renderer active"
+                : "DOM renderer (slow under heavy output) — WebGL unavailable; see console"
+            }
+            className={`font-mono ${
+              renderer === "webgl" ? "text-zinc-500" : "text-amber-500"
+            }`}
+          >
+            {renderer}
+          </span>
+          <span className="text-zinc-600">·</span>
+          <span
+            className={
+              status === "open"
+                ? "text-emerald-400"
+                : status === "closed"
+                  ? "text-red-400"
+                  : "text-zinc-400"
+            }
+          >
+            {status}
+          </span>
         </span>
       </div>
       {/* Padding is on THIS wrapper; the xterm host below fills it exactly

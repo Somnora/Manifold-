@@ -43,7 +43,13 @@ SCROLLBACK_CHARS = 200_000
 # acks (an old cached tab) is covered by the wait timeout below.
 FLOW_HIGH_WATER = 128 * 1024
 FLOW_LOW_WATER = 16 * 1024
+# How long to wait for a client that has NEVER acked: it probably predates
+# flow control (an old cached tab), so give up quickly and stream unpaced.
 FLOW_WAIT_TIMEOUT = 5.0
+# How long to wait for a client that HAS acked. It speaks the protocol and is
+# simply busy rendering — which is exactly when pausing matters, so this must
+# be generous. (At 5s we resumed flooding mid-choke and undid the pause.)
+FLOW_BUSY_TIMEOUT = 60.0
 
 
 class TerminalSession:
@@ -79,23 +85,41 @@ class TerminalSession:
         self._outstanding = 0
         self._writable = asyncio.Event()
         self._writable.set()
+        # Has this client ever acked? Distinguishes "can't speak flow control"
+        # from "speaks it but is busy" — they need opposite wait budgets.
+        self._acks_seen = 0
 
     # -- flow control ----------------------------------------------------------
 
     async def await_writable(self) -> None:
         """Block while the attached browser is too far behind, so the producer
         (SSH channel / PTY) backpressures instead of overrunning xterm's write
-        buffer. Bounded by FLOW_WAIT_TIMEOUT so a client that never acks (an
-        old cached tab) degrades to unpaced output, never a stalled shell."""
+        buffer.
+
+        The wait budget depends on whether this client has EVER acked:
+        - never acked -> it probably predates flow control; give up after
+          FLOW_WAIT_TIMEOUT and stream unpaced (today's behavior, no stall).
+        - has acked -> it speaks the protocol and is just busy rendering, so
+          wait FLOW_BUSY_TIMEOUT. Timing out fast here would resume the flood
+          mid-choke and defeat the whole mechanism; the long bound only exists
+          so a browser that dies without closing its socket can't wedge the
+          shell forever.
+        """
         if self._writable.is_set():
             return
+        budget = FLOW_BUSY_TIMEOUT if self._acks_seen else FLOW_WAIT_TIMEOUT
         try:
-            await asyncio.wait_for(self._writable.wait(), FLOW_WAIT_TIMEOUT)
+            await asyncio.wait_for(self._writable.wait(), budget)
         except asyncio.TimeoutError:
-            self._writable.set()   # assume the client can't ack; don't wedge
+            logger.warning(
+                "terminal %s: browser %s behind and silent for %.0fs; "
+                "resuming unpaced", self.id,
+                f"{self._outstanding} chars", budget)
+            self._writable.set()
 
     def ack(self, rendered: int) -> None:
         """The browser reports `rendered` more chars actually drawn."""
+        self._acks_seen += 1
         self._outstanding = max(0, self._outstanding - rendered)
         if self._outstanding <= FLOW_LOW_WATER:
             self._writable.set()
@@ -158,8 +182,10 @@ class TerminalSession:
         self._ws = ws
         self.detached_at = None
         # Fresh viewer: reset flow accounting (the scrollback replay above is
-        # a one-shot bulk render, not something to pace or wait on).
+        # a one-shot bulk render, not something to pace or wait on). Its
+        # protocol support is unknown again until it acks.
         self._outstanding = 0
+        self._acks_seen = 0
         self._writable.set()
 
     def detach(self, ws=None) -> None:

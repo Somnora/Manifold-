@@ -2313,3 +2313,32 @@ PermissionError, so it would otherwise have escaped as a generic 500.
 
 The raw detail is still appended in parens: the hint explains, it never hides
 what the OS said.
+
+## 2026-07-16 — Terminal still froze: show the renderer, fix the flow-control valve
+
+The freeze survived the flow-control fix (confirmed with a restarted backend
+and a hard-refreshed tab, so the fix WAS live). Two problems, both mine:
+
+**1. The safety valve defeated the mechanism.** `await_writable()` timed out
+after 5s and resumed sending. That valve exists for a client that CANNOT ack
+(an old tab predating flow control) — but a browser choking on render also
+stops acking, so the valve fired exactly when the pause was needed, and the
+backend resumed flooding mid-choke. Now the budget depends on evidence: a
+client that has NEVER acked gets FLOW_WAIT_TIMEOUT (5s, then stream unpaced —
+no stall); a client that HAS acked demonstrably speaks the protocol and is
+merely busy, so it gets FLOW_BUSY_TIMEOUT (60s), long enough for a real
+render backlog. The long bound still exists only so a browser that dies
+without closing its socket cannot wedge the shell forever; a timeout there
+now logs a warning instead of passing silently. attach() resets the ack count
+because a new viewer's protocol support is unknown again.
+
+**2. A silent fallback hid the likeliest cause.** WebGL init was wrapped in a
+bare `except`/`.catch(() => null)`, so if the GPU renderer never took (no
+context, blocklisted GPU, too many live contexts across dock tabs), the panel
+quietly ran xterm's much slower DOM renderer — indistinguishable from "the
+fix didn't work". The active renderer is now state, shown in the panel header
+(`webgl` grey / `dom` amber) with the reason logged to the console. Version
+pairing was checked and is correct (xterm 6.0 / fit 0.11 / webgl 0.19), so
+this is instrumentation to END the guessing, not a suspected mismatch.
+
+Lesson: an error path that swallows its reason turns one bug into two.
