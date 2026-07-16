@@ -263,6 +263,46 @@ def test_fs_delete_reports_when_even_sudo_cannot_remove(tmp_path, monkeypatch):
     assert "elevated privileges" in resp.json()["detail"]
 
 
+def test_fs_delete_explains_nfs_busy_instead_of_directory_not_empty(
+        tmp_path, monkeypatch):
+    # Real case: a running job holds the HF cache open, NFS leaves hidden
+    # .nfs* placeholders, and rm reports a baffling "Directory not empty".
+    nfs = tmp_path / "nfs" / "cache"
+    nfs.mkdir(parents=True)
+    monkeypatch.setattr(sidecar.shutil, "rmtree",
+                        lambda *a, **k: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(sidecar.subprocess, "run",
+                        lambda *a, **k: type("R", (), {
+                            "returncode": 1,
+                            "stderr": "rm: cannot remove "
+                                      "'/lambda/nfs/x/cache/xet/logs': "
+                                      "Directory not empty"})())
+    client = make_client(tmp_path)
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "cache", "recursive": True,
+    })
+    assert resp.status_code == 409                 # a conflict, not a crash
+    detail = resp.json()["detail"]
+    assert "still has these files open" in detail  # says what's really wrong
+    assert "Stop the job" in detail                # and what to do about it
+
+
+def test_fs_delete_busy_hint_on_the_unprivileged_path(tmp_path, monkeypatch):
+    # Same shape when the plain remove (not sudo) hits it: OSError, not
+    # PermissionError, so it must not escape as a generic 500.
+    (tmp_path / "nfs" / "cache").mkdir(parents=True)
+    monkeypatch.setattr(
+        sidecar.shutil, "rmtree",
+        lambda *a, **k: (_ for _ in ()).throw(
+            OSError("[Errno 39] Directory not empty: 'xet/logs'")))
+    client = make_client(tmp_path)
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "cache", "recursive": True,
+    })
+    assert resp.status_code == 409
+    assert "still has these files open" in resp.json()["detail"]
+
+
 def test_fs_delete_refuses_roots_and_escapes(tmp_path):
     (tmp_path / "nfs").mkdir()
     (tmp_path / "ephemeral").mkdir()

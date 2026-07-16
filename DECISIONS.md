@@ -2296,3 +2296,20 @@ privilege for everything else) and over running job containers as the host
 user (which would break the many templates that need root in-container for
 pip/apt and /root/.cache). Ships with the sidecar at launch, so it applies to
 newly launched instances.
+
+## 2026-07-16 — "Directory not empty" really means "a job still has it open"
+
+Found live while cleaning the vllm test's HF cache: deleting a directory a
+RUNNING job holds open fails on NFS with `rm: cannot remove '.../xet/logs':
+Directory not empty`. NFS turns "unlink a file another process still has
+open" into a hidden .nfsXXXX placeholder, so the parent then refuses — an
+error that reads like a bug rather than "stop the job first".
+
+`_busy_hint()` recognizes that shape (not empty / resource busy / .nfs) and
+fs_delete returns 409 (a conflict, retryable) saying what is actually wrong
+and what to do, instead of surfacing the raw rm text. Applied on BOTH paths:
+the privileged retry and the plain remove — the latter raises OSError, not
+PermissionError, so it would otherwise have escaped as a generic 500.
+
+The raw detail is still appended in parens: the hint explains, it never hides
+what the OS said.

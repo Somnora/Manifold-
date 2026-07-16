@@ -34,6 +34,24 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 
+# NFS turns "delete a file another process still has open" into a hidden
+# .nfsXXXX placeholder, so the parent then refuses to go with a bare
+# "Directory not empty" — which reads like a bug rather than "a job is still
+# using this". Recognize that shape and say what is actually wrong.
+_BUSY_HINT = (
+    "a running job still has these files open — NFS keeps hidden .nfs* "
+    "placeholders until that process exits. Stop the job using this path, "
+    "then delete again."
+)
+
+
+def _busy_hint(detail: str) -> str | None:
+    low = detail.lower()
+    if "not empty" in low or "resource busy" in low or ".nfs" in low:
+        return _BUSY_HINT
+    return None
+
+
 def _privileged_remove(target: Path) -> None:
     """Remove `target` with elevated privileges — the fallback when the
     ubuntu-run sidecar cannot unlink a path a job container wrote as root.
@@ -51,11 +69,12 @@ def _privileged_remove(target: Path) -> None:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise HTTPException(500, f"privileged delete failed: {exc}")
     if result.returncode != 0:
+        detail = result.stderr.strip() or "sudo rm failed"
+        hint = _busy_hint(detail)
+        if hint:
+            raise HTTPException(409, f"could not delete: {hint} ({detail})")
         raise HTTPException(
-            500,
-            "could not delete (even with elevated privileges): "
-            + (result.stderr.strip() or "sudo rm failed"),
-        )
+            500, "could not delete (even with elevated privileges): " + detail)
 
 try:
     import pynvml
@@ -333,6 +352,12 @@ def create_app(nvml=None, ephemeral_root: Path | None = None,
             # dirs, so the ubuntu sidecar can't unlink them. Retry with a
             # privileged remove, still confined to the jailed path above.
             _privileged_remove(target)
+        except OSError as exc:
+            # Most often the NFS "still open by a running job" shape.
+            hint = _busy_hint(str(exc))
+            if hint:
+                raise HTTPException(409, f"could not delete: {hint} ({exc})")
+            raise HTTPException(400, f"could not delete {req.path}: {exc}")
         return {"deleted": f"{req.root_name}:{req.path}"}
 
     return app
