@@ -2273,3 +2273,26 @@ with the packages a template pip-installs at start — so it stays the author's
 call. As a recovery breadcrumb, sdxl-generate records the digest of the image
 we VERIFIED on a real A10 (2026-07-15) in a comment, so if a future pull
 breaks, pinning to that digest restores a known-good state immediately.
+
+## 2026-07-16 — File-navigator delete on root-owned job outputs
+
+Found while cleaning up the whisper-batch test: job containers write outputs
+as root (uid 0) into root-owned directories on the NFS, but the sidecar runs
+as `User=ubuntu` (cloud_init.py), so its `/fs/delete` (the dashboard file
+navigator's delete) hit "permission denied" on exactly the files a user wants
+to clean up — checkpoints, outputs, caches. Silent, confusing break.
+
+Fix: `fs_delete` tries the normal unprivileged remove first (least privilege
+for ubuntu-owned files), and only on PermissionError falls back to
+`_privileged_remove` — `sudo -n rm -rf -- <path>`. The path is the same
+jail-resolved absolute path the handler already validated, passed as a single
+argv (no shell) with `--` to stop option parsing, so the escalation stays
+confined to the sanctioned roots. `sudo -n` (non-interactive) relies on the
+instance's passwordless sudo (Lambda's default, already used by run_command);
+if sudo is missing or refuses, the user gets a clear 500, never a hang.
+
+Chose sudo-on-demand over running the whole sidecar as root (keeps least
+privilege for everything else) and over running job containers as the host
+user (which would break the many templates that need root in-container for
+pip/apt and /root/.cache). Ships with the sidecar at launch, so it applies to
+newly launched instances.

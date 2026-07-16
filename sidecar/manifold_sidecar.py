@@ -25,11 +25,37 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import os
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
+
+
+def _privileged_remove(target: Path) -> None:
+    """Remove `target` with elevated privileges — the fallback when the
+    ubuntu-run sidecar cannot unlink a path a job container wrote as root.
+
+    The caller has already jail-resolved `target` to an absolute path inside
+    a sanctioned root, and it is passed as a single argv (no shell, with `--`
+    to stop option parsing), so the escalation stays confined to that path.
+    Relies on the instance's passwordless sudo (Lambda's default); if sudo
+    is unavailable or refuses, we surface a clear error rather than hang."""
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "rm", "-rf", "--", str(target)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(500, f"privileged delete failed: {exc}")
+    if result.returncode != 0:
+        raise HTTPException(
+            500,
+            "could not delete (even with elevated privileges): "
+            + (result.stderr.strip() or "sudo rm failed"),
+        )
 
 try:
     import pynvml
@@ -292,15 +318,21 @@ def create_app(nvml=None, ephemeral_root: Path | None = None,
             raise HTTPException(400, "refusing to delete a filesystem root")
         if not target.exists():
             raise HTTPException(404, f"{req.root_name}:{req.path} not found")
-        if target.is_dir():
-            if not req.recursive:
-                raise HTTPException(
-                    409, f"{req.path} is a directory; pass recursive=true "
-                         f"to delete it and everything inside")
-            import shutil
-            shutil.rmtree(target)
-        else:
-            target.unlink()
+        is_dir = target.is_dir()
+        if is_dir and not req.recursive:
+            raise HTTPException(
+                409, f"{req.path} is a directory; pass recursive=true "
+                     f"to delete it and everything inside")
+        try:
+            if is_dir:
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except PermissionError:
+            # Job containers write outputs as root (uid 0) into root-owned
+            # dirs, so the ubuntu sidecar can't unlink them. Retry with a
+            # privileged remove, still confined to the jailed path above.
+            _privileged_remove(target)
         return {"deleted": f"{req.root_name}:{req.path}"}
 
     return app
