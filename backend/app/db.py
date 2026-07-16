@@ -139,6 +139,14 @@ CREATE TABLE IF NOT EXISTS preferences (
     value       TEXT NOT NULL           -- JSON
 );
 
+-- User-chosen display names for instances (Phase 39). Lambda fixes an
+-- instance's name at launch; this is Manifold's own overlay, applied
+-- wherever instances are shown. Deleting the row restores Lambda's name.
+CREATE TABLE IF NOT EXISTS instance_names (
+    instance_id TEXT PRIMARY KEY,
+    name        TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -793,6 +801,27 @@ class Database:
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, json.dumps(value)),
         )
+
+    # -- instance display names (Phase 39) --------------------------------------------
+
+    def set_instance_name(self, instance_id: str, name: str) -> None:
+        """Set (or clear, with an empty name) the user's display name."""
+        if name:
+            self._execute(
+                """INSERT INTO instance_names (instance_id, name)
+                   VALUES (?, ?)
+                   ON CONFLICT(instance_id) DO UPDATE SET name = excluded.name""",
+                (instance_id, name),
+            )
+        else:
+            self._execute(
+                "DELETE FROM instance_names WHERE instance_id = ?",
+                (instance_id,),
+            )
+
+    def instance_names(self) -> dict[str, str]:
+        rows = self._execute("SELECT * FROM instance_names").fetchall()
+        return {r["instance_id"]: r["name"] for r in rows}
 
     # -- capacity watches -----------------------------------------------------------
 

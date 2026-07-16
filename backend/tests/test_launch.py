@@ -129,6 +129,11 @@ async def test_capacity_exhaustion_fails_loudly(settings, db):
     assert final["attempts"] == 5                 # max_attempts, one type each
     assert "5 attempts" in final["error"]
     assert "gpu_1x_a10" in final["error"]
+    # Actionable, not a dead end: the A10 has capacity in us-west-2 (the mock
+    # catalog), so the failure names where to relaunch instead of only saying
+    # "edit config.yaml".
+    assert "Available right now" in final["error"]
+    assert "us-west-2" in final["error"]
 
 
 async def test_fallback_type_used_when_primary_has_no_capacity(tmp_path, db):

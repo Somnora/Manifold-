@@ -46,25 +46,61 @@ Restart Claude Desktop; the tools appear under the hammer icon.
 If the backend runs somewhere non-default, set the env var in the same
 block: `"env": {"MANIFOLD_API_URL": "http://localhost:8000"}`.
 
+## Registering in Codex
+
+Add to `~/.codex/config.toml`, with YOUR absolute repo path:
+
+```toml
+[mcp_servers.manifold]
+command = "uv"
+args = ["run", "--directory", "/Users/you/Manifold/backend", "manifold-mcp"]
+```
+
+Then in any codex session: "use the manifold tools to launch an A10 and
+run gpu-smoke". Tell it once per task: **use the manifold tools, not ssh**
+- that is what keeps every action on the audit trail.
+
+## Registering in Gemini CLI
+
+Add to `~/.gemini/settings.json` (create it if needed):
+
+```json
+{
+  "mcpServers": {
+    "manifold": {
+      "command": "uv",
+      "args": ["run", "--directory", "/Users/you/Manifold/backend", "manifold-mcp"]
+    }
+  }
+}
+```
+
+`/mcp` inside gemini lists the tools once it connects.
+
 ## The tools
 
 | Tool | What it does |
 | --- | --- |
+| `list_launch_options()` | Ranked {type, region, filesystem} targets that have capacity NOW, co-located with your data first — call before `launch_gpu` |
 | `launch_gpu(instance_type, region, filesystem, connection_mode?)` | Launch through ALL guards; returns a launch id |
-| `get_launch_status(launch_id)` | Poll: launching → retrying → booting → active/failed |
+| `get_launch_status(launch_id)` | One snapshot: phase + boot countdown while it boots |
+| `wait_for_launch(launch_id, timeout=120)` | Block until active/failed instead of polling (best for slow SXM4 boots) |
 | `list_instances()` | Live instances + SSH connection state |
 | `terminate_instance(id, force=false)` | force=false returns the unsaved-file list instead of terminating |
 | `sync_outputs(instance_id)` | rsync ephemeral scratch → persistent filesystem |
 | `list_templates()` | Job templates with parameter schemas |
 | `run_job(template, parameters)` | Enqueue a job; validated immediately |
 | `get_job_status(id)` / `get_job_logs(id, tail=100)` | Progress and live logs |
-| `list_filesystems()` / `list_persistent_files(prefix)` | Persistent storage, no instance needed |
+| `list_filesystems()` / `list_persistent_files(prefix)` | Persistent storage; browses over SSH (no S3 keys) when a box is up, else via the S3 Files API |
 | `upload_file(local_path, remote_path)` | Push a file from this machine to the instance (SFTP) |
 | `download_file(remote_path, local_path)` | Pull results back to this machine (SFTP) |
+| `run_command(instance_id, command, timeout=120)` | ONE shell command on the instance, audited with its exit code |
+| `save_template(yaml_text)` / `delete_template(name)` | Author a custom job template (see docs/custom-templates.md) |
 
 Every tool takes an optional `note` — one line of intent that lands in the
-audit log. Everything an agent does is visible on the dashboard's **Agent
-Activity** page as it happens.
+audit log. Everything an agent does is visible live on the dashboard's
+**Activity → Audit trail** page (filter: Agent actions), and any job it
+queues appears on the Jobs page with streaming logs.
 
 ## Worked example
 
@@ -77,8 +113,9 @@ Activity):
 
 1. `list_templates(note="find transcription template")` → sees
    `whisper-batch` with parameters `input_dir`, `model_size`, `language`.
-2. `list_filesystems()` → `manifold-data` in `us-east-1`; the inbox lives
-   at `<filesystem>/inbox`.
+2. `list_launch_options(note="where can I launch, near my data")` → the top
+   target is `gpu_1x_a10` in `us-east-1` on `manifold-data` (co-located with
+   the inbox, and available right now), so no region is guessed blind.
 3. `launch_gpu(instance_type="gpu_1x_a10", region="us-east-1",
    filesystem="manifold-data", note="GPU for whisper batch")` → launch id.
    If this had breached the budget or concurrency cap, the tool would have
@@ -94,6 +131,23 @@ Activity):
 8. `sync_outputs(id, note="save outputs first")` →
    `terminate_instance(id, force=true, note="all synced")` → terminated.
    Billing stopped.
+
+## Do agents get everything SSH would give them?
+
+Yes — the difference is not capability, it is visibility.
+
+- `run_command` is full shell parity: anything an agent could type over
+  raw SSH, it can run through the tool. The difference is that every
+  command lands in the audit log with its exit code, and activity resets
+  the idle clock so the box is not reaped mid-task.
+- Long-running work belongs in `run_job` (or a custom template): jobs
+  stream logs to the dashboard, survive backend restarts, and record
+  their outputs.
+- What agents can NOT do through the tools: bypass a guard. Budget,
+  concurrency, the mount jail, and the termination data rescue bind every
+  tool identically. Raw SSH from your own terminal could sidestep the
+  audit trail — which is exactly why the one instruction worth giving
+  every agent is: **use the manifold tools, not ssh**.
 
 ## Non-MCP agents
 

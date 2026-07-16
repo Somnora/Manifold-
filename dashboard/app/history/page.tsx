@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type Launch, type Utilization } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
+import { AuditLog } from "@/components/AuditLog";
 import {
   formatDate,
   formatDuration,
@@ -11,11 +12,57 @@ import {
   launchCost,
 } from "@/lib/format";
 
+// Activity: everything that happened, in two ledgers. "Spend" is the launch
+// history with cost = rate x billable runtime; "Audit" is the full action
+// trail (agents, MCP, backend safety actions). One place to answer both
+// "what did this cost me" and "who did what" - they used to be two nav
+// destinations, which made each feel thinner than it is.
+type Tab = "spend" | "audit";
+
+export default function ActivityPage() {
+  const [tab, setTab] = useState<Tab>("spend");
+
+  // Deep link: /history?tab=audit (used by the old /agents URL's redirect).
+  // Read on the client only - the static export prerenders without a query.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("tab") === "audit") {
+      setTab("audit");
+    }
+  }, []);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex overflow-hidden rounded border border-zinc-300 text-xs self-start w-fit">
+        {(
+          [
+            ["spend", "Spend"],
+            ["audit", "Audit trail"],
+          ] as [Tab, string][]
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
+            className={`px-4 py-1.5 ${
+              tab === key
+                ? "bg-zinc-900 text-white"
+                : "text-zinc-600 hover:bg-zinc-50"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "spend" ? <SpendLedger /> : <AuditLog />}
+    </div>
+  );
+}
+
 // Launch history straight from SQLite, with cost = rate x billable runtime.
 // Billing runs from launch acceptance to termination; running launches show
 // a live, still-growing cost. Each row expands to a post-run utilization
 // verdict (peak VRAM, avg util) with an advisory right-size hint.
-export default function HistoryPage() {
+function SpendLedger() {
   const { data: launches, error } = usePolling(() => api.launches(), 5000);
 
   const rows = launches ?? [];

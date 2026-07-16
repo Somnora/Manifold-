@@ -66,7 +66,10 @@ class LaunchPolicy:
     backoff_base_seconds: float = 5.0
     backoff_max_seconds: float = 120.0
     fallback_instance_types: tuple[str, ...] = ()
-    boot_timeout_seconds: float = 900.0
+    # SXM4/large multi-GPU instances routinely take 15-30+ minutes to reach
+    # 'active' on Lambda's side. 900s (15 min) failed real launches that were
+    # still booting; 2400s (40 min) is the observed ceiling with headroom.
+    boot_timeout_seconds: float = 2400.0
     boot_poll_seconds: float = 10.0
 
 
@@ -93,6 +96,13 @@ class SSHSettings:
 @dataclass(frozen=True)
 class TaskSettings:
     poll_seconds: float = 1.0
+    # First-job GPU preflight: on A100 SXM boxes CUDA cannot initialize
+    # until nvidia-fabricmanager finishes starting - minutes after boot,
+    # while nvidia-smi already looks healthy. The dispatcher probes until
+    # the fabric state is settled (bounded by the timeout, then dispatches
+    # anyway) instead of burning billed minutes on a doomed container.
+    gpu_ready_timeout_seconds: float = 180.0
+    gpu_ready_poll_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -162,6 +172,11 @@ class HubSettings:
     cli_brains: tuple[str, ...] = ("claude", "codex", "gemini")
     # The in-dashboard terminal on THIS machine (loopback + origin-checked).
     local_terminal: bool = True
+    # How long a terminal session whose browser tab went away (refresh,
+    # freeze, crash) keeps its shell alive waiting for a reattach. A refresh
+    # reattaches in seconds; a tab closed for good never does, and its shell
+    # is reaped after this window instead of leaking.
+    terminal_grace_seconds: float = 900.0
 
 
 @dataclass(frozen=True)
@@ -285,11 +300,15 @@ def load_settings(
             backoff_base_seconds=float(launch.get("backoff_base_seconds", 5)),
             backoff_max_seconds=float(launch.get("backoff_max_seconds", 120)),
             fallback_instance_types=tuple(launch.get("fallback_instance_types") or ()),
-            boot_timeout_seconds=float(launch.get("boot_timeout_seconds", 900)),
+            boot_timeout_seconds=float(launch.get("boot_timeout_seconds", 2400)),
             boot_poll_seconds=float(launch.get("boot_poll_seconds", 10)),
         ),
         tasks=TaskSettings(
             poll_seconds=float(tasks.get("poll_seconds", 1.0)),
+            gpu_ready_timeout_seconds=float(
+                tasks.get("gpu_ready_timeout_seconds", 180)),
+            gpu_ready_poll_seconds=float(
+                tasks.get("gpu_ready_poll_seconds", 10)),
         ),
         idle=IdleSettings(
             timeout_seconds=float(idle.get("timeout_seconds", 1800)),
@@ -323,6 +342,8 @@ def load_settings(
                 str(n) for n in hub.get("cli_brains") or []
             ) or ("claude", "codex", "gemini"),
             local_terminal=bool(hub.get("local_terminal", True)),
+            terminal_grace_seconds=float(
+                hub.get("terminal_grace_seconds", 900)),
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),

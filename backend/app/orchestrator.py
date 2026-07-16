@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -53,7 +54,13 @@ from .connections import (
     backoff_delay,
 )
 from .db import Database, utcnow
-from .lambda_api import InstanceInfo, LambdaAPIError, LambdaClient
+from .lambda_api import (
+    FilesystemInfo,
+    InstanceInfo,
+    InstanceTypeInfo,
+    LambdaAPIError,
+    LambdaClient,
+)
 from .model_client import ModelClient, RealModelClient
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 
@@ -109,6 +116,134 @@ class LaunchPlan:
     types_to_try: list[str]          # requested type first, then fallbacks
     prices: dict[str, int]           # cents/hour per candidate type
     name: str
+
+
+# A launch a poller can stop watching: nothing further will change on its own.
+SETTLED_LAUNCH_STATUSES = frozenset({"active", "failed", "terminated"})
+
+# Coarse, stable phase label + one-line human summary for each launch status,
+# so a client shows a real step (and, while booting, a countdown) instead of
+# an empty error string.
+_LAUNCH_PHASES = {
+    "launching": ("requesting_capacity",
+                  "Asking Lambda for a matching instance"),
+    "retrying":  ("retrying_capacity",
+                  "No capacity yet; backing off and retrying"),
+    "booting":   ("waiting_for_active",
+                  "Instance created; waiting for it to boot and get an IP"),
+    "active":    ("ready", "SSH is up; the instance is ready"),
+    "failed":    ("failed", "Launch did not complete"),
+    "terminated": ("terminated", "Instance has been terminated"),
+}
+
+
+def launch_progress(launch: dict, boot_timeout_seconds: float,
+                    now_iso: str) -> dict:
+    """Return `launch` enriched with structured progress fields.
+
+    Pure (the caller supplies `now_iso`): `phase` is a stable machine label,
+    `phase_detail` a one-line human summary, and `settled` tells a poller it
+    can stop. While booting we add `boot_elapsed_seconds` / `boot_timeout_
+    seconds` / `boot_remaining_seconds` so a client renders a countdown rather
+    than a blank.
+    """
+    status = launch.get("status", "")
+    phase, detail = _LAUNCH_PHASES.get(status, (status or "unknown", ""))
+    enriched = dict(launch)
+    enriched["phase"] = phase
+    enriched["settled"] = status in SETTLED_LAUNCH_STATUSES
+    if status == "booting" and launch.get("launched_at"):
+        try:
+            elapsed = (datetime.fromisoformat(now_iso)
+                       - datetime.fromisoformat(launch["launched_at"])
+                       ).total_seconds()
+        except ValueError:
+            elapsed = None
+        if elapsed is not None:
+            elapsed = max(0.0, elapsed)
+            remaining = max(0.0, boot_timeout_seconds - elapsed)
+            enriched["boot_elapsed_seconds"] = round(elapsed)
+            enriched["boot_timeout_seconds"] = round(boot_timeout_seconds)
+            enriched["boot_remaining_seconds"] = round(remaining)
+            inst = launch.get("lambda_instance_id") or "instance"
+            detail = (f"{inst} booting; waited {round(elapsed)}s of "
+                      f"{round(boot_timeout_seconds)}s "
+                      f"(~{round(remaining)}s left before timeout)")
+    enriched["phase_detail"] = detail
+    return enriched
+
+
+def launch_options(
+    instance_types: dict[str, InstanceTypeInfo],
+    filesystems: list[FilesystemInfo],
+) -> dict:
+    """Cross-reference the live catalog with the user's filesystems into a
+    ranked list of launchable targets. Pure — no I/O.
+
+    A launch must name a (type, region, filesystem) that all line up: the type
+    needs current capacity in that region, and Lambda filesystems are
+    region-locked, so a persistent launch can only use a filesystem that lives
+    in the launch's region. Guessing a region blind is how a launch hits
+    "no capacity" or a region-mismatch rejection. Each returned target is a
+    combination Lambda can actually satisfy right now, so a caller can pick the
+    top one instead of guessing.
+
+    Ranking puts the targets the user most likely wants first:
+      1. co-located with EXISTING data (a filesystem with bytes_used > 0 in
+         that region) — keeps a job next to the files it reads/writes;
+      2. co-located with an empty filesystem in that region;
+      3. scratch-only (capacity, but no filesystem there — everything is
+         ephemeral);
+    and within each band, cheaper first. `unavailable` lists types with zero
+    regions reporting capacity right now.
+    """
+    fs_by_region: dict[str, list[FilesystemInfo]] = {}
+    for fs in filesystems:
+        fs_by_region.setdefault(fs.region, []).append(fs)
+
+    targets: list[dict] = []
+    unavailable: list[str] = []
+    for name, t in instance_types.items():
+        if not t.regions_with_capacity:
+            unavailable.append(name)
+            continue
+        price = t.price_cents_per_hour / 100
+        for region in t.regions_with_capacity:
+            here = fs_by_region.get(region, [])
+            if here:
+                # Most-populated filesystem first, so "where my data is" wins.
+                for fs in sorted(here, key=lambda f: -f.bytes_used):
+                    targets.append({
+                        "instance_type": name,
+                        "gpu": t.gpu_description,
+                        "price_usd_per_hour": price,
+                        "region": region,
+                        "filesystem": fs.name,
+                        "filesystem_bytes_used": fs.bytes_used,
+                        "colocated": True,
+                    })
+            else:
+                targets.append({
+                    "instance_type": name,
+                    "gpu": t.gpu_description,
+                    "price_usd_per_hour": price,
+                    "region": region,
+                    "filesystem": None,
+                    "filesystem_bytes_used": 0,
+                    "colocated": False,
+                })
+
+    def rank(o: dict) -> tuple:
+        return (
+            not o["colocated"],                 # co-located first
+            o["filesystem_bytes_used"] == 0,    # existing data before empty
+            o["price_usd_per_hour"],            # then cheaper
+            o["instance_type"],
+            o["region"],
+        )
+
+    targets.sort(key=rank)
+    return {"targets": targets, "unavailable": sorted(unavailable)}
 
 
 class Orchestrator:
@@ -180,22 +315,32 @@ class Orchestrator:
                 f"Valid types: {', '.join(sorted(types))}",
             )
 
-        filesystems = {fs.name: fs for fs in await self.client.list_filesystems()}
-        if filesystem not in filesystems:
-            raise LaunchRejected(
-                400,
-                f"Unknown filesystem '{filesystem}'. "
-                f"Available: {', '.join(sorted(filesystems)) or '(none)'}",
-            )
-        fs = filesystems[filesystem]
-        if fs.region != region:
-            raise LaunchRejected(
-                400,
-                f"Region mismatch: filesystem '{filesystem}' lives in "
-                f"{fs.region} but the launch requests {region}. Lambda "
-                f"filesystems are region-locked and can only be attached at "
-                f"launch — launch in {fs.region} instead.",
-            )
+        # Filesystem is OPTIONAL (Phase 39): "" launches a scratch-only
+        # instance in any region, including ones where the user has no
+        # filesystem. Everything on it is ephemeral - jobs that mount
+        # {persistent} refuse to run, sync has nowhere to go, and the
+        # termination rescue can only save files by downloading them here.
+        # The launch form says all of this before the user clicks.
+        if filesystem:
+            filesystems = {fs.name: fs
+                           for fs in await self.client.list_filesystems()}
+            if filesystem not in filesystems:
+                raise LaunchRejected(
+                    400,
+                    f"Unknown filesystem '{filesystem}'. "
+                    f"Available: {', '.join(sorted(filesystems)) or '(none)'}"
+                    f" - or launch without one (scratch only).",
+                )
+            fs = filesystems[filesystem]
+            if fs.region != region:
+                raise LaunchRejected(
+                    400,
+                    f"Region mismatch: filesystem '{filesystem}' lives in "
+                    f"{fs.region} but the launch requests {region}. Lambda "
+                    f"filesystems are region-locked and can only be attached "
+                    f"at launch — launch in {fs.region} instead, or launch "
+                    f"without a filesystem (scratch only).",
+                )
 
         # SSH key: per-launch choice wins, config.yaml is the fallback. The
         # name must be registered with Lambda or the launch call would fail
@@ -222,18 +367,27 @@ class Orchestrator:
         # snapshot (two quick launches both seeing "0 running").
         running = [i for i in await self.client.list_instances(fresh=True)
                    if i.is_running]
-        limit = self.settings.guardrails.max_concurrent_instances
+        # The NUMBERS come from Settings when the user set them there
+        # (preferences.guardrails; 0 = unset), falling back to config.yaml.
+        # The guards themselves never move out of this function.
+        prefs_guard = self.prefs.get().guardrails if self.prefs else None
+        limit = (prefs_guard.max_concurrent_instances
+                 if prefs_guard and prefs_guard.max_concurrent_instances > 0
+                 else self.settings.guardrails.max_concurrent_instances)
         if len(running) + 1 > limit:
             raise LaunchRejected(
                 409,
                 f"Concurrency guard: {len(running)} instance(s) already "
                 f"running, limit is {limit}. Terminate one first or raise "
-                f"guardrails.max_concurrent_instances in config.yaml.",
+                f"the limit under Settings -> Spending guardrails.",
                 reason_code="concurrency",
             )
 
         current_spend = sum(i.hourly_rate_cents for i in running)
-        budget_cents = round(self.settings.guardrails.max_hourly_spend_usd * 100)
+        budget_usd = (prefs_guard.max_hourly_spend_usd
+                      if prefs_guard and prefs_guard.max_hourly_spend_usd > 0
+                      else self.settings.guardrails.max_hourly_spend_usd)
+        budget_cents = round(budget_usd * 100)
         price = types[instance_type].price_cents_per_hour
         if current_spend + price > budget_cents:
             raise LaunchRejected(
@@ -242,7 +396,7 @@ class Orchestrator:
                 f"(${price / 100:.2f}/hr) would bring hourly spend to "
                 f"${(current_spend + price) / 100:.2f}, over the "
                 f"${budget_cents / 100:.2f} limit "
-                f"(guardrails.max_hourly_spend_usd in config.yaml).",
+                f"(Settings -> Spending guardrails).",
                 reason_code="budget",
             )
 
@@ -559,6 +713,9 @@ class Orchestrator:
                 )
 
         result = []
+        # User display names overlay Lambda's launch-time names (which
+        # cannot be changed after launch).
+        aliases = self.db.instance_names()
         for inst in listed:
             if inst.status in gone_statuses:
                 continue   # Lambda can report these for a while; not a card
@@ -566,7 +723,7 @@ class Orchestrator:
             launch = self.db.find_launch_by_instance(inst.id)
             result.append({
                 "id": inst.id,
-                "name": inst.name,
+                "name": aliases.get(inst.id) or inst.name,
                 "status": inst.status,
                 "ip": inst.ip,
                 "region": inst.region,
@@ -639,7 +796,8 @@ class Orchestrator:
                         instance_type=candidate,
                         region=plan.region,
                         ssh_key_names=[plan.ssh_key_name],
-                        filesystem_names=[plan.filesystem],
+                        filesystem_names=(
+                            [plan.filesystem] if plan.filesystem else []),
                         name=plan.name,
                         user_data=build_user_data(
                             # Only a tailscale-mode launch carries the key.
@@ -683,13 +841,38 @@ class Orchestrator:
                     round_no, policy.backoff_base_seconds, policy.backoff_max_seconds
                 )
                 await asyncio.sleep(delay)
+        hint = await self._capacity_hint(plan)
         self.db.update_launch(
             plan.launch_id, status="failed",
             error=f"No capacity after {attempts} attempts across "
                   f"{', '.join(plan.types_to_try)} in {plan.region}. "
-                  f"Try again later or add fallback types in config.yaml.",
+                  + (hint or "Try again later, launch in another region, or "
+                             "add fallback types in config.yaml."),
         )
         return None
+
+    async def _capacity_hint(self, plan: "LaunchPlan") -> str:
+        """Best-effort: name where the requested types DO have capacity right
+        now, so the failure is actionable instead of a dead end. Never masks
+        the real failure — any catalog error just yields no hint."""
+        try:
+            types = await self.client.list_instance_types()
+        except Exception:
+            return ""
+        elsewhere: list[str] = []
+        for name in plan.types_to_try:
+            info = types.get(name)
+            regions = [r for r in (info.regions_with_capacity if info else [])
+                       if r != plan.region]
+            if regions:
+                elsewhere.append(f"{name} in {', '.join(sorted(regions))}")
+        if not elsewhere:
+            return ("None of those types have capacity in any region right "
+                    "now — try again later.")
+        return ("Available right now: " + "; ".join(elsewhere)
+                + ". Relaunch there (a persistent filesystem must be in the "
+                  "same region), or call list-launch-options for co-located "
+                  "targets.")
 
     async def _wait_until_active(
         self, plan: LaunchPlan, instance_id: str
@@ -787,6 +970,97 @@ class Orchestrator:
             )
         return adopted
 
+    async def resume_pending_launches(self) -> int:
+        """Pick back up launches left mid-boot by a backend restart (--reload).
+
+        A launch in 'booting' has a real instance on Lambda, but the in-memory
+        boot-waiter died with the old process. Without this, the instance boots
+        to 'active' and nothing dials SSH or closes out the launch: it hangs in
+        'booting' forever while it bills. We re-attach - instances that adopt
+        already reconnected are marked ready; ones still booting get a fresh
+        wait-then-connect task (a fresh timeout window, so a restart never
+        shortens a genuine boot). Best-effort; never blocks startup. Call it
+        AFTER adopt_running_instances so already-active launches are settled,
+        not re-dialed.
+        """
+        resumed = 0
+        for launch in self.db.list_launches():
+            if launch["status"] != "booting":
+                continue
+            if launch["id"] in self._launch_tasks:
+                continue  # its waiter is already running in this process
+            instance_id = launch.get("lambda_instance_id")
+            if not instance_id:
+                # 'booting' with no instance id shouldn't happen in normal
+                # flow; fail it rather than leave a zombie that never settles.
+                self.db.update_launch(
+                    launch["id"], status="failed",
+                    error="launch was interrupted before an instance id was "
+                          "recorded; nothing to resume",
+                )
+                continue
+            if instance_id in self.connections:
+                # adopt_running_instances already reconnected this one, so the
+                # boot finished during the downtime; just close the record.
+                self.db.update_launch(
+                    launch["id"], status="active", active_at=utcnow())
+                resumed += 1
+                continue
+            plan = self._plan_from_launch(launch)
+            if plan is None:
+                continue
+            self._launch_tasks[launch["id"]] = asyncio.create_task(
+                self._resume_launch(plan, instance_id))
+            resumed += 1
+        if resumed:
+            self.db.record_audit(
+                "backend", "resume_pending_launches",
+                f"resumed {resumed} launch(es) left mid-boot by a restart",
+            )
+        return resumed
+
+    def _plan_from_launch(self, launch: dict) -> LaunchPlan | None:
+        """Reconstruct the minimal LaunchPlan needed to resume a boot wait.
+
+        The instance is already created, so the launch-time fields (ssh key,
+        fallback candidates, prices) no longer matter; only launch_id and
+        connection_mode drive the wait-then-connect tail.
+        """
+        mode = launch.get("connection_mode") or self.settings.default_connection_mode
+        if mode not in self.managers:
+            logger.warning("cannot resume launch %s: unknown connection mode %r",
+                           launch["id"], mode)
+            return None
+        launched_type = (launch.get("launched_type")
+                         or launch.get("requested_type") or "")
+        return LaunchPlan(
+            launch_id=launch["id"],
+            region=launch.get("region") or "",
+            filesystem=launch.get("filesystem") or "",
+            connection_mode=mode,
+            ssh_key_name="",   # already used at launch; unused by the tail
+            types_to_try=[launched_type] if launched_type else [],
+            prices={},
+            name=launch.get("requested_type") or launch["id"],
+        )
+
+    async def _resume_launch(self, plan: LaunchPlan, instance_id: str) -> None:
+        """The tail of _run_launch (wait for active, then connect), run on its
+        own after a restart to finish an interrupted boot."""
+        try:
+            instance = await self._wait_until_active(plan, instance_id)
+            if instance is None:
+                return
+            await self._establish_connection(plan, instance)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("resume of launch %s crashed", plan.launch_id)
+            self.db.update_launch(
+                plan.launch_id, status="failed",
+                error=f"internal error during resume: {exc}",
+            )
+
     # -- test/introspection helpers ----------------------------------------------
 
     async def wait_for_launch(self, launch_id: str, timeout: float = 10.0) -> dict:
@@ -798,6 +1072,31 @@ class Orchestrator:
         if task is not None:
             await asyncio.wait_for(asyncio.shield(task), timeout)
         return self.db.get_launch(launch_id)
+
+    async def wait_until_settled(
+        self, launch_id: str, timeout: float, poll: float = 2.0
+    ) -> dict | None:
+        """Block up to `timeout` seconds until a launch settles (active,
+        failed, or terminated), then return its record; return the current
+        record if the window elapses first, or None if the id is unknown.
+
+        Polls the DB rather than an in-memory task, so it also serves launches
+        resumed after a restart. This is the server-side long-poll behind the
+        MCP wait tool: one blocking call replaces dozens of get_launch_status
+        round-trips (and the tokens they burn) while a slow SXM4 instance boots.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while True:
+            launch = self.db.get_launch(launch_id)
+            if launch is None:
+                return None
+            if launch["status"] in SETTLED_LAUNCH_STATUSES:
+                return launch
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return launch
+            await asyncio.sleep(min(poll, remaining))
 
     def connection_state(self, instance_id: str) -> ConnectionState | None:
         conn = self.connections.get(instance_id)

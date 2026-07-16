@@ -15,13 +15,20 @@ import {
 // files when a GPU is torn down.
 export function PolicySettings() {
   const [prefs, setPrefs] = useState<Preferences | null>(null);
+  const [defaults, setDefaults] = useState<{
+    max_concurrent_instances: number;
+    max_hourly_spend_usd: number;
+  } | null>(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     api
       .preferences()
-      .then((r) => setPrefs(r.preferences))
+      .then((r) => {
+        setPrefs(r.preferences);
+        setDefaults(r.guardrail_defaults);
+      })
       .catch((err) =>
         setError(err instanceof ApiError ? err.message : String(err)),
       );
@@ -35,6 +42,7 @@ export function PolicySettings() {
       approvals: { ...prefs.approvals, ...patch.approvals },
       notifications: { ...prefs.notifications, ...patch.notifications },
       data_safety: { ...prefs.data_safety, ...patch.data_safety },
+      guardrails: { ...prefs.guardrails, ...patch.guardrails },
     };
     setPrefs(optimistic);
     setError("");
@@ -66,6 +74,67 @@ export function PolicySettings() {
           {error}
         </p>
       )}
+
+      {/* -- spending guardrails --------------------------------------------- */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4">
+        <SectionHead title="Spending guardrails" note={saved ? "saved" : ""} />
+        <p className="mt-1 text-xs text-zinc-500">
+          Hard limits every launch is checked against - yours, an agent&apos;s,
+          or Autopilot&apos;s. A launch over either limit is refused outright,
+          never queued. Blank uses the config.yaml default.
+        </p>
+
+        <div className="mt-3 flex flex-wrap gap-6">
+          <label className="block text-xs font-medium text-zinc-600">
+            Max instances at once
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={prefs.guardrails.max_concurrent_instances || ""}
+              placeholder={String(defaults?.max_concurrent_instances ?? 1)}
+              onChange={(e) =>
+                save({
+                  guardrails: {
+                    max_concurrent_instances: Math.max(
+                      0,
+                      Math.floor(Number(e.target.value) || 0),
+                    ),
+                  },
+                })
+              }
+              className="mt-1 block w-28 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+            />
+          </label>
+          <label className="block text-xs font-medium text-zinc-600">
+            Max hourly spend (USD)
+            <input
+              type="number"
+              min={0}
+              step={0.5}
+              value={prefs.guardrails.max_hourly_spend_usd || ""}
+              placeholder={String(defaults?.max_hourly_spend_usd ?? 4)}
+              onChange={(e) =>
+                save({
+                  guardrails: {
+                    max_hourly_spend_usd: Math.max(
+                      0,
+                      Number(e.target.value) || 0,
+                    ),
+                  },
+                })
+              }
+              className="mt-1 block w-28 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+            />
+          </label>
+        </div>
+        {prefs.guardrails.max_concurrent_instances > 4 && (
+          <p className="mt-2 rounded border border-amber-300/40 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+            {prefs.guardrails.max_concurrent_instances} simultaneous instances
+            can bill fast - the burn chip in the header shows the live total.
+          </p>
+        )}
+      </section>
 
       {/* -- approvals ------------------------------------------------------ */}
       <section className="rounded-lg border border-zinc-200 bg-white p-4">

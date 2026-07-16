@@ -219,6 +219,90 @@ def test_fs_delete_file_and_dir(tmp_path):
     assert not (nfs / "keep.txt").exists()
 
 
+def test_fs_delete_falls_back_to_sudo_when_unlink_is_denied(tmp_path, monkeypatch):
+    # Job outputs are root-owned; the ubuntu sidecar's plain remove is denied.
+    nfs = tmp_path / "nfs" / "outputs"
+    (nfs / "job-out").mkdir(parents=True)
+    (nfs / "job-out" / "model.bin").write_bytes(b"x")
+
+    def denied(*a, **k):
+        raise PermissionError("Operation not permitted")
+    monkeypatch.setattr(sidecar.shutil, "rmtree", denied)
+
+    calls = {}
+
+    def fake_run(argv, **k):
+        calls["argv"] = argv
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+    monkeypatch.setattr(sidecar.subprocess, "run", fake_run)
+
+    client = make_client(tmp_path)
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "outputs/job-out", "recursive": True,
+    })
+    assert resp.status_code == 200
+    # Escalated via a jail-confined, shell-free sudo rm.
+    assert calls["argv"][:4] == ["sudo", "-n", "rm", "-rf"]
+    assert calls["argv"][-2] == "--"                       # stops option parsing
+    assert calls["argv"][-1] == str((nfs / "job-out").resolve())
+
+
+def test_fs_delete_reports_when_even_sudo_cannot_remove(tmp_path, monkeypatch):
+    nfs = tmp_path / "nfs" / "outputs"
+    (nfs / "stuck").mkdir(parents=True)
+    monkeypatch.setattr(sidecar.shutil, "rmtree",
+                        lambda *a, **k: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(sidecar.subprocess, "run",
+                        lambda *a, **k: type("R", (), {
+                            "returncode": 1, "stderr": "rm: cannot remove"})())
+    client = make_client(tmp_path)
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "outputs/stuck", "recursive": True,
+    })
+    assert resp.status_code == 500
+    assert "elevated privileges" in resp.json()["detail"]
+
+
+def test_fs_delete_explains_nfs_busy_instead_of_directory_not_empty(
+        tmp_path, monkeypatch):
+    # Real case: a running job holds the HF cache open, NFS leaves hidden
+    # .nfs* placeholders, and rm reports a baffling "Directory not empty".
+    nfs = tmp_path / "nfs" / "cache"
+    nfs.mkdir(parents=True)
+    monkeypatch.setattr(sidecar.shutil, "rmtree",
+                        lambda *a, **k: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(sidecar.subprocess, "run",
+                        lambda *a, **k: type("R", (), {
+                            "returncode": 1,
+                            "stderr": "rm: cannot remove "
+                                      "'/lambda/nfs/x/cache/xet/logs': "
+                                      "Directory not empty"})())
+    client = make_client(tmp_path)
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "cache", "recursive": True,
+    })
+    assert resp.status_code == 409                 # a conflict, not a crash
+    detail = resp.json()["detail"]
+    assert "still has these files open" in detail  # says what's really wrong
+    assert "Stop the job" in detail                # and what to do about it
+
+
+def test_fs_delete_busy_hint_on_the_unprivileged_path(tmp_path, monkeypatch):
+    # Same shape when the plain remove (not sudo) hits it: OSError, not
+    # PermissionError, so it must not escape as a generic 500.
+    (tmp_path / "nfs" / "cache").mkdir(parents=True)
+    monkeypatch.setattr(
+        sidecar.shutil, "rmtree",
+        lambda *a, **k: (_ for _ in ()).throw(
+            OSError("[Errno 39] Directory not empty: 'xet/logs'")))
+    client = make_client(tmp_path)
+    resp = client.post("/fs/delete", json={
+        "root_name": "persistent", "path": "cache", "recursive": True,
+    })
+    assert resp.status_code == 409
+    assert "still has these files open" in resp.json()["detail"]
+
+
 def test_fs_delete_refuses_roots_and_escapes(tmp_path):
     (tmp_path / "nfs").mkdir()
     (tmp_path / "ephemeral").mkdir()

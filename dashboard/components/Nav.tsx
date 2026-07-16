@@ -3,21 +3,22 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-// Grouped by frequency of use: everyday driving · agent surfaces ·
+// Grouped by frequency of use: everyday driving · the agent surface ·
 // occasional reference. A thin divider separates each cluster.
+//
+// Phase 38 consolidation: Hub merged into Autopilot (brains + approvals live
+// where runs start; the local terminal became the header drawer), and Agent
+// Activity merged into History as the Activity page's audit tab. Old URLs
+// still work via redirect stubs.
 const groups = [
   [
     { href: "/", label: "Instances" },
     { href: "/jobs", label: "Jobs" },
     { href: "/storage", label: "Storage" },
   ],
+  [{ href: "/autopilot", label: "Autopilot" }],
   [
-    { href: "/hub", label: "Hub" },
-    { href: "/autopilot", label: "Autopilot" },
-    { href: "/agents", label: "Agent Activity" },
-  ],
-  [
-    { href: "/history", label: "History" },
+    { href: "/history", label: "Activity" },
     { href: "/settings", label: "Settings" },
   ],
 ];

@@ -17,6 +17,7 @@ Config: MANIFOLD_API_URL (default http://localhost:8000).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -30,8 +31,10 @@ mcp = FastMCP(
     instructions=(
         "Manifold orchestrates Lambda Cloud GPU instances through a guarded "
         "local backend. Launches are asynchronous: launch_gpu returns a "
-        "launch id immediately; poll get_launch_status until status is "
-        "'active' or 'failed'. Termination may be blocked by a safety hook "
+        "launch id immediately; then call wait_for_launch to block until it is "
+        "'active' or 'failed' (one call, not a poll loop - large GPU instances "
+        "can take 15-40 min to boot), or get_launch_status for a single "
+        "snapshot. Termination may be blocked by a safety hook "
         "if unsaved files exist on the instance; sync_outputs saves them. "
         "Pass a short `note` with each call saying why — it lands in the "
         "audit log the user reviews."
@@ -70,16 +73,39 @@ async def _call(
     args: dict[str, Any] | None = None,
     body: dict | None = None,
     params: dict | None = None,
+    request_timeout: float | None = None,
 ) -> dict:
     """One guarded backend call + its audit entry. Backend rejections come
     back as {"error": <the backend's own message>} so the agent sees the
-    same truth a human sees in the dashboard."""
+    same truth a human sees in the dashboard. Transport failures (backend
+    down or restarting) additionally carry `unreachable: true`, so a caller
+    can tell "the backend said no" from "the backend didn't answer".
+
+    `request_timeout` overrides the client's default 60s ceiling for calls
+    that legitimately hold the socket longer (the wait_for_launch long-poll
+    parks server-side for up to 300s)."""
     args = args or {}
     try:
-        resp = await _http().request(method, path, json=body, params=params)
-        payload = resp.json() if resp.content else {}
+        resp = await _http().request(
+            method, path, json=body, params=params,
+            **({"timeout": request_timeout} if request_timeout else {}),
+        )
+        # A healthy backend answers JSON. A 500 that escaped the route,
+        # though, is a Starlette plain-text "Internal Server Error" page —
+        # calling .json() on that raises a cryptic "Expecting value" decode
+        # error that would surface to the agent instead of the real status.
+        # Fall back to the body text so the status-code branch below can
+        # report something actionable.
+        try:
+            payload = resp.json() if resp.content else {}
+        except ValueError:
+            payload = {"detail": (resp.text or "").strip()[:300]
+                       or f"HTTP {resp.status_code} (non-JSON response)"}
     except httpx.HTTPError as exc:
-        result = {"error": f"Manifold backend unreachable at {API_URL}: {exc}"}
+        result = {
+            "error": f"Manifold backend unreachable at {API_URL}: {exc}",
+            "unreachable": True,
+        }
         await _audit(tool, args, note, result["error"])
         return result
     if resp.status_code >= 400:
@@ -98,6 +124,31 @@ async def _call(
 
 
 @mcp.tool()
+async def list_launch_options(note: str = "") -> dict:
+    """Launchable {instance_type, region, filesystem} targets Lambda can
+    satisfy RIGHT NOW, ranked best-first. CALL THIS BEFORE launch_gpu: it is
+    the only way to see which instance types have capacity in which regions,
+    and it keeps you from guessing a region that has no capacity or no
+    filesystem.
+
+    A launch needs the three to line up — the type must have capacity in the
+    region, and a persistent filesystem is region-locked, so it can only be
+    used from its own region. Each returned target is a combination that lines
+    up, so you can copy one straight into launch_gpu.
+
+    `targets` is ranked: co-located with your EXISTING data first (a filesystem
+    that already holds files, so a job runs next to what it reads/writes), then
+    co-located with an empty filesystem, then scratch-only (capacity but no
+    filesystem there — everything on it is ephemeral), and cheaper first within
+    each band. A target's `filesystem` is null for a scratch-only launch; pass
+    "" as launch_gpu's filesystem for those. `unavailable` lists types with no
+    capacity anywhere right now (retry later or pick another from `targets`)."""
+    return await _call(
+        "list_launch_options", "GET", "/launch-options", note=note,
+    )
+
+
+@mcp.tool()
 async def launch_gpu(
     instance_type: str,
     region: str,
@@ -108,7 +159,12 @@ async def launch_gpu(
     """Launch a GPU instance. Flows through ALL backend guards (budget,
     concurrency, region-filesystem match); a rejection returns the guard's
     message in `error`. Returns a launch record — poll get_launch_status
-    with its `id` until status is 'active' (SSH up) or 'failed'."""
+    with its `id` until status is 'active' (SSH up) or 'failed'.
+
+    Call list_launch_options FIRST and pass one of its targets: it returns
+    only {type, region, filesystem} combinations that have capacity right now
+    and are co-located with your data, which avoids a blind region guess that
+    fails on capacity or a region-filesystem mismatch."""
     body = {
         "instance_type": instance_type,
         "region": region,
@@ -125,11 +181,61 @@ async def launch_gpu(
 @mcp.tool()
 async def get_launch_status(launch_id: str, note: str = "") -> dict:
     """Progress of an asynchronous launch: launching -> retrying (capacity)
-    -> booting -> active | failed, with attempts and error detail."""
+    -> booting -> active | failed. Returns a stable `phase`
+    (requesting_capacity | retrying_capacity | waiting_for_active | ready |
+    failed | terminated), a human `phase_detail`, and `settled` (true once
+    nothing more will change). While booting it also returns
+    boot_elapsed_seconds / boot_timeout_seconds / boot_remaining_seconds.
+    For a slow boot, prefer wait_for_launch: one blocking call instead of a
+    poll loop."""
     return await _call(
         "get_launch_status", "GET", f"/launches/{launch_id}",
         note=note, args={"launch_id": launch_id},
     )
+
+
+@mcp.tool()
+async def wait_for_launch(launch_id: str, timeout: float = 120,
+                          note: str = "") -> dict:
+    """Block until a launch settles (active | failed | terminated) or up to
+    `timeout` seconds (max 300) pass, then return the same enriched record as
+    get_launch_status. This is the efficient way to await a slow SXM4 boot:
+    ONE call parks server-side instead of dozens of get_launch_status polls.
+    If it returns still booting (settled=false), the instance is fine - just
+    call again to keep waiting. A backend restart mid-wait (dev --reload) is
+    absorbed: the wait reconnects and keeps parking; the launch itself is
+    resumed by the backend and keeps booting either way."""
+    timeout = max(1.0, min(float(timeout), 300.0))
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = max(1.0, deadline - loop.time())
+        result = await _call(
+            "wait_for_launch", "GET", f"/launches/{launch_id}/wait",
+            note=note, args={"launch_id": launch_id, "timeout": timeout},
+            params={"timeout": remaining},
+            # The server parks up to `remaining`; give the socket headroom
+            # past that so a legitimate long park is not misread as death.
+            request_timeout=remaining + 15.0,
+        )
+        # A restart mid-park drops the socket. The launch is unharmed (the
+        # backend resumes it on startup), so reconnect and keep waiting
+        # instead of alarming the caller with a transport error.
+        if not result.get("unreachable"):
+            return result
+        if loop.time() >= deadline:
+            return {
+                "status": "unknown",
+                "settled": False,
+                "phase": "backend_restarting",
+                "phase_detail": (
+                    "The Manifold backend was unreachable for the whole wait "
+                    "window (it may be restarting). The launch itself is not "
+                    "affected - the backend resumes in-flight boots on "
+                    "startup. Call wait_for_launch again."
+                ),
+            }
+        await asyncio.sleep(2.0)
 
 
 @mcp.tool()
@@ -187,6 +293,51 @@ async def run_job(template: str, parameters: dict, note: str = "") -> dict:
 
 
 @mcp.tool()
+async def save_template(yaml_text: str, note: str = "") -> dict:
+    """Create or update a CUSTOM job template from raw YAML, so a workflow
+    you have proven by hand becomes a one-click recipe the user can rerun
+    from the Jobs page without any agent involved. Validated exactly like
+    bundled templates (image, command with {{param}} placeholders, parameter
+    schema; volume mounts only under /workspace/ephemeral or {persistent};
+    ports always loopback-bound). Returns the parsed template or the
+    validation error. Prefer parameterizing over hardcoding: a template with
+    good parameters serves the user forever."""
+    return await _call(
+        "save_template", "POST", "/templates/custom",
+        note=note, args={"yaml": f"({len(yaml_text)} chars)"},
+        body={"yaml": yaml_text},
+    )
+
+
+@mcp.tool()
+async def delete_template(name: str, note: str = "") -> dict:
+    """Delete a CUSTOM template by name. Bundled templates cannot be
+    deleted; if the custom one was overriding a bundled name, the bundled
+    version is restored."""
+    return await _call(
+        "delete_template", "DELETE", f"/templates/custom/{name}",
+        note=note, args={"name": name},
+    )
+
+
+@mcp.tool()
+async def run_command(instance_id: str, command: str, timeout: float = 120,
+                      note: str = "") -> dict:
+    """Run ONE shell command on the instance over the managed SSH connection
+    and return {exit_code, stdout, stderr}. Full shell parity, but audited:
+    every command lands in the user's activity log with its exit code, which
+    raw SSH would not. Bounded by `timeout` (max 600s) - long-running work
+    belongs in a job (run_job streams logs and survives backend restarts).
+    Use this for the quick real commands in between: inspecting files,
+    checking nvidia-smi, preparing directories."""
+    return await _call(
+        "run_command", "POST", f"/instances/{instance_id}/run",
+        note=note, args={"instance_id": instance_id, "command": command[:200]},
+        body={"command": command, "timeout": timeout},
+    )
+
+
+@mcp.tool()
 async def get_job_status(task_id: str, note: str = "") -> dict:
     """Job state (queued|running|succeeded|failed), exit code, and the
     persistent output paths it writes to."""
@@ -216,12 +367,61 @@ async def list_filesystems(note: str = "") -> dict:
     return await _call("list_filesystems", "GET", "/filesystems", note=note)
 
 
+async def _connected_instance_for_fs(filesystem: str | None) -> tuple | None:
+    """A connected instance that mounts `filesystem` (or any, if None), as
+    (instance_id, filesystem_name). None when nothing suitable is connected.
+    Lets file browsing ride the SSH connection with no S3 keys."""
+    listing = await _call("list_persistent_files", "GET", "/instances", note="")
+    for inst in listing.get("instances", []):
+        if inst.get("connection_state") != "connected":
+            continue
+        mounts = inst.get("filesystems") or []
+        if filesystem is None:
+            if mounts:
+                return inst["id"], mounts[0]
+        elif filesystem in mounts:
+            return inst["id"], filesystem
+    return None
+
+
 @mcp.tool()
 async def list_persistent_files(
     prefix: str = "", filesystem: str | None = None, note: str = ""
 ) -> dict:
-    """Browse persistent-filesystem files (works with no instance running).
-    If `filesystem` is omitted and exactly one exists, it is used."""
+    """Browse one directory level of a persistent filesystem.
+
+    Prefers a RUNNING instance: if one is connected and mounts the target
+    filesystem, this browses over its SSH connection (via the sidecar, at
+    local-disk speed and needing NO S3 keys) — the same path the dashboard's
+    per-instance Files panel uses. It returns {source, filesystem, root, path,
+    entries:[{name, is_dir, size_bytes, modified}]}. `prefix` is relative to
+    the filesystem, e.g. "outputs/images".
+
+    Only when no connected instance mounts the filesystem does it fall back to
+    Lambda's S3 "Files" API — which CAN browse with nothing running, but needs
+    S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY in .env and returns {filesystem,
+    files:[...]}. If `filesystem` is omitted and exactly one exists (or one
+    instance is connected), it is used."""
+    # 1) Keyless path: a connected instance that mounts this filesystem.
+    hit = await _connected_instance_for_fs(filesystem)
+    if hit is not None:
+        instance_id, fs_name = hit
+        # The sidecar's persistent root is /lambda/nfs (the filesystem's
+        # PARENT), so its first path segment is the filesystem name; prepend
+        # it to keep `prefix` filesystem-relative like the S3 path.
+        sub = "/".join(p for p in [fs_name, prefix.strip("/")] if p)
+        result = await _call(
+            "list_persistent_files", "GET",
+            f"/instances/{instance_id}/files/list",
+            note=note, args={"filesystem": fs_name, "prefix": prefix},
+            params={"root_name": "persistent", "path": sub},
+        )
+        if "error" not in result:
+            result["filesystem"] = fs_name
+            result["source"] = f"instance:{instance_id} (ssh, no S3 keys)"
+        return result
+
+    # 2) S3 fallback (needs keys; works with no instance running).
     if filesystem is None:
         listing = await _call(
             "list_persistent_files", "GET", "/filesystems", note="",
@@ -235,11 +435,18 @@ async def list_persistent_files(
                          {"prefix": prefix}, note, result["error"])
             return result
         filesystem = names[0]
-    return await _call(
+    result = await _call(
         "list_persistent_files", "GET", "/storage/files",
         note=note, args={"filesystem": filesystem, "prefix": prefix},
         params={"filesystem": filesystem, "prefix": prefix},
     )
+    # No S3 keys AND no connected instance: point at the keyless route.
+    if result.get("error") and "credential" in result["error"].lower():
+        result["hint"] = (
+            "No S3 Files keys configured. Launch or connect an instance that "
+            "mounts this filesystem, then this browses it over SSH with no keys."
+        )
+    return result
 
 
 async def _pick_instance(instance_id: str | None, tool: str, note: str,

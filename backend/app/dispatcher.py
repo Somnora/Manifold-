@@ -45,6 +45,42 @@ class ParameterError(Exception):
     """User-supplied task parameters don't satisfy the template schema."""
 
 
+# GPU-readiness probe, run on the instance before its FIRST job. `nvidia-smi
+# -q` is the one host-side signal that exposes the A100-SXM trap: the fabric
+# manager still initializing, during which nvidia-smi looks healthy but any
+# CUDA init inside a container fails with "No CUDA GPUs are available".
+GPU_PROBE_COMMAND = "nvidia-smi -q"
+
+# Fabric states that mean CUDA is (or will trivially be) initializable.
+# Anything else - "In Progress" above all - means wait.
+_FABRIC_READY_STATES = ("completed", "n/a", "not supported", "none", "")
+
+
+def gpu_readiness(exit_code: int, output: str) -> tuple[bool, str]:
+    """Interpret a GPU_PROBE_COMMAND run: (ready, human reason).
+
+    Pure, so the parsing is testable against captured nvidia-smi output.
+    Three cases:
+    - probe failed: driver isn't up yet (or nvidia-smi missing) -> not ready
+    - a Fabric section reports a non-settled State -> not ready (SXM boxes)
+    - no Fabric section (PCIe boxes) or a settled state -> ready
+    """
+    if exit_code != 0:
+        return False, "nvidia-smi not answering yet (driver still coming up)"
+    in_fabric = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Fabric"):
+            in_fabric = True
+            continue
+        if in_fabric and stripped.startswith("State"):
+            state = stripped.split(":", 1)[-1].strip().lower()
+            if state in _FABRIC_READY_STATES:
+                return True, f"fabric state: {state or 'settled'}"
+            return False, f"fabric manager still initializing (state: {state})"
+    return True, "GPU driver up (no fabric manager on this box)"
+
+
 def coerce_parameters(template: JobTemplate, values: dict) -> dict:
     """Validate user values against the template schema; apply defaults.
 
@@ -210,6 +246,11 @@ class Dispatcher:
         # weights, and load the GPU before its API answers. This tracks
         # "actually answering", probed via GET /v1/models with a TTL.
         self._readiness: dict[str, dict] = {}
+        # Instances whose GPU passed (or timed out of) the first-job CUDA
+        # preflight; later jobs skip the probe. In-memory on purpose: a
+        # backend restart re-probes once, which costs seconds and re-covers
+        # any instance that was mid-boot during the restart.
+        self._gpu_ready: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -547,6 +588,10 @@ class Dispatcher:
             self.db.record_audit("backend", "auto_manage_running",
                                  f"job {task_id} instance {instance_id}: dispatched")
         self.touch_activity(instance_id)
+        # First job on this instance: hold until CUDA is actually
+        # initializable (fabric manager on SXM boxes), instead of burning
+        # billed minutes on a container that dies with "No CUDA GPUs".
+        await self._ensure_gpu_ready(conn, instance_id, task_id)
         self.queue.append_log(task_id, f"[manifold] dispatching to {instance_id}")
         self.queue.append_log(task_id, f"[manifold] $ {docker_cmd}")
         self.db.record_audit("backend", "task_dispatch",
@@ -586,6 +631,62 @@ class Dispatcher:
             output_paths=outputs,
             error="" if exit_code == 0 else f"container exited {exit_code}",
         )
+
+    async def _ensure_gpu_ready(self, conn: ManagedConnection,
+                                instance_id: str, task_id: str) -> None:
+        """Gate the FIRST job on an instance until its GPU can really run
+        CUDA. Field case: an A100 SXM4 job dispatched 2.5 min after cloud-init
+        finished died with "No CUDA GPUs are available" - the fabric manager
+        was still initializing, invisibly to every nvidia-smi hand-check.
+
+        Fail-open by design: when the window expires (or the probe itself
+        errors), dispatch anyway with an honest log line - a wrong probe must
+        never brick job dispatch, and the pre-preflight behavior is the floor.
+        Either way the instance is marked so later jobs skip the probe."""
+        if instance_id in self._gpu_ready:
+            return
+        timeout = self.settings.tasks.gpu_ready_timeout_seconds
+        poll = self.settings.tasks.gpu_ready_poll_seconds
+        deadline = self._clock() + timeout
+        waiting_logged = False
+        while True:
+            try:
+                exit_code, stdout, _ = await conn.run(GPU_PROBE_COMMAND)
+            except Exception as exc:
+                # A dead/flaky connection here will fail the job properly at
+                # dispatch; don't let the preflight be the thing that blocks.
+                self.queue.append_log(
+                    task_id,
+                    f"[manifold] GPU preflight skipped (probe error: {exc})")
+                self._gpu_ready.add(instance_id)
+                return
+            ready, reason = gpu_readiness(exit_code, stdout)
+            if ready:
+                self._gpu_ready.add(instance_id)
+                if waiting_logged:
+                    self.queue.append_log(
+                        task_id, f"[manifold] GPU ready ({reason})")
+                return
+            if self._clock() >= deadline:
+                self.queue.append_log(
+                    task_id,
+                    f"[manifold] GPU still not ready after {timeout:.0f}s "
+                    f"({reason}); dispatching anyway - if this job fails "
+                    f"with 'No CUDA GPUs are available', retry it in a few "
+                    f"minutes",
+                )
+                self._gpu_ready.add(instance_id)
+                return
+            if not waiting_logged:
+                self.queue.append_log(
+                    task_id,
+                    f"[manifold] waiting for the GPU to finish initializing "
+                    f"({reason}) - on A100 SXM boxes the fabric manager can "
+                    f"take a few minutes after boot",
+                )
+                waiting_logged = True
+            self.touch_activity(instance_id)   # waiting is not idleness
+            await asyncio.sleep(poll)
 
     async def _stream_run(self, conn: ManagedConnection, command: str,
                           task_id: str) -> tuple[int, str, str]:

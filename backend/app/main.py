@@ -36,7 +36,7 @@ from .sidecar_client import SidecarError
 
 from .config import Settings, load_settings
 from .connections import MockSSHConnection
-from .db import Database
+from .db import Database, utcnow
 from .config import update_env_file
 from .lambda_api import (
     FilesystemInfo,
@@ -52,13 +52,20 @@ from .agent import Autopilot, find_serving_task
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .notifications import NotificationCenter, os_notify
-from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
+from .orchestrator import (
+    LaunchRejected,
+    Orchestrator,
+    TerminationBlocked,
+    launch_options,
+    launch_progress,
+)
 from .preferences import GATEABLE_ACTIONS, PreferenceStore
 from .sidecar_client import MockSidecarClient
 from .image_checker import MockImageChecker, RealImageChecker
 from .storage import MockStorage, S3AdapterStorage, StorageClient
 from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
+from .terminal_sessions import TerminalSession, TerminalSessionManager
 
 logger = logging.getLogger("manifold.main")
 
@@ -109,6 +116,10 @@ class AutopilotRequest(BaseModel):
     brain: str | None = None
     brain_instance_id: str | None = None
     max_steps: int | None = Field(default=None, ge=1)
+    # True removes the step cap entirely (stored as max_steps=0): the run
+    # ends only via done/cancel/failure. Spend stays bounded by the guards
+    # and any approval gates; this only unbounds the TURN count.
+    unlimited_steps: bool = False
     # Which actions pause for a human Approve/Deny. None = use the saved
     # policy from Settings (launch-only by default). An explicit list is a
     # per-run override; [] means fully autonomous within the guards.
@@ -128,11 +139,26 @@ class PreferencesPatch(BaseModel):
     approvals: dict | None = None
     notifications: dict | None = None
     data_safety: dict | None = None
+    guardrails: dict | None = None
 
 
 class NotificationsReadRequest(BaseModel):
     # Omit to mark everything read.
     ids: list[str] | None = None
+
+
+class CustomTemplateRequest(BaseModel):
+    yaml: str = Field(min_length=20, max_length=65536)
+
+
+class RunCommandRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=8192)
+    timeout: float = Field(default=120.0, gt=0, le=600)
+
+
+class RenameRequest(BaseModel):
+    # Empty restores the Lambda launch-time name.
+    name: str = Field(default="", max_length=64)
 
 
 class ChatRequest(BaseModel):
@@ -172,6 +198,7 @@ def create_app(
     notification_sender=None,      # (title, body) -> None; tests record, mock no-ops
     env_path=None,                 # where /settings writes secrets (.env)
     templates_dir=None,
+    custom_templates_dir=None,     # user-authored templates (DATA_ROOT/custom-templates)
     mock: bool = False,
 ) -> FastAPI:
     settings = settings or load_settings()
@@ -264,9 +291,45 @@ def create_app(
     )
     storage_cache: dict[str, StorageClient] = {}
 
-    templates, template_errors = load_templates(
-        templates_dir if templates_dir is not None else RESOURCE_ROOT / "templates"
-    )
+    # Templates come from two places: the bundled set (read-only, ships with
+    # the app) and the user's own custom-templates dir (created from the Jobs
+    # page or by an agent via MCP). One shared dict is handed to the
+    # dispatcher/autopilot/brains, so reloads mutate it IN PLACE and every
+    # consumer sees new templates without a restart. User templates win name
+    # collisions - overriding a bundled template is a feature, not an error.
+    bundled_dir = (templates_dir if templates_dir is not None
+                   else RESOURCE_ROOT / "templates")
+    custom_dir = (custom_templates_dir if custom_templates_dir is not None
+                  else DATA_ROOT / "custom-templates")
+    templates: dict = {}
+    template_errors: dict = {}
+    custom_names: set[str] = set()
+
+    def reload_templates() -> None:
+        loaded, errors = load_templates(bundled_dir)
+        custom, custom_errors = load_templates(custom_dir)
+        loaded.update(custom)
+        errors.update({f"custom/{k}": v for k, v in custom_errors.items()})
+        templates.clear()
+        templates.update(loaded)
+        template_errors.clear()
+        template_errors.update(errors)
+        custom_names.clear()
+        custom_names.update(custom)
+
+    reload_templates()
+
+    def save_custom_template_text(yaml_text: str):
+        """The ONE validated path for saving a custom template, shared by
+        the Jobs-page route, the MCP tool, and the autopilot action. Raises
+        TemplateError/YAMLError with the loader's message on a bad template;
+        on success the template is on disk and live in the shared dict."""
+        from .templates import parse_template
+        template = parse_template(yaml_text, source="custom")
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        (custom_dir / f"{template.name}.yaml").write_text(yaml_text)
+        reload_templates()
+        return templates[template.name]
 
     queue = SQLiteTaskQueue(db)
     dispatcher = Dispatcher(
@@ -274,9 +337,14 @@ def create_app(
         image_checker=image_checker, notifier=notifier,
     )
     autopilot = Autopilot(settings, orchestrator, queue, templates, db,
-                          notifier=notifier)
+                          notifier=notifier,
+                          template_saver=save_custom_template_text)
     from .brains import BrainRegistry
     brains = BrainRegistry(settings, orchestrator, queue, templates)
+    # Shells outlive their WebSocket (a refresh reattaches instead of
+    # re-setting up whatever was running); see terminal_sessions.py.
+    term_sessions = TerminalSessionManager(
+        grace_seconds=settings.hub.terminal_grace_seconds)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -286,15 +354,24 @@ def create_app(
         adopted = await orchestrator.adopt_running_instances()
         if adopted:
             logger.info("reconnect-on-startup: adopted %d instance(s)", adopted)
+        # A launch left mid-boot by the restart (common under --reload) has a
+        # real instance still booting on Lambda; resume its wait so it does not
+        # hang in 'booting' forever while it bills. Runs after adopt so already-
+        # active launches are just settled, not re-dialed.
+        resumed = await orchestrator.resume_pending_launches()
+        if resumed:
+            logger.info("resumed %d launch(es) left mid-boot", resumed)
         # An agent loop is in-memory; a run left 'running' by a previous
         # process is dead. Say so instead of showing it running forever.
         orphaned = db.fail_orphaned_agent_runs()
         if orphaned:
             logger.info("marked %d orphaned autopilot run(s) failed", orphaned)
         dispatcher.start()
+        term_sessions.start()
         yield
         await autopilot.stop()
         await dispatcher.stop()
+        await term_sessions.stop()
         await orchestrator.shutdown()
         await lambda_client.close()
         db.close()
@@ -303,6 +380,7 @@ def create_app(
     app.state.orchestrator = orchestrator
     app.state.settings = settings
     app.state.dispatcher = dispatcher
+    app.state.terminal_sessions = term_sessions
     app.state.queue = queue
     app.state.brains = brains
     app.state.autopilot = autopilot
@@ -467,6 +545,14 @@ def create_app(
             "preferences": prefs.get().to_dict(),
             "gateable_actions": list(GATEABLE_ACTIONS),
             "notification_kinds": list(NOTIFICATION_KINDS),
+            # What the guardrails fall back to when unset (0) here - the
+            # Settings page shows these as placeholders.
+            "guardrail_defaults": {
+                "max_concurrent_instances":
+                    settings.guardrails.max_concurrent_instances,
+                "max_hourly_spend_usd":
+                    settings.guardrails.max_hourly_spend_usd,
+            },
         }
 
     @app.put("/preferences")
@@ -512,6 +598,16 @@ def create_app(
             }
             for name, t in sorted(types.items())
         }
+
+    @app.get("/launch-options")
+    async def launch_options_route():
+        """Launchable (type, region, filesystem) targets that Lambda can
+        satisfy right now, ranked so options co-located with the user's
+        existing data come first. The launch form and any agent use this to
+        pick an available, co-located target instead of guessing a region."""
+        types = await lambda_client.list_instance_types()
+        filesystems = await lambda_client.list_filesystems()
+        return launch_options(types, filesystems)
 
     @app.get("/regions")
     async def list_regions():
@@ -575,6 +671,16 @@ def create_app(
         """Switch idle auto-termination off (enabled=true) or back on."""
         return dispatcher.set_keep_alive(instance_id, req.enabled)
 
+    @app.post("/instances/{instance_id}/name")
+    async def rename_instance(instance_id: str, req: RenameRequest):
+        """Set the display name Manifold shows for this instance. Lambda
+        fixes the real name at launch, so this is a local overlay; an empty
+        name restores Lambda's."""
+        db.set_instance_name(instance_id, req.name.strip())
+        db.record_audit("dashboard", "instance_renamed",
+                        f"{instance_id} -> {req.name.strip()!r}")
+        return {"instance_id": instance_id, "name": req.name.strip()}
+
     @app.delete("/instances/{instance_id}")
     async def terminate_instance(instance_id: str, force: bool = False):
         return await orchestrator.terminate(instance_id, force=force)
@@ -591,6 +697,40 @@ def create_app(
         you get here is exactly what a termination would do."""
         return {"rescue": await orchestrator.rescue(instance_id)}
 
+    @app.post("/instances/{instance_id}/run")
+    async def run_instance_command(instance_id: str, req: RunCommandRequest):
+        """Run one command on the instance over the managed SSH connection.
+
+        This is the SSH-parity endpoint for agents: everything a shell could
+        do, but through the guarded gateway, so every command lands in the
+        audit log with its exit code. Bounded by a hard timeout; output is
+        capped so a runaway command cannot flood the response. Long-running
+        work belongs in a job (run_job streams logs and survives restarts) -
+        this is for the quick, real commands in between.
+        """
+        conn = orchestrator.connections.get(instance_id)
+        if conn is None or conn.ssh_connection() is None:
+            raise HTTPException(
+                409, f"no connected instance {instance_id}")
+        dispatcher.touch_activity(instance_id)
+        try:
+            exit_code, stdout, stderr = await conn.run(
+                req.command, timeout=req.timeout)
+        except ConnectionError as exc:
+            raise HTTPException(409, str(exc))
+        db.record_audit(
+            "api", "instance_command",
+            f"{instance_id}: {req.command[:200]!r} -> exit {exit_code}",
+        )
+        cap = 64 * 1024
+        return {
+            "instance_id": instance_id,
+            "exit_code": exit_code,
+            "stdout": stdout[-cap:],
+            "stderr": stderr[-cap:],
+            "truncated": len(stdout) > cap or len(stderr) > cap,
+        }
+
     @app.get("/instances/{instance_id}/metrics")
     async def instance_metrics(instance_id: str):
         sidecar = orchestrator.sidecar_for(instance_id)
@@ -598,16 +738,73 @@ def create_app(
             raise HTTPException(409, f"no managed connection to {instance_id}")
         return await sidecar.metrics()
 
+    async def _drive_terminal(
+        ws: WebSocket,
+        session: TerminalSession,
+        *,
+        persistent: bool,
+        on_input=None,
+    ) -> None:
+        """Shared WS half of every terminal: attach (replays scrollback),
+        forward input/resize, and on the way out decide the shell's fate. A
+        plain socket drop (refresh, frozen tab) DETACHES a persistent session
+        - the shell keeps running for a reattach; an explicit {"type":
+        "close"} from the panel's x button kills it."""
+        await session.attach(ws)
+        killed = False
+        try:
+            while True:
+                msg = await ws.receive_json()
+                if on_input:
+                    on_input()
+                kind = msg.get("type")
+                if kind == "input":
+                    session.write_input(msg.get("data", ""))
+                elif kind == "resize":
+                    session.resize(
+                        int(msg.get("cols", 80)), int(msg.get("rows", 24)))
+                elif kind == "ack":
+                    # Flow control: the browser rendered this many more chars.
+                    session.ack(int(msg.get("bytes", 0)))
+                elif kind == "close":
+                    killed = True
+                    term_sessions.kill(session.id)
+                    await ws.close()
+                    return
+        except (WebSocketDisconnect, KeyError, ValueError, OSError):
+            pass
+        finally:
+            if not killed:
+                if persistent and not session.exited:
+                    session.detach(ws)
+                else:
+                    term_sessions.kill(session.id)
+
     @app.websocket("/instances/{instance_id}/terminal")
     async def instance_terminal(ws: WebSocket, instance_id: str):
         """Browser terminal: xterm.js <-> this WS <-> SSH shell session.
 
         Rides the managed connection — no ttyd, nothing new listening on
-        the instance. Protocol: client sends JSON {type: "input"|"resize"},
-        server sends raw text frames of terminal output. All traffic counts
-        as activity for idle detection.
+        the instance. Protocol: client sends JSON {type: "input"|"resize"|
+        "close"}, server sends raw text frames of terminal output. All
+        traffic counts as activity for idle detection.
+
+        Pass ?session=<id> to make the shell survive the socket: reconnect
+        with the same id (after a refresh) and it reattaches with scrollback
+        instead of starting over. No session id = the old ephemeral behavior.
         """
         await ws.accept()
+        sid = ws.query_params.get("session", "")
+        key = f"inst:{instance_id}:{sid}" if sid else ""
+        touch = lambda: dispatcher.touch_activity(instance_id)  # noqa: E731
+
+        existing = term_sessions.get(key) if key else None
+        if existing is not None:
+            touch()
+            await _drive_terminal(ws, existing, persistent=True,
+                                  on_input=touch)
+            return
+
         conn = orchestrator.connections.get(instance_id)
         ssh = conn.ssh_connection() if conn else None
         if ssh is None:
@@ -621,37 +818,31 @@ def create_app(
         process = await ssh.create_process(
             term_type="xterm-256color", term_size=(80, 24)
         )
-        dispatcher.touch_activity(instance_id)
+        touch()
+        session = TerminalSession(
+            key or f"inst:{instance_id}:ephemeral-{id(process)}",
+            write_input=lambda data: process.stdin.write(data),
+            resize=lambda cols, rows: process.change_terminal_size(cols, rows),
+            close=process.close,
+            on_output=touch,
+        )
 
         async def pump_output():
-            try:
-                while True:
-                    data = await process.stdout.read(4096)
-                    if not data:
-                        break
-                    dispatcher.touch_activity(instance_id)
-                    await ws.send_text(data)
-                await ws.send_text("\r\n[manifold] shell exited\r\n")
-                await ws.close()
-            except (WebSocketDisconnect, RuntimeError):
-                pass
-
-        output_task = asyncio.create_task(pump_output())
-        try:
             while True:
-                msg = await ws.receive_json()
-                dispatcher.touch_activity(instance_id)
-                if msg.get("type") == "input":
-                    process.stdin.write(msg.get("data", ""))
-                elif msg.get("type") == "resize":
-                    process.change_terminal_size(
-                        int(msg.get("cols", 80)), int(msg.get("rows", 24))
-                    )
-        except (WebSocketDisconnect, KeyError, ValueError):
-            pass
-        finally:
-            output_task.cancel()
-            process.close()
+                # Backpressure: if the browser is behind, pause BEFORE reading
+                # more so the SSH channel window fills and the remote shell
+                # throttles itself, instead of buffering unboundedly here.
+                await session.await_writable()
+                data = await process.stdout.read(4096)
+                if not data:
+                    break
+                await session.feed(data)
+            await session.mark_exited()
+
+        session.pump_task = asyncio.create_task(pump_output())
+        term_sessions.register(session)
+        await _drive_terminal(ws, session, persistent=bool(sid),
+                              on_input=touch)
 
     @app.websocket("/local/terminal")
     async def local_terminal(ws: WebSocket):
@@ -679,6 +870,14 @@ def create_app(
             await ws.close()
             return
 
+        await ws.accept()
+        sid = ws.query_params.get("session", "")
+        key = f"local:{sid}" if sid else ""
+        existing = term_sessions.get(key) if key else None
+        if existing is not None:
+            await _drive_terminal(ws, existing, persistent=True)
+            return
+
         import fcntl
         import pty
         import shutil
@@ -686,16 +885,26 @@ def create_app(
         import struct
         import termios
 
-        await ws.accept()
         shell = os.environ.get("SHELL") or shutil.which("zsh") or "/bin/sh"
         pid, fd = pty.fork()
         if pid == 0:                       # child: become the user's shell
             os.execvp(shell, [shell, "-l"])
 
         loop = asyncio.get_event_loop()
-        out_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Bounded so a firehose can't grow unboundedly here: when it fills, we
+        # stop reading the pty (below), leaving output in the kernel's pty
+        # buffer, whose backpressure eventually throttles the local shell.
+        out_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+        reader_paused = False
 
         def on_readable():
+            nonlocal reader_paused
+            if out_queue.full():
+                # The pump is behind; pause reading and let the pty buffer
+                # hold the data. pump_output re-arms us after it drains one.
+                loop.remove_reader(fd)
+                reader_paused = True
+                return
             try:
                 data = os.read(fd, 4096)
             except OSError:
@@ -706,34 +915,11 @@ def create_app(
 
         loop.add_reader(fd, on_readable)
 
-        async def pump_output():
-            try:
-                while True:
-                    data = await out_queue.get()
-                    if data is None:
-                        break
-                    await ws.send_text(data.decode(errors="replace"))
-                await ws.send_text("\r\n[manifold] shell exited\r\n")
-                await ws.close()
-            except (WebSocketDisconnect, RuntimeError):
-                pass
+        def resize_pty(cols: int, rows: int) -> None:
+            size = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
 
-        output_task = asyncio.create_task(pump_output())
-        db.record_audit("dashboard", "local_terminal_open", shell)
-        try:
-            while True:
-                msg = await ws.receive_json()
-                if msg.get("type") == "input":
-                    os.write(fd, msg.get("data", "").encode())
-                elif msg.get("type") == "resize":
-                    size = struct.pack(
-                        "HHHH", int(msg.get("rows", 24)),
-                        int(msg.get("cols", 80)), 0, 0)
-                    fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
-        except (WebSocketDisconnect, KeyError, ValueError, OSError):
-            pass
-        finally:
-            output_task.cancel()
+        def close_pty() -> None:
             try:
                 loop.remove_reader(fd)
             except Exception:
@@ -743,6 +929,33 @@ def create_app(
                 os.close(fd)
             except OSError:
                 pass
+
+        session = TerminalSession(
+            key or f"local:ephemeral-{pid}",
+            write_input=lambda data: os.write(fd, data.encode()),
+            resize=resize_pty,
+            close=close_pty,
+        )
+
+        async def pump_output():
+            nonlocal reader_paused
+            while True:
+                # Backpressure: hold off while the browser is behind, so the
+                # queue stays full and the pty reader stays paused.
+                await session.await_writable()
+                data = await out_queue.get()
+                if reader_paused and not session.exited:
+                    reader_paused = False
+                    loop.add_reader(fd, on_readable)
+                if data is None:
+                    break
+                await session.feed(data.decode(errors="replace"))
+            await session.mark_exited()
+
+        session.pump_task = asyncio.create_task(pump_output())
+        term_sessions.register(session)
+        db.record_audit("dashboard", "local_terminal_open", shell)
+        await _drive_terminal(ws, session, persistent=bool(sid))
 
     # -- chat with a served model -----------------------------------------------
 
@@ -1310,11 +1523,56 @@ def create_app(
     @app.get("/templates")
     async def list_templates():
         """Valid templates with parameter schemas, plus load errors so a
-        broken YAML file is visible instead of silently missing."""
-        return {
-            "templates": [t.to_api() for t in templates.values()],
-            "errors": template_errors,
-        }
+        broken YAML file is visible instead of silently missing. Custom
+        (user-authored) templates carry their raw YAML for editing."""
+        out = []
+        for t in templates.values():
+            entry = t.to_api()
+            entry["custom"] = t.name in custom_names
+            if entry["custom"]:
+                path = custom_dir / f"{t.name}.yaml"
+                entry["yaml"] = path.read_text() if path.exists() else ""
+            out.append(entry)
+        return {"templates": out, "errors": template_errors}
+
+    @app.post("/templates/custom", status_code=201)
+    async def save_custom_template(req: CustomTemplateRequest):
+        """Create or update a user template from raw YAML.
+
+        Validated by the SAME loader as bundled templates - the mount jail
+        (only /workspace/ephemeral and {persistent}), the parameter schema,
+        and the port rules all apply. A custom template gets no powers a
+        bundled one lacks; it is a recipe, not an escape hatch. Live
+        immediately: the shared dict is reloaded in place, no restart."""
+        try:
+            template = save_custom_template_text(req.yaml)
+        except Exception as exc:
+            raise HTTPException(422, f"template rejected: {exc}")
+        db.record_audit(
+            "api", "template_saved",
+            f"custom template '{template.name}' "
+            f"({'overrides bundled' if (bundled_dir / (template.name + '.yaml')).exists() else 'new'})",
+        )
+        entry = templates[template.name].to_api()
+        entry["custom"] = True
+        return {"template": entry}
+
+    @app.delete("/templates/custom/{name}")
+    async def delete_custom_template(name: str):
+        """Remove a user template. Bundled templates cannot be deleted; if
+        this one was shadowing a bundled template, the bundled version comes
+        back on the reload."""
+        if name not in custom_names:
+            raise HTTPException(
+                404 if name not in templates else 400,
+                f"'{name}' is not a custom template"
+                + (" (bundled templates cannot be deleted)"
+                   if name in templates else ""),
+            )
+        (custom_dir / f"{name}.yaml").unlink(missing_ok=True)
+        reload_templates()
+        db.record_audit("api", "template_deleted", f"custom template '{name}'")
+        return {"deleted": name, "restored_bundled": name in templates}
 
     # -- tasks ------------------------------------------------------------------------
 
@@ -1543,9 +1801,12 @@ def create_app(
         else:
             gated = prefs.get().approvals.gated_actions()
 
-        cap = settings.autopilot.max_steps_cap
-        max_steps = min(req.max_steps or settings.autopilot.max_steps_default,
-                        cap)
+        if req.unlimited_steps:
+            max_steps = 0    # unlimited: an explicit user choice
+        else:
+            cap = settings.autopilot.max_steps_cap
+            max_steps = min(
+                req.max_steps or settings.autopilot.max_steps_default, cap)
         run_id = autopilot.start_run(
             goal=req.goal,
             brain_ref=ref,
@@ -1631,14 +1892,35 @@ def create_app(
 
     @app.get("/launches")
     async def list_launches():
-        return {"launches": db.list_launches()}
+        now = utcnow()
+        boot_timeout = settings.launch.boot_timeout_seconds
+        return {"launches": [
+            launch_progress(l, boot_timeout, now) for l in db.list_launches()
+        ]}
 
     @app.get("/launches/{launch_id}")
     async def get_launch(launch_id: str):
         launch = db.get_launch(launch_id)
         if launch is None:
             raise HTTPException(404, f"launch {launch_id} not found")
-        return launch
+        return launch_progress(
+            launch, settings.launch.boot_timeout_seconds, utcnow()
+        )
+
+    @app.get("/launches/{launch_id}/wait")
+    async def wait_launch(launch_id: str, timeout: float = 120.0):
+        """Long-poll: block until the launch settles (active/failed/terminated)
+        or `timeout` seconds pass, then return the (enriched) record. Replaces
+        a poll loop of get_launch_status calls while a slow instance boots. The
+        per-call wait is capped so the HTTP request never hangs indefinitely; a
+        caller that is still booting simply calls again."""
+        timeout = max(1.0, min(float(timeout), 300.0))
+        launch = await orchestrator.wait_until_settled(launch_id, timeout)
+        if launch is None:
+            raise HTTPException(404, f"launch {launch_id} not found")
+        return launch_progress(
+            launch, settings.launch.boot_timeout_seconds, utcnow()
+        )
 
     # -- cost/utilization intelligence (read-only; advisory) -----------------------
 
@@ -1726,7 +2008,14 @@ def create_app(
             )
         fs = filesystems[filesystem]
         if fs.id not in storage_cache:
-            storage_cache[fs.id] = storage_factory(fs)
+            try:
+                storage_cache[fs.id] = storage_factory(fs)
+            except ValueError as exc:
+                # Browsing persistent files rides the Lambda S3 "Files" API,
+                # whose access keys live in .env separately from the Lambda
+                # API key. Without them the factory raises; surface that as a
+                # clear 503 instead of an opaque 500 that decodes to nothing.
+                raise HTTPException(503, str(exc)) from exc
         return storage_cache[fs.id]
 
     @app.get("/storage/files")

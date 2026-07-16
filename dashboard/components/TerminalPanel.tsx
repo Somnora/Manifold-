@@ -8,13 +8,27 @@ import { wsBase } from "@/lib/backend";
 // A real shell in the dashboard: xterm.js <-> backend WS. Two flavors of
 // the same wire protocol: an instance shell (SSH session over the managed
 // connection) or, with wsPath="/local/terminal", a shell on THIS machine
-// (the local half of the hub). Closing the panel closes the shell.
+// (the local half of the hub).
+//
+// With a sessionId, the SHELL lives on the backend keyed by that id: a
+// page refresh (the freeze-then-reload case) only drops the socket, and
+// remounting with the same id reattaches to the same shell with its
+// scrollback replayed - Claude keeps running through it. Unmounting the
+// panel (the tab's x) sends an explicit close, which really ends the shell.
 export function TerminalPanel({
   instanceId,
   wsPath,
+  label,
+  fill,
+  sessionId,
 }: {
   instanceId?: string;
   wsPath?: string;
+  label?: string;
+  // fill: size to the parent instead of the self-resizable h-80 box. Used
+  // by the terminal drawer, whose own top-edge handle does the resizing.
+  fill?: boolean;
+  sessionId?: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<"connecting" | "open" | "closed">(
@@ -28,10 +42,14 @@ export function TerminalPanel({
     let cleanup: (() => void) | undefined;
 
     // xterm touches the DOM at import time in some builds; load it client-side.
+    // The WebGL addon is optional: if the chunk or a WebGL context can't be
+    // had (headless, blocklisted GPU), the terminal still runs on the DOM
+    // renderer — so its import never blocks or breaks the shell.
     (async () => {
-      const [{ Terminal }, { FitAddon }] = await Promise.all([
+      const [{ Terminal }, { FitAddon }, webglMod] = await Promise.all([
         import("@xterm/xterm"),
         import("@xterm/addon-fit"),
+        import("@xterm/addon-webgl").catch(() => null),
       ]);
       if (disposed) return;
 
@@ -47,25 +65,65 @@ export function TerminalPanel({
       term.loadAddon(fit);
       term.open(el);
 
+      // GPU-accelerated rendering: WebGL draws glyphs on the GPU instead of
+      // the DOM renderer's per-cell layout, which is what keeps the terminal
+      // responsive under heavy output. Must load AFTER open() (it hooks the
+      // live renderer). If the context is ever lost (tab backgrounded, GPU
+      // reset) we dispose the addon and xterm silently reverts to the DOM
+      // renderer, so a lost context degrades instead of going blank.
+      if (webglMod) {
+        try {
+          const webgl = new webglMod.WebglAddon();
+          webgl.onContextLoss(() => webgl.dispose());
+          term.loadAddon(webgl);
+        } catch {
+          // No usable WebGL context: stay on the DOM renderer.
+        }
+      }
+
       // Fit to the host element's real box, then keep the prompt in view.
       // The host has NO padding of its own (padding lives on the wrapper),
       // so FitAddon's row math is exact and the last row never clips.
+      //
+      // Coalesced to one run per animation frame: the ResizeObserver and the
+      // dock's resize drag can both fire this dozens of times a second, and
+      // an unthrottled fit.fit() (a full reflow) plus a resize send per tick
+      // was a real source of jank. We also skip the PTY resize unless the
+      // grid actually changed, so a drag no longer spams change_terminal_size.
+      let fitQueued = false;
+      let lastCols = 0;
+      let lastRows = 0;
       const doFit = () => {
-        try {
-          fit.fit();
-        } catch {
-          return;
-        }
-        term.scrollToBottom();
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }),
-          );
-        }
+        if (fitQueued) return;
+        fitQueued = true;
+        requestAnimationFrame(() => {
+          fitQueued = false;
+          try {
+            fit.fit();
+          } catch {
+            return;
+          }
+          if (term.cols === lastCols && term.rows === lastRows) return;
+          lastCols = term.cols;
+          lastRows = term.rows;
+          term.scrollToBottom();
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "resize",
+                cols: term.cols,
+                rows: term.rows,
+              }),
+            );
+          }
+        });
       };
 
       const path = wsPath ?? `/instances/${instanceId}/terminal`;
-      const ws = new WebSocket(`${wsBase()}${path}`);
+      const qs = sessionId
+        ? `?session=${encodeURIComponent(sessionId)}`
+        : "";
+      const ws = new WebSocket(`${wsBase()}${path}${qs}`);
 
       ws.onopen = () => {
         setStatus("open");
@@ -73,8 +131,24 @@ export function TerminalPanel({
         requestAnimationFrame(doFit);
         term.focus();
       };
+      // Flow control: ack how many chars we've actually rendered so the
+      // backend can pause a firehose (or a full-screen TUI like Claude Code)
+      // instead of letting xterm's write buffer grow without bound — the
+      // remaining cause of the freeze under heavy output. The write callback
+      // fires once xterm has parsed the chunk (the right "rendered" signal)
+      // and carries NO scrollToBottom, so it doesn't bring back the per-chunk
+      // reflow; xterm still auto-scrolls when the viewport is at the bottom.
+      // Acks are batched (~8 KB) to avoid a message per chunk.
+      let unacked = 0;
       ws.onmessage = (event) => {
-        term.write(event.data as string, () => term.scrollToBottom());
+        const data = event.data as string;
+        term.write(data, () => {
+          unacked += data.length;
+          if (unacked >= 8192 && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ack", bytes: unacked }));
+            unacked = 0;
+          }
+        });
       };
       ws.onclose = () => setStatus("closed");
       ws.onerror = () => setStatus("closed");
@@ -96,6 +170,13 @@ export function TerminalPanel({
         observer.disconnect();
         window.removeEventListener("resize", doFit);
         dataSub.dispose();
+        // Unmount = the user closed this tab (the dock never unmounts a
+        // panel otherwise; a page refresh tears the socket without running
+        // this). Tell the backend to really end the shell - a bare socket
+        // close would leave it parked awaiting a reattach.
+        if (sessionId && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "close" }));
+        }
         ws.close();
         term.dispose();
       };
@@ -105,14 +186,20 @@ export function TerminalPanel({
       disposed = true;
       cleanup?.();
     };
-  }, [instanceId, wsPath]);
+  }, [instanceId, wsPath, sessionId]);
 
   return (
-    <div className="mt-3 overflow-hidden rounded border border-zinc-300 bg-[#09090b]">
-      <div className="flex items-center justify-between border-b border-zinc-200 px-3 py-1.5">
+    <div
+      className={
+        fill
+          ? "flex h-full min-h-0 flex-col overflow-hidden rounded border border-zinc-300 bg-[#09090b]"
+          : "mt-3 overflow-hidden rounded border border-zinc-300 bg-[#09090b]"
+      }
+    >
+      <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-3 py-1.5">
         <span className="text-xs text-zinc-400">
-          Terminal (SSH via the managed connection) · drag the bottom-right
-          corner to resize
+          {label ?? "Terminal (SSH via the managed connection)"}
+          {fill ? "" : " · drag the bottom-right corner to resize"}
         </span>
         <span
           className={`text-xs ${
@@ -128,8 +215,15 @@ export function TerminalPanel({
       </div>
       {/* Padding is on THIS wrapper; the xterm host below fills it exactly
           so FitAddon measures a clean, padding-free box. resize-y gives a
-          native drag handle; the ResizeObserver refits rows on every drag. */}
-      <div className="h-80 min-h-40 max-h-[85vh] resize-y overflow-hidden p-2">
+          native drag handle; the ResizeObserver refits rows on every drag
+          (and on every drawer resize, in fill mode). */}
+      <div
+        className={
+          fill
+            ? "min-h-0 flex-1 overflow-hidden p-2"
+            : "h-80 min-h-40 max-h-[85vh] resize-y overflow-hidden p-2"
+        }
+      >
         <div ref={containerRef} className="h-full w-full" />
       </div>
     </div>

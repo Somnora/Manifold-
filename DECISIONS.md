@@ -1878,3 +1878,438 @@ out of the rescue directory.
 transfer budgeting, and path confinement are testable without an instance, an
 SSH server, or a byte of network. The transport lives in the orchestrator,
 which owns the connections.
+
+## 2026-07-14 — Phase 38: nav consolidation + ambient burn rate
+
+**Problem:** 8 top-level pages for this scope, with two overlapping pairs.
+Hub and Autopilot both showed brains and both rendered ApprovalsPanel; Agent
+Activity and History were both "what happened" pages (audit trail vs cost
+ledger). And the hourly burn — the single most important number in the
+product — was visible on exactly one page.
+
+**Decided (frontend only, zero backend changes):**
+
+- **Hub merged into Autopilot.** Brains and approvals live where runs start.
+  The Hub's third feature, the local terminal, is a TOOL, not a PLACE: it
+  became a bottom drawer toggled by the `>_` header button, available on
+  every page. Once opened it stays MOUNTED and is only hidden with CSS, so
+  closing the drawer does not kill the shell — navigate anywhere, reopen,
+  and the session (history, cwd, running command) is where you left it.
+- **Agent Activity merged into History as the "Activity" page** with
+  Spend / Audit tabs. The audit table moved verbatim into
+  components/AuditLog.tsx; deep link `/history?tab=audit`.
+- **Old URLs keep working**: /hub and /agents are client redirect stubs
+  (static export cannot do server redirects), so desktop-app bookmarks and
+  doc links don't break.
+- **BurnChip in the header** next to the bell on every page: sum of running
+  instances' hourly rates, amber + pulsing when > $0, click-through to
+  Instances where the terminate buttons are. Renders nothing while the
+  backend is unreachable — an unknown must not display as a reassuring $0.
+
+Nav went 8 -> 6: Instances · Jobs · Storage | Autopilot | Activity ·
+Settings. Deliberately NOT touched: the Jobs page's density is earned (one
+coherent workflow); Storage's region limitation is a separate problem.
+
+## 2026-07-14 — Phase 39: power without training wheels
+
+Four asks from live testing, one theme: advanced users (and their agents)
+should never hit a wall that exists only for ceremony.
+
+**Guardrail NUMBERS moved to Settings; the guards did not move.** The
+concurrency/budget guards stay in orchestrator.request_launch (hard rule),
+but the limits they enforce now read through the preference store:
+Settings -> Spending guardrails, 0/blank = config.yaml default. Raising the
+instance limit no longer needs a YAML edit + restart. Guard rejection
+messages point at Settings instead of config.yaml.
+
+**Filesystem is optional at launch.** filesystem="" launches a scratch-only
+instance in ANY region with capacity - previously a region without one of
+your filesystems was unlaunchable. Consequences fall out of existing
+machinery, deliberately: jobs mounting {persistent} fail with a clear
+reason; sync has nowhere to go, so the rescue reports sync_error and the
+data-safety policy decides (default: block termination while unsaved files
+exist; to_local download is the net). The launch form says all of this in
+amber BEFORE the click. No new code path touches the guards.
+
+**Custom job templates - the "skills" model.** User/agent-authored YAML in
+custom-templates/ under the data dir, loaded alongside the bundled set into
+ONE shared dict that reloads in place (dispatcher/autopilot/brains all see
+new templates with no restart). Validated by the SAME parser and mount jail
+as bundled templates: a custom template is a recipe, not an escape hatch
+(test: a template mounting /etc is rejected with 422). User templates win
+name collisions; deleting one restores the bundled original. Files, not DB
+rows - portable, committable, backupable. Editor on the Jobs page; agents
+get MCP save_template/delete_template. The design goal is agent-as-
+scaffolding: prove a workflow with the agent once, save it, rerun it
+forever as a form - no tokens, no re-explaining.
+
+**run_command: SSH parity, audited.** The honest answer to "do agents get
+the same tools as SSH?" used to be "no". Now the difference is visibility,
+not capability: POST /instances/{id}/run (MCP run_command) runs one shell
+command over the managed connection, hard-timeout (<=600s), output capped,
+audited with exit code, idle-clock touched. Guards still bind everything.
+The instruction to give agents stays: use the manifold tools, not ssh -
+same power, but on the record.
+
+Docs: codex + gemini MCP registration blocks and the parity section in
+mcp-setup.md; new custom-templates.md authoring guide.
+
+## 2026-07-14 — Phase 39 additions from the live test pass
+
+**The dock generalized to all instance panels.** Chat, recent Files, and the
+file Browser open in the dock (tabs or split, bottom or right) instead of
+unrolling inside the instance card - one surface for everything
+instance-scoped, and it survives page navigation. Multiple shells: a "+"
+on any terminal tab duplicates it (fresh pty, numbered label), and a
+"+ >_" button adds more Local Machine tabs. Local tab renamed
+"Local Machine".
+
+**Instance rename is a local overlay.** Lambda fixes an instance's name at
+launch; instance_names in SQLite overlays it everywhere Manifold shows
+names. Empty restores Lambda's. No Lambda API call involved.
+
+**Unlimited autopilot steps: max_steps=0.** The unlimited toggle stores 0
+and the loop switches to itertools.count - the run ends only via
+done/cancel/failure. Deliberately NOT a bigger cap: the money is already
+bounded by guards + approval gates + the wait cap + consecutive-failure
+kill; the step cap only bounded TURNS, and for long unattended goals that
+was the artificial wall. Finite runs keep the 50-step hard cap.
+
+**Autopilot can author templates mid-run (save_template action).** Same
+validated path as the Jobs page and MCP (one save_custom_template_text
+helper in the app factory feeds all three), so the mount jail binds the
+agent identically. What a run saves persists for the user - agent as
+scaffolding, again.
+
+**Template editor contrast bug:** the dark theme remaps the zinc scale, so
+text-zinc-100 on bg-zinc-950 was ink-on-ink. Terminal-style editors now use
+the terminal's own literal hex palette, not remapped tokens.
+
+---
+
+## 2026-07-14 — Phase 40: field hardening for slow real boots
+
+From a field report by an agent orchestrator that ran the sprite-to-3D
+workflow on real GPUs. Five backend fixes, all against the same failure:
+large SXM4 instances take much longer to boot than the code assumed.
+
+**Boot timeout 900s -> 2400s (config default AND config.yaml).** 15 minutes
+cut off real launches that were still booting on Lambda's side; SXM4/large
+multi-GPU boots were observed at 15-30+ min. 2400s (40 min) covers the worst
+case with headroom. This is a ceiling, not a wait we always incur.
+
+**The boot waiter now survives a backend restart (--reload).** The launch
+pipeline runs in an in-memory asyncio task; a `--reload` restart (every
+backend file save in dev) killed it mid-boot. The instance kept booting to
+'active' on Lambda, but nothing dialed SSH or closed the launch record: it
+hung in 'booting' forever while it billed. Fix: `resume_pending_launches()`
+runs at startup (after adopt), finds every 'booting' launch, and either marks
+it active (if adopt already reconnected the now-live instance) or spawns a
+fresh wait-then-connect task. Fresh timeout window on resume is deliberate -
+a restart must never SHORTEN a genuine boot, which was the whole bug.
+Alternative (persist the coroutine / seed elapsed from launched_at) was
+rejected: it risks instantly timing out an instance that is still booting,
+reintroducing the failure.
+
+**Server-side long-poll: wait_for_launch (MCP) / GET /launches/{id}/wait.**
+An agent polling get_launch_status every few seconds burned ~40 round-trips
+(and their tokens) per slow boot. `wait_until_settled` parks server-side up
+to a capped timeout (<=300s/call) and returns when the launch settles. It
+polls the DB, not the in-memory task, so it also serves resumed launches.
+The cap keeps a single HTTP request from hanging forever; a still-booting
+caller just calls again.
+
+**Structured launch phase (launch_progress, pure).** Every launch record now
+carries a stable `phase` (requesting_capacity | retrying_capacity |
+waiting_for_active | ready | failed | terminated), a human `phase_detail`,
+`settled`, and while booting a `boot_elapsed/timeout/remaining_seconds`
+countdown. Replaces the empty connection_error a poller used to see mid-boot.
+The dashboard's Pending-launch card renders the countdown with a note that a
+long boot is normal, so a 40-min boot doesn't look frozen.
+
+**Log progress-bar collapse (collapse_progress).** Tools redraw progress bars
+with `\r`; captured by newline only, all the intermediate frames arrive glued
+into one multi-KB line that a terminal never shows and that burns agent
+tokens on read. We now store only the segment after the last `\r` (the
+terminal-visible frame), at the single append_log chokepoint. Chose write-
+time over a read-time clean=true flag: the raw frames have zero value stored,
+and every reader stays clean without opting in.
+
+**Not done: no forced fallback instance type.** The report suggested adding
+gpu_1x_a100_sxm4 as a default fallback. Left fallback_instance_types empty:
+substituting a different (pricier) type than the user asked for should be
+their opt-in, not a shipped default. The config comment shows the example.
+
+**wait_for_launch absorbs a backend restart mid-park (client-side retry).**
+Field follow-up: a --reload restart during the long-poll dropped the socket
+and the tool surfaced "backend unreachable" for a launch that was actually
+fine (the backend resumes it on startup). The MCP tool now distinguishes
+transport failure (`unreachable: true` from _call) from backend rejection,
+reconnects, and keeps parking inside its own timeout window; if the backend
+never answers it returns a calm structured `phase: backend_restarting`
+record that says to call again. This retry is transport resilience in a
+read-only poll, NOT client-side business logic - no guard is involved. Same
+fix also raised the per-request socket timeout above the server park time
+(the shared client's 60s default would have cut off a 120s park).
+
+**Terminal sessions survive a page refresh (terminal_sessions.py).** The
+dock already kept shells alive across navigation, but the WS handler OWNED
+the pty/SSH process, so a refresh (the freeze-then-reload case) killed the
+shell and any Claude session running in it. Now the process, its output
+pump, and a ~200k-char scrollback buffer live in a TerminalSessionManager
+keyed by a client-chosen session id; the dock persists its tabs/layout in
+sessionStorage and reconnects with the same ids, so a refresh reattaches
+every shell with scrollback replayed. Lifecycle: a bare socket drop
+DETACHES (shell keeps running); the tab's x sends {"type":"close"} which
+kills; the shell exiting ends it; a detached session is reaped after
+hub.terminal_grace_seconds (default 900) so closed-for-good tabs don't
+leak shells; backend shutdown kills all. sessionStorage (per-tab, dies
+with it) was chosen over localStorage deliberately: refresh = restore,
+closing the app = a fresh start, matching the requested scope. No ?session=
+param keeps the old ephemeral contract for any other client. Security
+posture unchanged: same origin allowlist, same loopback-only listen, the
+session layer is transport glue below those checks.
+
+**First-job GPU preflight (dispatcher._ensure_gpu_ready).** Field case: an
+A100 SXM4 job dispatched 2.5 min after cloud-init finished died with "No
+CUDA GPUs are available" and burned ~5 billed minutes. Cause: on SXM boxes
+CUDA cannot initialize until nvidia-fabricmanager finishes starting -
+minutes after boot - while nvidia-smi already looks healthy, so every
+hand-check passes. The dispatcher now runs `nvidia-smi -q` before the FIRST
+job on each instance and waits until the Fabric State line settles
+(Completed / absent on PCIe boxes), bounded by
+tasks.gpu_ready_timeout_seconds (180s) polling every 10s. Fail-open on
+purpose: a probe error or timeout logs an honest line and dispatches anyway
+- a wrong probe must never brick dispatch; pre-preflight behavior is the
+floor. Readiness is cached per instance in memory only: a backend restart
+re-probes once (seconds), which also re-covers an instance that was
+mid-boot during the restart. Parsing lives in a pure gpu_readiness()
+function tested against captured nvidia-smi output from both phases.
+
+## 2026-07-15 — sdxl-generate uses python3; storage-browse errors made legible
+
+Two field findings from dogfooding the templates on a real A10 (us-west-1),
+both on the phase-40 field-hardening branch.
+
+**sdxl-generate ran `python`, but its image only ships `python3`.** The
+template's command was `... && exec python -c "$PYCODE" ...`. The
+`huggingface/transformers-pytorch-gpu:latest` image has `/usr/bin/python3`
+and no `python` symlink, so every run died with `exec: python: not found`
+(exit 127) AFTER pulling the multi-GB image and running pip - real GPU
+minutes for a guaranteed failure. Fixed to `python3`. Verified end-to-end on
+the A10: two 1024x1024 PNGs written to the persistent filesystem, exit 0.
+Only this template was affected - whisper-batch uses `pytorch/pytorch`
+(has `python`, proven by the sprite-to-3d field run) and the python:3.11-slim
+templates have both. **Alternative considered:** pin the image to a digest so
+`:latest` cannot drift again. Deferred - the interpreter fix is the correct
+minimal change, and a pinned tag has its own staleness cost (older CUDA); the
+comment already flags `:latest` as a pin-later hot-path candidate.
+
+**list_persistent_files crashed with "Expecting value: line 1 column 1".**
+The S3 "Files" API keys (separate from the Lambda API key) were empty in
+.env, so the storage factory raised ValueError; the `/storage/files` route
+let that become a Starlette 500 *plain-text* page; and the MCP `_call` helper
+ran `resp.json()` on that plain text, raising an opaque JSON-decode error
+that surfaced to the agent. Hardened at both layers: `_storage_for` now
+catches the credential ValueError and returns a clear 503 ("...credentials
+are not configured in .env"), and `_call` wraps the JSON decode so ANY
+non-JSON body (a 500 page, a proxy error) degrades to `{"error": <status /
+body text>}` instead of crashing. The decode guard helps every tool, not
+just this one. Underlying cause is config, not code: filling the S3 keys in
+.env turns the persistent-file browser back on. **Why surface, not silence:**
+a guiding LLM that gets "credentials are not configured" can tell the user
+what to fix; "Expecting value: line 1 column 1" tells no one anything.
+
+## 2026-07-15 — Launch-target discovery, actionable capacity failures, quieter pull logs
+
+Repair pass on the friction found while dogfooding a launch over MCP: I
+guessed a region with no A10 (5 failed attempts), then guessed one where the
+user had no filesystem. The backend already knew both facts — capacity per
+region (`regions_with_capacity` on each instance type) and region per
+filesystem — but nothing put them together or exposed them to an agent.
+
+**`launch_options(types, filesystems)` — a pure cross-reference.** Returns
+launchable `{instance_type, region, filesystem}` targets Lambda can satisfy
+NOW, ranked: co-located with EXISTING data first (a filesystem with bytes in
+that region), then co-located with an empty filesystem, then scratch-only
+(capacity but no filesystem there), cheaper first within each band; plus an
+`unavailable` list of types with no capacity anywhere. Exposed as
+`GET /launch-options` and the MCP tool `list_launch_options`, whose docstring
+(and `launch_gpu`'s) tell an agent to call it FIRST and copy a target. A
+launch needs type+region+filesystem to line up (types are capacity-gated per
+region; filesystems are region-locked), so handing back only combinations
+that already line up removes the blind guess. **Why a pure function + thin
+route:** same pattern as `launch_progress` / `gpu_readiness` — the ranking is
+unit-tested against the mock catalog with no I/O, and the route/tool are
+one-liners. **Not changed:** `launch_gpu` still takes explicit args (a spend
+action must not auto-pick); discovery informs the choice, it doesn't make it.
+The dashboard already greys out impossible regions from `/instance-types`;
+wiring a co-located "recommended" picker into the form is a possible
+follow-up, not done here.
+
+**Capacity exhaustion now names where to go.** The final "no capacity"
+message used to end with "add fallback types in config.yaml" — useless to an
+agent that can't edit YAML. `_capacity_hint` (best-effort; a catalog error
+just yields no hint, never masks the failure) now appends the regions where
+the requested types DO have capacity right now, e.g. "Available right now:
+gpu_1x_a10 in us-west-2. Relaunch there ... or call list-launch-options".
+
+**Docker pull churn dropped from stored job logs.** A `docker pull` in
+captured (non-TTY) output emits one line per layer per state — dozens of
+`<hash>: Waiting / Downloading / Pull complete` that buried the real job
+output and burned agent tokens on every `get_job_logs`. `is_docker_pull_noise`
+(pure, regex on the `<12-hex>: <verb>` shape) drops them in `append_log`. The
+lines that carry signal — `Pulling from ...`, `Digest:`, `Status: Downloaded
+...`, and all job output — are NOT matched, and the full docker output still
+lands in the per-task log file archived on the instance. Chose drop-at-store
+over a stateful collapser: stateless, testable, and the archived file is the
+escape hatch if the raw pull is ever needed.
+
+## 2026-07-15 — Keyless agent file browsing: SSH first, S3 only as fallback
+
+The MCP `list_persistent_files` tool browsed ONLY through Lambda's S3 "Files"
+API, so an account with no S3 keys in .env (a real user case: they don't have
+and won't add them) could not browse persistent files from an agent at all —
+even with a box up. But the dashboard's per-instance Files panel browses the
+same files over the managed SSH connection through the sidecar, needing no
+keys. The tool now uses that path first: if a connected instance mounts the
+target filesystem, it browses via `/instances/{id}/files/list` (sidecar, local
+-disk speed, no keys) and returns `{source, filesystem, root, path, entries}`;
+only when nothing suitable is connected does it fall back to `/storage/files`
+(S3, which CAN browse with no instance running but needs keys). When even that
+fails for lack of keys, the error carries a `hint` pointing at the keyless
+route. `prefix` stays filesystem-relative on both paths — the sidecar's
+persistent root is `/lambda/nfs` (the filesystem's parent), so the tool
+prepends the filesystem name to the sidecar path to match the S3 semantics.
+
+**Why the tool, not the /storage/files route:** the route is a thin S3 shim
+and routes hold no business logic (project rule); the tool is already the
+place that composes multiple backend calls (it picks a filesystem, picks an
+instance), and choosing WHICH existing guarded endpoint to hit keeps the MCP
+client thin without importing backend internals. The dashboard Storage page
+(the standalone no-instance browser) still needs S3 keys and now returns the
+clean 503 added earlier; wiring its UI toward the per-instance panel when a
+box is up is a possible follow-up.
+
+## 2026-07-15 — Terminal freeze: stop forcing a reflow per output chunk
+
+The in-dock terminal froze under output volume (Claude streaming, build logs)
+and janked while resizing. All three causes were front-end, not the (sound)
+backend session layer:
+
+1. **Per-chunk scrollToBottom.** `ws.onmessage` did
+   `term.write(data, () => term.scrollToBottom())` — a synchronous reflow on
+   EVERY WebSocket frame, including on hidden tabs. Under a firehose that is
+   hundreds of forced layouts a second, which pins the main thread. xterm
+   already auto-scrolls on write when the viewport is at the bottom, so the
+   callback was redundant; dropping it fixes the freeze AND lets a user scroll
+   up to read without being yanked back down.
+2. **Unthrottled fit.** The ResizeObserver ran `doFit` (a full `fit.fit()`
+   reflow + a PTY resize send) on every animation frame during a resize.
+   `doFit` now coalesces to one run per frame and skips the PTY resize unless
+   the cols/rows grid actually changed — no more change_terminal_size spam.
+3. **Unthrottled drag.** The dock resize handle called setHeight/setWidth on
+   every pointermove, re-rendering the dock and firing every terminal's
+   ResizeObserver each time. The drag now coalesces to one state update per
+   animation frame.
+
+4. **DOM renderer.** xterm's default renderer lays out every cell in the DOM.
+   Added `@xterm/addon-webgl` (0.19.0, pairs with xterm 6.0), loaded after
+   `term.open()` so it hooks the live renderer, to draw glyphs on the GPU —
+   the throughput ceiling-raiser under heavy output. It degrades safely: the
+   import is `.catch(() => null)` (a missing/blocked chunk never breaks the
+   shell), construction is wrapped in try/catch (no usable WebGL context ->
+   stay on the DOM renderer), and `onContextLoss` disposes the addon so a lost
+   GPU context reverts to DOM instead of going blank.
+
+## 2026-07-16 — Terminal flow control: the real fix for freeze-under-output
+
+The earlier terminal-perf pass (dropping the per-chunk scrollToBottom reflow,
+throttling fit, WebGL) helped but did not stop the freeze: with a full-screen
+TUI (Claude Code) streaming, output outran xterm and its write buffer grew
+without bound until the tab choked. Diagnosis confirmed by the user: JUST the
+terminal froze (rest of the app responsive), under heavy output, not the dev
+server / drive. So the missing piece was backpressure.
+
+Watermark flow control end to end:
+- The browser acks how many chars it has actually RENDERED (xterm's write
+  callback is the "parsed" signal), batched ~8 KB to avoid a message per
+  chunk, carrying no scrollToBottom so the reflow stays gone.
+- TerminalSession tracks outstanding (sent - acked) chars and a `_writable`
+  event: cleared at FLOW_HIGH_WATER (128 KB behind), set again at
+  FLOW_LOW_WATER (16 KB). feed() records scrollback FIRST (a reattach always
+  replays everything), then sends and accounts — only delivery is paced.
+- Each pump calls await_writable() BEFORE reading more, so the pause lands at
+  the source: the SSH channel window fills and the remote shell throttles; the
+  local pty pump uses a bounded queue that, when full, stops reading the fd so
+  the kernel pty buffer backpressures the local shell.
+- await_writable() is bounded by FLOW_WAIT_TIMEOUT (5 s): a client that never
+  acks (an old cached tab) degrades to unpaced output, never a stalled shell.
+  attach/detach reset the accounting so a fresh or absent viewer starts clean.
+
+Chose true backpressure over dropping/coalescing output: a TUI's escape
+stream can't be dropped without corrupting the screen, so the producer must
+be slowed, not the bytes thinned.
+
+## 2026-07-16 — Rolling-tag drift: surface it, don't force a pin
+
+sdxl-generate broke because its `:latest` base silently dropped the `python`
+symlink — image drift, not an authoring error. Several templates ride
+floating tags (vllm/sglang `:latest`, axolotl `main-latest`), so the same
+class of failure can recur and only shows up after a job burns GPU minutes.
+
+`floating_tag_warning(image)` (pure) flags any unpinned tag: a tag counts as
+PINNED when it is a @sha256 digest or contains a digit (a version, e.g.
+2.4.0-cuda12.4 or 5.5.0-tf2); a digit-less tag (latest, main, nightly) or no
+tag at all floats. It parses the ref carefully so a registry:port on the host
+is not mistaken for a tag. The result rides a new non-fatal `warnings` field
+on JobTemplate, surfaced three ways: logged at load, returned by
+`to_api()` (so `/templates` and MCP `list_templates` carry it), and shown as
+an amber advisory under the Jobs-page template picker.
+
+**Surface, not pin:** hard-pinning every image to a digest trades drift for
+staleness — a frozen base misses CUDA/security fixes and falls out of step
+with the packages a template pip-installs at start — so it stays the author's
+call. As a recovery breadcrumb, sdxl-generate records the digest of the image
+we VERIFIED on a real A10 (2026-07-15) in a comment, so if a future pull
+breaks, pinning to that digest restores a known-good state immediately.
+
+## 2026-07-16 — File-navigator delete on root-owned job outputs
+
+Found while cleaning up the whisper-batch test: job containers write outputs
+as root (uid 0) into root-owned directories on the NFS, but the sidecar runs
+as `User=ubuntu` (cloud_init.py), so its `/fs/delete` (the dashboard file
+navigator's delete) hit "permission denied" on exactly the files a user wants
+to clean up — checkpoints, outputs, caches. Silent, confusing break.
+
+Fix: `fs_delete` tries the normal unprivileged remove first (least privilege
+for ubuntu-owned files), and only on PermissionError falls back to
+`_privileged_remove` — `sudo -n rm -rf -- <path>`. The path is the same
+jail-resolved absolute path the handler already validated, passed as a single
+argv (no shell) with `--` to stop option parsing, so the escalation stays
+confined to the sanctioned roots. `sudo -n` (non-interactive) relies on the
+instance's passwordless sudo (Lambda's default, already used by run_command);
+if sudo is missing or refuses, the user gets a clear 500, never a hang.
+
+Chose sudo-on-demand over running the whole sidecar as root (keeps least
+privilege for everything else) and over running job containers as the host
+user (which would break the many templates that need root in-container for
+pip/apt and /root/.cache). Ships with the sidecar at launch, so it applies to
+newly launched instances.
+
+## 2026-07-16 — "Directory not empty" really means "a job still has it open"
+
+Found live while cleaning the vllm test's HF cache: deleting a directory a
+RUNNING job holds open fails on NFS with `rm: cannot remove '.../xet/logs':
+Directory not empty`. NFS turns "unlink a file another process still has
+open" into a hidden .nfsXXXX placeholder, so the parent then refuses — an
+error that reads like a bug rather than "stop the job first".
+
+`_busy_hint()` recognizes that shape (not empty / resource busy / .nfs) and
+fs_delete returns 409 (a conflict, retryable) saying what is actually wrong
+and what to do, instead of surfacing the raw rm text. Applied on BOTH paths:
+the privileged retry and the plain remove — the latter raises OSError, not
+PermissionError, so it would otherwise have escaped as a generic 500.
+
+The raw detail is still appended in parens: the hint explains, it never hides
+what the OS said.

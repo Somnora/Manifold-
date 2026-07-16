@@ -9,15 +9,24 @@
 # Files panel and download from there.
 name: sdxl-generate
 description: Generate images from a prompt with SDXL (diffusers)
+# `:latest` floats — the loader flags it (floating_tag_warning). Last image
+# VERIFIED working on a real A10 (2026-07-15) was digest
+# sha256:4c7317881a534b22e18add49c925096fa902651fb0571c69f3cad58af3ea2c0f;
+# if a future pull breaks, pin to that digest (@sha256:...) to recover.
 image: huggingface/transformers-pytorch-gpu:latest
 
 # Params go OUTSIDE the single quotes as positional args (reached via "$@"),
 # so a multi-word prompt is not split apart. Inside the quotes the host
 # shell leaves $PYCODE literal for the container to expand. See DECISIONS.md
 # 2026-07-12 (env-script quoting).
+#
+# Interpreter is `python3`, NOT `python`: the HF :latest image ships only
+# /usr/bin/python3 (no `python` symlink), so `exec python` died with
+# "exec: python: not found" (exit 127) after the image pull. Verified on a
+# real A10 2026-07-15. See DECISIONS.md (sdxl-generate python3).
 command: >
   bash -c 'pip install -q diffusers accelerate safetensors &&
-  exec python -c "$PYCODE" "$@"' manifold {{prompt}} {{count}} {{steps}} {{run_name}}
+  exec python3 -c "$PYCODE" "$@"' manifold {{prompt}} {{count}} {{steps}} {{run_name}}
 
 parameters:
   - name: prompt

@@ -120,10 +120,24 @@ class DataSafetyPrefs:
 
 
 @dataclass(frozen=True)
+class GuardrailPrefs:
+    """User-editable spending guardrails, from the Settings page.
+
+    0 means "not set here - use the config.yaml default". The guards
+    themselves stay in the orchestrator (hard rule); this only decides the
+    NUMBERS they enforce, so raising the instance limit never needs a YAML
+    edit and a backend restart.
+    """
+    max_concurrent_instances: int = 0
+    max_hourly_spend_usd: float = 0.0
+
+
+@dataclass(frozen=True)
 class Preferences:
     approvals: ApprovalPrefs = ApprovalPrefs()
     notifications: NotificationPrefs = NotificationPrefs()
     data_safety: DataSafetyPrefs = DataSafetyPrefs()
+    guardrails: GuardrailPrefs = GuardrailPrefs()
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -142,6 +156,8 @@ def _coerce(section, raw: dict):
         try:
             if isinstance(current, bool):
                 updates[key] = bool(value)
+            elif isinstance(current, int):
+                updates[key] = int(value)
             elif isinstance(current, float):
                 updates[key] = float(value)
             elif isinstance(current, str):
@@ -164,6 +180,14 @@ def _validate(section):
             fixes["max_local_gib"] = 0.0
         if fixes:
             section = replace(section, **fixes)
+    if isinstance(section, GuardrailPrefs):
+        fixes = {}
+        if section.max_concurrent_instances < 0:
+            fixes["max_concurrent_instances"] = 0
+        if section.max_hourly_spend_usd < 0:
+            fixes["max_hourly_spend_usd"] = 0.0
+        if fixes:
+            section = replace(section, **fixes)
     return section
 
 
@@ -174,6 +198,7 @@ def preferences_from_dict(base: Preferences, raw: dict) -> Preferences:
         approvals=_coerce(base.approvals, raw.get("approvals", {})),
         notifications=_coerce(base.notifications, raw.get("notifications", {})),
         data_safety=_coerce(base.data_safety, raw.get("data_safety", {})),
+        guardrails=_coerce(base.guardrails, raw.get("guardrails", {})),
     )
 
 

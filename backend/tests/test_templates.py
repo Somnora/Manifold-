@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from app.templates import TemplateError, load_templates, parse_template
+from app.templates import (
+    TemplateError,
+    floating_tag_warning,
+    load_templates,
+    parse_template,
+)
 
 REPO_TEMPLATES = Path(__file__).resolve().parent.parent.parent / "templates"
 
@@ -45,6 +50,47 @@ volumes:
   - host: /etc
     container: /host-etc
 """
+
+
+# -- floating image tags (drift guard) -------------------------------------------
+
+def test_floating_tags_are_flagged():
+    assert floating_tag_warning("vllm/vllm-openai:latest")
+    assert floating_tag_warning("axolotlai/axolotl:main-latest")
+    assert floating_tag_warning("repo:nightly")
+    assert floating_tag_warning("alpine")               # no tag -> :latest
+    assert floating_tag_warning("localhost:5000/img")   # port, still no tag
+
+
+def test_pinned_tags_and_digests_are_clean():
+    for image in (
+        "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+        "nvcr.io/nvidia/tao/tao-toolkit:5.5.0-tf2",
+        "nvidia/cuda:12.4.1-base-ubuntu22.04",
+        "repo@sha256:abc123",
+        "localhost:5000/img:2.0",                       # port not mistaken
+    ):
+        assert floating_tag_warning(image) is None, image
+
+
+def test_template_surfaces_floating_tag_warning():
+    text = """
+name: drifty
+description: rides latest
+image: some/image:latest
+command: "true"
+"""
+    t = parse_template(text)
+    assert any("floating" in w for w in t.warnings)
+    assert any("floating" in w for w in t.to_api()["warnings"])
+
+
+def test_reference_template_drift_flags():
+    templates, _ = load_templates(REPO_TEMPLATES)
+    # Version-pinned on purpose: no drift warning.
+    assert templates["whisper-batch"].warnings == []
+    # Rides :latest deliberately (documented breadcrumb) -> flagged.
+    assert any("floating" in w for w in templates["sdxl-generate"].warnings)
 
 
 def test_illegal_mount_rejected():

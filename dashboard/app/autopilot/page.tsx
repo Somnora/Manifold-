@@ -20,14 +20,29 @@ const GATE_LABEL: Record<GateableAction, string> = {
   terminate_instance: "shutting one down",
 };
 
+const KIND_LABEL: Record<Brain["kind"], string> = {
+  instance: "GPU instance",
+  local: "this machine",
+  api: "frontier API",
+  cli: "your login",
+};
+
+const KIND_TONE: Record<Brain["kind"], string> = {
+  instance: "bg-emerald-100 text-emerald-800",
+  local: "bg-sky-100 text-sky-800",
+  api: "bg-indigo-100 text-indigo-800",
+  cli: "bg-amber-100 text-amber-800",
+};
+
 // Autopilot: a model (served on one of YOUR instances, running locally, or a
 // frontier API) drives Manifold's guarded operations toward a goal. Every step
-// is recorded below and on the Agent Activity page; budget and concurrency
+// is recorded below and on the Activity page's audit trail; budget and concurrency
 // guards bind the autopilot exactly as they bind you.
 export default function AutopilotPage() {
   const [brain, setBrain] = useState("");
   const [goal, setGoal] = useState("");
   const [maxSteps, setMaxSteps] = useState(20);
+  const [unlimited, setUnlimited] = useState(false);
   // Which actions pause for approval. Seeded from the Settings policy, and
   // overridable for this one run.
   const [gates, setGates] = useState<GateableAction[] | null>(null);
@@ -71,7 +86,8 @@ export default function AutopilotPage() {
       await api.startAutopilot({
         goal: goal.trim(),
         brain,
-        max_steps: maxSteps,
+        max_steps: unlimited ? undefined : maxSteps,
+        unlimited_steps: unlimited,
         approve_actions: gates ?? [],
       });
       setGoal("");
@@ -117,25 +133,51 @@ export default function AutopilotPage() {
               </label>
               <label className="block text-xs font-medium text-zinc-600">
                 Step limit
-                <input
-                  type="number"
-                  min={1}
-                  max={50}
-                  className="mt-1 block w-24 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
-                  value={maxSteps}
-                  onChange={(e) => setMaxSteps(Number(e.target.value))}
-                />
+                <span className="mt-1 flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    disabled={unlimited}
+                    className="block w-24 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm disabled:opacity-40"
+                    value={maxSteps}
+                    onChange={(e) => setMaxSteps(Number(e.target.value))}
+                  />
+                  <label
+                    className="flex cursor-pointer items-center gap-1.5 text-xs font-normal text-zinc-600"
+                    title="The run ends only when the agent finishes, fails, or you cancel it. Spend is still bounded by your guardrails and approval gates - this only unbounds the number of turns."
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 accent-teal-400"
+                      checked={unlimited}
+                      onChange={(e) => setUnlimited(e.target.checked)}
+                    />
+                    unlimited
+                  </label>
+                </span>
               </label>
             </div>
             <textarea
               className="w-full rounded border border-zinc-300 px-2.5 py-1.5 text-sm"
-              rows={2}
+              rows={3}
               placeholder='e.g. "Run the gpu-smoke job on this instance and report whether the GPU is healthy, then stop."'
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
               required
               minLength={4}
             />
+            <p className="text-[11px] text-zinc-400">
+              The goal IS the agent&apos;s briefing - it starts knowing your
+              instances, templates, and guards, and nothing else. Good goals
+              name the outcome, the data&apos;s location on the filesystem, and
+              the bounds: &ldquo;Synthesize 500 Q&amp;A pairs from{" "}
+              <span className="font-mono">datasets/scrape.jsonl</span> using
+              the cheapest GPU that fits, save to{" "}
+              <span className="font-mono">outputs/qa/</span>, terminate when
+              done.&rdquo; If no template fits the work, the agent can author
+              a custom one mid-run (it stays in your Jobs page afterwards).
+            </p>
             <div className="rounded border border-zinc-200 bg-zinc-50 p-2.5">
               <p className="text-xs font-medium text-zinc-600">
                 Ask me before the agent...
@@ -206,6 +248,63 @@ export default function AutopilotPage() {
           )}
         </div>
       </section>
+
+      <section>
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
+          Brains
+        </h2>
+        <div className="space-y-2">
+          {brains.map((b: Brain) => (
+            <div
+              key={b.ref}
+              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-zinc-200 bg-white p-3"
+            >
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span
+                  className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${KIND_TONE[b.kind]}`}
+                >
+                  {KIND_LABEL[b.kind]}
+                </span>
+                <span className="truncate text-sm font-medium">{b.model}</span>
+              </div>
+              <span className="truncate font-mono text-xs text-zinc-400">
+                {b.detail || b.ref}
+              </span>
+            </div>
+          ))}
+          {brains.length === 0 && (
+            <div className="rounded-lg border border-dashed border-zinc-300 p-6 text-sm text-zinc-500">
+              <p className="font-medium text-zinc-600">No brains found yet.</p>
+              <ul className="mt-2 list-inside list-disc space-y-1 text-xs">
+                <li>
+                  Serve a model on a GPU instance (Jobs page,{" "}
+                  <span className="font-mono">vllm-serve</span>) - it appears
+                  here once running.
+                </li>
+                <li>
+                  Start Ollama or LM Studio on this machine - detected
+                  automatically within seconds.
+                </li>
+                <li>
+                  Log into a frontier CLI once (claude, codex, or gemini) -
+                  it appears here via your own subscription, no API key
+                  needed.
+                </li>
+                <li>
+                  Or add an Anthropic / OpenAI / Gemini API key to .env
+                  (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) - the
+                  frontier brain appears on the next refresh.
+                </li>
+              </ul>
+            </div>
+          )}
+        </div>
+        <p className="mt-2 text-xs text-zinc-400">
+          Any brain here can drive a run or be the reasoning end of a
+          pipeline: a local model orchestrating cloud GPUs, a frontier model
+          reviewing a fine-tune, one instance directing another.
+        </p>
+      </section>
     </div>
   );
 }
@@ -250,7 +349,8 @@ function RunCard({ run, onChanged }: { run: AgentRun; onChanged: () => void }) {
         </div>
         <div className="flex shrink-0 items-center gap-3 text-xs text-zinc-500">
           <span>
-            {run.steps_taken}/{run.max_steps} steps
+            {run.steps_taken}/{run.max_steps === 0 ? "∞" : run.max_steps}{" "}
+            steps
           </span>
           <span>{formatDate(run.created_at)}</span>
           {run.status === "running" && (

@@ -137,6 +137,13 @@ export type Launch = {
   launched_at: string | null;
   active_at: string | null;
   terminated_at: string | null;
+  // Structured progress (backend-computed; see launch_progress).
+  phase?: string;
+  phase_detail?: string;
+  settled?: boolean;
+  boot_elapsed_seconds?: number;
+  boot_timeout_seconds?: number;
+  boot_remaining_seconds?: number;
 };
 
 export type StoredFile = {
@@ -169,6 +176,11 @@ export type Template = {
   command: string;
   parameters: TemplateParameter[];
   gpu: { min_vram_gib?: number; recommended_types?: string[] };
+  // Non-fatal advisories (e.g. a floating image tag that may drift).
+  warnings?: string[];
+  // User-authored template (editable/deletable); yaml is its raw source.
+  custom?: boolean;
+  yaml?: string;
 };
 
 export type Lifecycle =
@@ -306,12 +318,18 @@ export type Preferences = {
     max_local_gib: number;
     if_unsaveable: "block" | "terminate";
   };
+  // 0 = "use the config.yaml default" (shown as the placeholder).
+  guardrails: {
+    max_concurrent_instances: number;
+    max_hourly_spend_usd: number;
+  };
 };
 
 export type PreferencesPatch = {
   approvals?: Partial<Record<GateableAction, boolean>>;
   notifications?: Partial<Record<NotificationKind | "desktop", boolean>>;
   data_safety?: Partial<Preferences["data_safety"]>;
+  guardrails?: Partial<Preferences["guardrails"]>;
 };
 
 export type Notification = {
@@ -395,6 +413,12 @@ export const api = {
     request<{ synced_to: string }>(`/instances/${instanceId}/sync`, {
       method: "POST",
       timeoutMs: 10 * 60_000,
+    }),
+
+  renameInstance: (instanceId: string, name: string) =>
+    request<{ name: string }>(`/instances/${instanceId}/name`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
     }),
 
   setKeepAlive: (instanceId: string, enabled: boolean) =>
@@ -509,6 +533,9 @@ export const api = {
     brain?: string; // full brain ref (instance:/local:/api:)
     brain_instance_id?: string; // legacy spelling for instance brains
     max_steps?: number;
+    // No step cap (stored as max_steps 0): the run ends only via
+    // done/cancel/failure. Guards and approval gates still bound the spend.
+    unlimited_steps?: boolean;
     // Which actions pause for approval. Omit to inherit the Settings policy.
     approve_actions?: GateableAction[];
   }) =>
@@ -522,7 +549,22 @@ export const api = {
       preferences: Preferences;
       gateable_actions: GateableAction[];
       notification_kinds: NotificationKind[];
+      guardrail_defaults: {
+        max_concurrent_instances: number;
+        max_hourly_spend_usd: number;
+      };
     }>("/preferences"),
+
+  saveCustomTemplate: (yaml: string) =>
+    request<{ template: Template }>("/templates/custom", {
+      method: "POST",
+      body: JSON.stringify({ yaml }),
+    }).then((r) => r.template),
+
+  deleteCustomTemplate: (name: string) =>
+    request<{ deleted: string }>(`/templates/custom/${name}`, {
+      method: "DELETE",
+    }),
 
   updatePreferences: (patch: PreferencesPatch) =>
     request<{ preferences: Preferences }>("/preferences", {

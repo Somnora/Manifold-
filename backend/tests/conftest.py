@@ -105,9 +105,17 @@ def client(settings, mock_client, mock_storage, mock_sidecar, mock_model,
         model_client_factory=lambda conn: mock_model,
         image_checker=MockImageChecker(),   # offline: no registry calls in tests
         notification_sender=lambda title, body: os_pings.append((title, body)),
+        # Keep custom-template writes inside the test sandbox, never the repo.
+        custom_templates_dir=tmp_path_factory_dir(settings),
     )
     with TestClient(app) as test_client:
         yield test_client
+
+
+def tmp_path_factory_dir(settings) -> "Path":
+    """A custom-templates dir next to the test database (both are tmp)."""
+    from pathlib import Path
+    return Path(settings.db_path).parent / "custom-templates"
 
 
 def set_data_safety(client: TestClient, **policy) -> dict:
