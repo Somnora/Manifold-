@@ -120,6 +120,13 @@ export function TerminalPanel({
       // an unthrottled fit.fit() (a full reflow) plus a resize send per tick
       // was a real source of jank. We also skip the PTY resize unless the
       // grid actually changed, so a drag no longer spams change_terminal_size.
+      // lastCols/lastRows mean "the size the PTY has actually been TOLD", so
+      // they may ONLY be updated on a successful send. Recording a size we
+      // could not send (socket still connecting) made the next fit believe
+      // the PTY already knew it, so the resize was never sent at all: the
+      // shell stayed at its 80x24 default while the view was wider, and the
+      // app wrapped at column 80 and typed back over its own line. Hence the
+      // readyState check BEFORE the dedup, not after it.
       let fitQueued = false;
       let lastCols = 0;
       let lastRows = 0;
@@ -133,19 +140,18 @@ export function TerminalPanel({
           } catch {
             return;
           }
+          if (ws.readyState !== WebSocket.OPEN) return;
           if (term.cols === lastCols && term.rows === lastRows) return;
           lastCols = term.cols;
           lastRows = term.rows;
           term.scrollToBottom();
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "resize",
-                cols: term.cols,
-                rows: term.rows,
-              }),
-            );
-          }
+          ws.send(
+            JSON.stringify({
+              type: "resize",
+              cols: term.cols,
+              rows: term.rows,
+            }),
+          );
         });
       };
 

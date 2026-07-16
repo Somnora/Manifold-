@@ -2342,3 +2342,25 @@ pairing was checked and is correct (xterm 6.0 / fit 0.11 / webgl 0.19), so
 this is instrumentation to END the guessing, not a suspected mismatch.
 
 Lesson: an error path that swallows its reason turns one bug into two.
+
+## 2026-07-16 — The terminal glitch was a resize dedup that never sent
+
+Symptom: typed text wrapped back over the start of its own line, the input
+box kept stale text, and stretching the dock ("jiggling") fixed it. Not the
+renderer: it reproduced identically with ?renderer=dom, which exonerated
+WebGL after the header confirmed webgl was live.
+
+Cause, introduced by my own resize-throttling pass: doFit updated
+lastCols/lastRows BEFORE checking that the socket was open. The first fit
+runs while the WebSocket is still CONNECTING (ResizeObserver fires on
+observe), so it recorded the size and skipped the send; when ws.onopen ran
+doFit again, the dims matched lastCols/lastRows and it returned early. The
+resize was therefore NEVER sent, leaving the pty at its 80x24 default while
+the view was much wider. The app wrapped at column 80 and overwrote its own
+line; any real resize sent a fresh size and resynced it, which is exactly why
+jiggling "fixed" it.
+
+Fix: lastCols/lastRows mean "the size the pty has actually been TOLD", so
+they are only updated on a successful send - the readyState check now comes
+BEFORE the dedup. Lesson: a cache of "what the peer knows" must never be
+written on a path that did not tell the peer.
