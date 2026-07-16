@@ -46,6 +46,15 @@ export function TerminalPanel({
     let disposed = false;
     let cleanup: (() => void) | undefined;
 
+    // Renderer is switchable for diagnosis: add ?renderer=dom to the URL to
+    // force xterm's built-in DOM renderer instead of the GPU one. That is the
+    // A/B for "is a display glitch the renderer's fault?" — if a symptom
+    // survives on dom, the renderer is not the cause. (The canvas renderer is
+    // not an option here: @xterm/addon-canvas still peers on xterm 5.)
+    const wantDom =
+      typeof window !== "undefined"
+      && new URLSearchParams(window.location.search).get("renderer") === "dom";
+
     // xterm touches the DOM at import time in some builds; load it client-side.
     // The WebGL addon is optional: if the chunk or a WebGL context can't be
     // had (headless, blocklisted GPU), the terminal still runs on the DOM
@@ -54,10 +63,12 @@ export function TerminalPanel({
       const [{ Terminal }, { FitAddon }, webglMod] = await Promise.all([
         import("@xterm/xterm"),
         import("@xterm/addon-fit"),
-        import("@xterm/addon-webgl").catch((err) => {
-          console.warn("[manifold] WebGL addon failed to load:", err);
-          return null;
-        }),
+        wantDom
+          ? Promise.resolve(null)
+          : import("@xterm/addon-webgl").catch((err) => {
+              console.warn("[manifold] WebGL addon failed to load:", err);
+              return null;
+            }),
       ]);
       if (disposed) return;
 
