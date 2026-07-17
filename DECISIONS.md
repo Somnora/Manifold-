@@ -2517,3 +2517,15 @@ cost of the other wrong guess is someone's running job). Alternative
 considered: exempting external instances from the idle loop entirely -
 rejected because it removes the user's ability to opt a forgotten external
 box INTO cost protection.
+
+**GPU telemetry falls back to nvidia-smi over SSH.** The telemetry chart
+and sampling loop rode the sidecar exclusively - which only exists on
+instances Manifold launched, because OUR cloud-init installs it. Adopted
+external boxes therefore showed "telemetry unavailable" forever. Now the
+sidecar is tried first (richer, cheaper, streaming), and when it raises,
+metrics come from nvidia-smi --query-gpu over the managed SSH connection
+in the same payload shape (marked source: "ssh"), in all three consumers:
+the 30s sampling loop, GET /metrics, and the chart's WS relay (3s poll).
+Alternative considered: installing the sidecar onto adopted boxes over
+SSH - rejected for now because mutating a machine Manifold does not own
+is a bigger decision than reading nvidia-smi from it.

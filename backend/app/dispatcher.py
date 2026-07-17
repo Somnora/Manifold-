@@ -1285,14 +1285,21 @@ class Dispatcher:
         for instance_id, conn in list(self.orchestrator.connections.items()):
             if conn.state != ConnectionState.CONNECTED:
                 continue
+            gpus = None
             sidecar = self.orchestrator.sidecar_for(instance_id)
-            if sidecar is None:
-                continue
-            try:
-                metrics = await sidecar.metrics()
-            except Exception:
-                continue   # sidecar not up yet / transient: skip this tick
-            gpus = metrics.get("gpus") if metrics.get("available") else None
+            if sidecar is not None:
+                try:
+                    metrics = await sidecar.metrics()
+                    gpus = (metrics.get("gpus")
+                            if metrics.get("available") else None)
+                except Exception:
+                    gpus = None   # sidecar not up yet / not installed
+            if not gpus:
+                # Externally-launched boxes have no sidecar (our cloud-init
+                # never ran there): nvidia-smi over the managed connection.
+                payload = await self.orchestrator.gpu_metrics_via_ssh(
+                    instance_id)
+                gpus = (payload or {}).get("gpus")
             if not gpus:
                 continue
             g = gpus[0]
