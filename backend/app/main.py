@@ -191,6 +191,10 @@ class KeepAliveRequest(BaseModel):
     enabled: bool
 
 
+class ProjectBriefRequest(BaseModel):
+    content: str = Field(max_length=20000)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -2026,6 +2030,19 @@ def create_app(
     @app.get("/audit")
     async def list_audit(actor: str | None = None, limit: int = 200):
         return {"entries": db.list_audit(actor=actor, limit=limit)}
+
+    @app.get("/project-brief")
+    async def get_project_brief():
+        """The persistent Autopilot project brief (see agent._run_loop)."""
+        return db.get_project_brief()
+
+    @app.put("/project-brief")
+    async def set_project_brief(req: ProjectBriefRequest):
+        db.set_project_brief(req.content.strip())
+        db.record_audit(
+            "dashboard", "project_brief_updated",
+            f"{len(req.content.strip())} chars")
+        return db.get_project_brief()
 
     @app.get("/worklog")
     async def get_worklog(limit: int = 20):

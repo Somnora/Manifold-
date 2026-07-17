@@ -577,6 +577,15 @@ export const api = {
       body: JSON.stringify(body),
     }).then((r) => r.run),
 
+  projectBrief: () =>
+    request<{ content: string; updated_at: string | null }>("/project-brief"),
+
+  setProjectBrief: (content: string) =>
+    request<{ content: string; updated_at: string | null }>("/project-brief", {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    }),
+
   preferences: () =>
     request<{
       preferences: Preferences;
