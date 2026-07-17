@@ -15,6 +15,35 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+# Launch rows in any of these states may have a REAL instance attached (or
+# about to attach). Everything else is settled history.
+LIVE_LAUNCH_STATUSES = ("launching", "retrying", "booting", "active")
+
+
+def live_launches(db_path: str) -> list[dict]:
+    """Launches in the database at `db_path` that may still have a real
+    instance behind them. Read-only and tolerant of a missing file or
+    table: used by the mock-mode startup guard, which must be able to
+    inspect the REAL database without opening it for writing."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return []          # no database yet: nothing live
+    try:
+        conn.row_factory = sqlite3.Row
+        marks = ",".join("?" for _ in LIVE_LAUNCH_STATUSES)
+        rows = conn.execute(
+            f"SELECT id, requested_type, region, status FROM launches "
+            f"WHERE status IN ({marks})",
+            LIVE_LAUNCH_STATUSES,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []          # schema not created yet
+    finally:
+        conn.close()
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS launches (
     id                  TEXT PRIMARY KEY,

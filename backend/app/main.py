@@ -254,6 +254,36 @@ def create_app(
         settings = replace(
             settings, ssh=replace(settings.ssh, key_name="mock-key")
         )
+        # Mock isolation (incident 2026-07-17: a mock backend started for
+        # screenshots swapped fixture state under a live agent session and
+        # reconciled its real in-flight launch against the mock catalog).
+        # 1. REFUSE to start while the real database records launches that
+        #    may still have paying instances behind them - every client on
+        #    this port would silently switch to fixture data mid-session.
+        # 2. Fixture state lives in its own database file, so mock can
+        #    never read or rewrite real rows even when it does run.
+        from pathlib import Path as _Path
+        from .db import live_launches
+        real_db = _Path(settings.db_path)
+        if os.environ.get("MANIFOLD_MOCK_FORCE", "") != "1":
+            live = live_launches(str(real_db))
+            if live:
+                names = ", ".join(
+                    f"{l['id']} ({l['requested_type']} in {l['region']}, "
+                    f"{l['status']})" for l in live[:5])
+                raise SystemExit(
+                    f"manifold: refusing to start in mock mode: the real "
+                    f"database ({real_db}) has {len(live)} launch(es) that "
+                    f"may still be running: {names}. A mock backend here "
+                    f"would serve fixture data to every connected client "
+                    f"and could strand a paying instance. Terminate them "
+                    f"first, or set MANIFOLD_MOCK_FORCE=1 if you are sure."
+                )
+        settings = replace(
+            settings,
+            db_path=str(real_db.with_name(
+                real_db.stem + "-mock" + (real_db.suffix or ".db"))),
+        )
     elif lambda_client is None:
         # Real mode: never crash on a missing key. Start with a placeholder
         # that returns a clear "configure me" error on every call; the
@@ -623,7 +653,11 @@ def create_app(
         pick an available, co-located target instead of guessing a region."""
         types = await lambda_client.list_instance_types()
         filesystems = await lambda_client.list_filesystems()
-        return launch_options(types, filesystems)
+        options = launch_options(types, filesystems)
+        # Agents act on this data: fixture state must be self-identifying
+        # (an agent once had to spot a TEST-NET IP to detect mock mode).
+        options["mock"] = mock
+        return options
 
     @app.get("/regions")
     async def list_regions():
@@ -680,7 +714,9 @@ def create_app(
                 dispatcher.idle_status(inst["id"])
                 if inst["connection_state"] == "connected" else None
             )
-        return {"instances": instances}
+        # Agents act on this data: fixture state must be self-identifying
+        # (an agent once had to spot a TEST-NET IP to detect mock mode).
+        return {"instances": instances, "mock": mock}
 
     @app.post("/instances/{instance_id}/keep-alive")
     async def set_keep_alive(instance_id: str, req: KeepAliveRequest):
@@ -2083,7 +2119,9 @@ def create_app(
                     "bytes_used": fs.bytes_used,
                 }
                 for fs in await lambda_client.list_filesystems()
-            ]
+            ],
+            # Self-identifying fixture state; see /instances.
+            "mock": mock,
         }
 
     @app.post("/filesystems", status_code=201)
