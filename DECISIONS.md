@@ -2594,3 +2594,31 @@ the spinners and glyphs Claude Code draws get the wrong cell width, so
 the app and terminal disagree about the cursor column - unicode11 addon
 fixes the tables. Also: macOptionIsMeta (Option+Enter newline,
 Option+arrow word jumps), Cmd+K clear, shortcuts on the header tooltip.
+
+**Filesystem creation in-app; deletion deliberately not.** Lambda's API
+supports POST /filesystems (create is free; storage bills by GB-month
+used), so the Storage page and MCP create_filesystem let a filebase be
+created in any known region without the Lambda console - the missing
+step when capacity appears in a region with no storage. Deletion stays
+console-only for now: it destroys data, and doing it right in Manifold
+means wiring the data-safety policy (what is on it, what would be lost)
+first. Note the API quirk: list is GET /file-systems, create is POST
+/filesystems.
+
+**No in-app credits balance: Lambda has no billing API.** Verified
+against the Cloud API docs: no endpoint exposes credits, invoices, or
+balance; the console (Settings > Billing) is the only surface. Settings
+now says exactly that and deep-links it, instead of showing a number we
+cannot actually know (data honesty over decoration).
+
+**Model presets follow Lambda's per-model benchmark pages.** Tiers for
+the big MoE presets now cite lambda.ai/inference-models/<repo>,
+constrained to instance types that exist ON-DEMAND (there is no 4x B200
+type, so Hy3 maps to 8x H100). Wording preempts the HGX misread: "1x
+NVIDIA HGX B200" on those pages is one 8-GPU SYSTEM (--tp 8), not one
+card. Added (all verified ungated on HF 2026-07-17): Carbon-3B (A10),
+LFM2.5-8B-A1B (A100), Nemotron-3-Ultra NVFP4 and Step-3.7-Flash (8x
+H100), MiniMax-M3, Kimi-K2.6, Kimi-K2.7-Code (8x B200). DeepSeek-V4-Pro
+deliberately excluded: Lambda serves it with data+expert parallelism,
+which vllm-serve (tensor parallel only) cannot express; a custom
+template is the path for it.

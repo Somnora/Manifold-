@@ -96,6 +96,11 @@ class TaskRequest(BaseModel):
     target_instance_id: str | None = None
 
 
+class CreateFilesystemRequest(BaseModel):
+    name: str
+    region: str
+
+
 class WatchRequest(BaseModel):
     instance_type: str
     region: str
@@ -2046,6 +2051,13 @@ def create_app(
                 for fs in await lambda_client.list_filesystems()
             ]
         }
+
+    @app.post("/filesystems", status_code=201)
+    async def create_filesystem(req: CreateFilesystemRequest):
+        """Create a persistent filesystem in a region, without leaving for
+        the Lambda console. Creation is free; storage bills by GB-month
+        actually used."""
+        return await orchestrator.create_filesystem(req.name, req.region)
 
     async def _storage_for(filesystem: str) -> StorageClient:
         filesystems = {fs.name: fs for fs in await lambda_client.list_filesystems()}
