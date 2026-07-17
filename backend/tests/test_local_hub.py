@@ -364,6 +364,31 @@ def test_local_terminal_echoes_and_respects_origin(tmp_path):
             assert "manifold_36" in seen
 
 
+def test_local_terminal_model_env_wires_the_shell(tmp_path):
+    """?model=<id> pre-wires the shell's env to the served model through
+    the OpenAI proxy (the Open-in-terminal button), and says so in a
+    banner that lands in scrollback."""
+    app, _, _ = registry_client(tmp_path)
+    with TestClient(app) as client:
+        with client.websocket_connect(
+                "/local/terminal?model=Qwen/Qwen3-8B",
+                headers={"origin": "http://localhost:3000"}) as ws:
+            ws.send_json({"type": "input",
+                          "data": "echo wired_${MANIFOLD_MODEL}"
+                                  "_${OPENAI_BASE_URL}\n"})
+            deadline = time.monotonic() + 8
+            seen = ""
+            while time.monotonic() < deadline:
+                seen += ws.receive_text()
+                if "wired_Qwen/Qwen3-8B_http://127.0.0.1:" in seen:
+                    break
+            assert "wired_Qwen/Qwen3-8B_http://127.0.0.1:" in seen
+            assert "/v1" in seen
+            # The banner explains the wiring (recorded via feed -> replayed
+            # on any later reattach too).
+            assert "wired to your served model" in seen
+
+
 # -- cli brains (frontier CLIs via the user's own login) -------------------------------
 
 

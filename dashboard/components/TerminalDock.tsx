@@ -50,6 +50,9 @@ type Session = {
   kind: PanelKind;
   instanceId?: string;
   label: string;
+  // Local shells only: shell env pre-wired to this served model (the
+  // "Open in terminal" button on a running serve job).
+  model?: string;
 };
 
 type Position = "bottom" | "right";
@@ -66,6 +69,10 @@ type DockState = {
   // Chat / recent files / file browser for an instance, as a dock tab.
   dockPanel: (kind: "chat" | "files" | "browse", instanceId: string,
               name: string) => void;
+  // A local shell whose env is pre-wired to a served model (OPENAI_BASE_URL
+  // at the proxy, MANIFOLD_MODEL set): any OpenAI-compatible CLI started in
+  // it talks to the user's own GPU.
+  openModelShell: (model: string) => void;
 };
 
 const DockContext = createContext<DockState | null>(null);
@@ -222,6 +229,18 @@ export function TerminalDockProvider({
     [sessions],
   );
 
+  const openModelShell = useCallback((model: string) => {
+    const short = model.split("/").pop() || model;
+    const id = `model:${model}`;
+    setSessions((s) =>
+      s.some((x) => x.id === id)
+        ? s
+        : [...s, { id, kind: "local" as const, model, label: `${short} CLI` }],
+    );
+    setActive(id);
+    setOpen(true);
+  }, []);
+
   const dockPanel = useCallback(
     (kind: "chat" | "files" | "browse", instanceId: string, name: string) => {
       const id = `${kind}:${instanceId}`;
@@ -323,7 +342,8 @@ export function TerminalDockProvider({
 
   return (
     <DockContext.Provider
-      value={{ open, sessions, toggleLocal, addLocal, dockInstance, dockPanel }}
+      value={{ open, sessions, toggleLocal, addLocal, dockInstance, dockPanel,
+               openModelShell }}
     >
       {children}
 
@@ -490,13 +510,16 @@ function SessionBody({ session: s }: { session: Session }) {
         fill
         instanceId={s.instanceId}
         wsPath={s.kind === "local" ? "/local/terminal" : undefined}
+        model={s.model}
         // The dock tab id doubles as the backend session id, so a refresh
         // reattaches this panel to the same still-running shell.
         sessionId={s.id}
         label={
-          s.kind === "local"
-            ? "Shell on this machine (loopback-only)"
-            : `${s.label} (SSH via the managed connection)`
+          s.model
+            ? `Shell wired to ${s.model} (via the local proxy)`
+            : s.kind === "local"
+              ? "Shell on this machine (loopback-only)"
+              : `${s.label} (SSH via the managed connection)`
         }
       />
     );

@@ -2622,3 +2622,16 @@ H100), MiniMax-M3, Kimi-K2.6, Kimi-K2.7-Code (8x B200). DeepSeek-V4-Pro
 deliberately excluded: Lambda serves it with data+expert parallelism,
 which vllm-serve (tensor parallel only) cannot express; a custom
 template is the path for it.
+
+**"Open in terminal" wires a local shell to a served model via env, not
+config files.** A running serve job's card opens a Local Machine dock tab
+whose shell is spawned with OPENAI_BASE_URL/OPENAI_API_BASE pointed at
+the OpenAI proxy, OPENAI_API_KEY set (proxy key or a placeholder), and
+MANIFOLD_MODEL naming the model - so any OpenAI-compatible CLI started
+there (aider, opencode, ...) talks to the user's own GPU with zero
+setup. The client passes only ?model=<id>; the backend composes the env
+itself (values land in the child's environment, never in a shell
+command), and a banner recorded in scrollback explains the wiring.
+Alternative considered: writing CLI-specific config files - rejected
+because env vars are the one interface every OpenAI-compatible tool
+already honors.

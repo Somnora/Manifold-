@@ -910,8 +910,22 @@ def create_app(
         import termios
 
         shell = os.environ.get("SHELL") or shutil.which("zsh") or "/bin/sh"
+        # ?model=<id>: pre-wire this shell to a model served through the
+        # OpenAI-compatible proxy, so any OpenAI-compatible CLI started in
+        # it (aider, opencode, ...) talks to the user's own served model
+        # with zero setup. Values land in the child's ENV only - nothing is
+        # interpolated into a shell command.
+        model = ws.query_params.get("model", "")[:200]
+        proxy_port = os.environ.get("MANIFOLD_PORT", "8000")
+        proxy_base = f"http://127.0.0.1:{proxy_port}/v1"
         pid, fd = pty.fork()
         if pid == 0:                       # child: become the user's shell
+            if model:
+                os.environ["OPENAI_BASE_URL"] = proxy_base
+                os.environ["OPENAI_API_BASE"] = proxy_base   # older SDKs
+                os.environ["OPENAI_API_KEY"] = (
+                    settings.proxy_api_key or "manifold")
+                os.environ["MANIFOLD_MODEL"] = model
             os.execvp(shell, [shell, "-l"])
 
         loop = asyncio.get_event_loop()
@@ -978,7 +992,18 @@ def create_app(
 
         session.pump_task = asyncio.create_task(pump_output())
         term_sessions.register(session)
-        db.record_audit("dashboard", "local_terminal_open", shell)
+        if model:
+            # Through feed(), so the banner lands in scrollback and a
+            # reattach after refresh replays it too.
+            await session.feed(
+                f"\r\n[manifold] this shell is wired to your served model:"
+                f"\r\n[manifold]   OPENAI_BASE_URL={proxy_base}"
+                f"\r\n[manifold]   MANIFOLD_MODEL={model}"
+                f"\r\n[manifold] any OpenAI-compatible CLI started here "
+                f"talks to it, e.g.: aider --model openai/$MANIFOLD_MODEL"
+                f"\r\n\r\n")
+        db.record_audit("dashboard", "local_terminal_open",
+                        f"{shell} (model env: {model})" if model else shell)
         await _drive_terminal(ws, session, persistent=bool(sid))
 
     # -- chat with a served model -----------------------------------------------
