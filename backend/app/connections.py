@@ -295,8 +295,14 @@ class ManagedConnection:
         finally:
             sftp.exit()
 
-    async def sftp_read(self, remote_path: str, chunk_size: int = 65536):
-        """Async iterator over a remote file's bytes."""
+    async def sftp_read(self, remote_path: str, chunk_size: int = 65536,
+                        *, offset: int = 0, max_bytes: int | None = None):
+        """Async iterator over a remote file's bytes.
+
+        `offset`/`max_bytes` carve out a byte range, which is what lets a
+        large download resume across bounded requests instead of holding
+        one socket for the whole transfer (see the ranged download route).
+        """
         if self.state != ConnectionState.CONNECTED or self._conn is None:
             raise ConnectionError(
                 f"no SSH connection to {self.host} (state: {self.state.value})"
@@ -305,13 +311,36 @@ class ManagedConnection:
         try:
             f = await sftp.open(remote_path, "rb")
             try:
-                while True:
-                    chunk = await f.read(chunk_size)
+                if offset:
+                    await f.seek(offset)
+                remaining = max_bytes
+                while remaining is None or remaining > 0:
+                    want = chunk_size if remaining is None \
+                        else min(chunk_size, remaining)
+                    chunk = await f.read(want)
                     if not chunk:
                         break
+                    if remaining is not None:
+                        remaining -= len(chunk)
                     yield chunk
             finally:
                 await f.close()
+        finally:
+            sftp.exit()
+
+    async def sftp_size(self, remote_path: str) -> int:
+        """Size of a remote file in bytes (raises FileNotFoundError)."""
+        if self.state != ConnectionState.CONNECTED or self._conn is None:
+            raise ConnectionError(
+                f"no SSH connection to {self.host} (state: {self.state.value})"
+            )
+        sftp = await self._conn.start_sftp_client()
+        try:
+            try:
+                attrs = await sftp.stat(remote_path)
+            except asyncssh.SFTPNoSuchFile:
+                raise FileNotFoundError(remote_path)
+            return int(attrs.size)
         finally:
             sftp.exit()
 
@@ -507,6 +536,9 @@ class _MockSFTPFile:
             self._pos += len(chunk)
         return chunk
 
+    async def seek(self, pos: int) -> None:
+        self._pos = pos
+
     async def close(self) -> None:
         pass
 
@@ -523,6 +555,15 @@ class MockSFTP:
 
     async def open(self, path: str, mode: str) -> _MockSFTPFile:
         return _MockSFTPFile(self.store, path, mode)
+
+    async def stat(self, path: str):
+        if path not in self.store:
+            raise FileNotFoundError(f"[mock sftp] no such file: {path}")
+
+        class _Attrs:
+            size = len(self.store[path])
+
+        return _Attrs()
 
     def exit(self) -> None:
         pass

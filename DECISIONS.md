@@ -2813,3 +2813,31 @@ Alternative considered: a different default port for mock mode -
 rejected because the dashboard and MCP bridge target one port by
 convention, and the failure was state substitution, not port collision;
 isolating the state removes the harm regardless of port.
+
+## 2026-07-18 — MCP transfers and waits fit inside the client's timeout
+
+Two reliability items from the Game Admin report (2026-07-17): tool
+calls were dying at the MCP client's ~60s request timeout while the
+underlying work succeeded server-side.
+
+**download_file is resumable, in bounded chunks.** A 127MB batch output
+required manual split -b 30m / reassemble on the instance. The download
+route now serves byte ranges (offset/max_bytes, X-File-Size header, 416
+when the offset outruns the file - i.e. the remote changed) via a seek
+on the SFTP handle, and the MCP tool fetches 16MB chunks into
+<local_path>.part, returning complete=false with progress before the
+~60s client timeout can fire. Calling again with the same arguments
+resumes from the .part size; a 416 restarts from zero (remote file was
+regenerated); on completion the .part is renamed into place. The whole
+transfer is restart-proof at every layer that can time out.
+
+**wait_for_launch and run_command self-limit to 50s.** The old
+wait_for_launch defaulted to 120s (cap 300) - guaranteed to outlive the
+client timeout it cannot see, surfacing as MCP error -32001 on every
+slow boot even though the launch was fine. Each call now parks at most
+50s server-side and returns settled=false with boot progress: the
+"still booting, call again" answer IS the poll token, and the docstring
+says so. run_command gets the same 50s cap with explicit guidance:
+longer work belongs in run_job or a detached nohup + follow-up check.
+Alternative considered: raising the client's own timeout - not ours to
+control; the server fitting inside the contract works with every client.

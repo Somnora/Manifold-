@@ -1428,16 +1428,39 @@ def create_app(
         return {"path": remote, "bytes": written}
 
     @app.get("/instances/{instance_id}/files/download")
-    async def download_file(instance_id: str, path: str):
-        """Stream a file down from the instance over SFTP."""
+    async def download_file(instance_id: str, path: str,
+                            offset: int = 0, max_bytes: int | None = None):
+        """Stream a file down from the instance over SFTP.
+
+        `offset`/`max_bytes` serve a byte range, and X-File-Size always
+        carries the full remote size - together they let a client fetch a
+        big file as a series of short, resumable requests (the MCP
+        download_file tool does exactly this; one long-held socket dies at
+        every proxy/client timeout in the chain).
+        """
         import posixpath
         from fastapi.responses import StreamingResponse
         conn = _connected(instance_id)
         remote = _resolve_remote_path(instance_id, path)
 
+        try:
+            total = await conn.sftp_size(remote)
+        except FileNotFoundError:
+            raise HTTPException(404, f"{remote} not found on the instance")
+        except ConnectionError as exc:
+            raise HTTPException(409, str(exc))
+        except Exception as exc:
+            raise HTTPException(502, f"download failed: {exc}")
+        if offset < 0 or offset > total:
+            raise HTTPException(
+                416,
+                f"offset {offset} is outside the file (size {total}); the "
+                f"remote file may have changed since the last chunk",
+            )
+
         # Pull the first chunk BEFORE responding, so missing files are a
         # real 404 instead of a broken 200 stream.
-        gen = conn.sftp_read(remote)
+        gen = conn.sftp_read(remote, offset=offset, max_bytes=max_bytes)
         first = b""
         try:
             first = await gen.__anext__()
@@ -1464,7 +1487,9 @@ def create_app(
             stream(),
             media_type="application/octet-stream",
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-File-Size": str(total),
+                "X-Offset": str(offset),
             },
         )
 

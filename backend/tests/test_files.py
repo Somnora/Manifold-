@@ -161,7 +161,7 @@ async def test_mcp_upload_download_roundtrip(mcp_wired_client, mock_client,
     out = tmp_path / "downloads" / "sprite.glb"
     result = await mcp_server.download_file("outputs/sprite.glb", str(out),
                                             note="fetch the mesh")
-    assert result == {"local_path": str(out), "bytes": 10}
+    assert result == {"local_path": str(out), "bytes": 10, "complete": True}
     assert out.read_bytes() == b"mesh-bytes"
 
 
@@ -303,3 +303,78 @@ def test_mcp_server_still_structurally_thin():
     # asyncio: stdlib retry plumbing for wait_for_launch, not backend access.
     assert imported <= {"__future__", "asyncio", "os", "typing", "httpx",
                         "mcp.server.fastmcp"}
+
+# -- ranged download + resumable MCP download (Game Admin report 2026-07-17) ------
+
+
+def test_download_range_slices_and_reports_size(client):
+    _, instance_id = launch_connected(client)
+    store = sftp_store(client, instance_id)
+    store["/lambda/nfs/manifold-data/outputs/big.bin"] = b"0123456789"
+
+    resp = client.get(
+        f"/instances/{instance_id}/files/download",
+        params={"path": "outputs/big.bin", "offset": 3, "max_bytes": 4},
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"3456"
+    assert resp.headers["x-file-size"] == "10"
+    assert resp.headers["x-offset"] == "3"
+
+    # An offset past the end means the remote file changed: explicit 416.
+    resp = client.get(
+        f"/instances/{instance_id}/files/download",
+        params={"path": "outputs/big.bin", "offset": 11},
+    )
+    assert resp.status_code == 416
+
+
+async def test_mcp_download_resumes_across_calls(mcp_wired_client, mock_client,
+                                                 tmp_path, monkeypatch):
+    """A big file with a tiny time budget: the first call returns partial
+    progress instead of timing out, the second call resumes the .part and
+    completes. This is the incident fix - a 127MB output needed manual
+    split/reassemble before."""
+    app = mcp_wired_client
+    instance_id = await _launch_connected_async(app, mock_client)
+    conn = app.state.orchestrator.connections[instance_id]
+    data = bytes(range(256)) * 40                      # 10240 bytes
+    conn.ssh_connection().sftp_files[
+        "/lambda/nfs/manifold-data/outputs/big.glb"] = data
+
+    monkeypatch.setattr(mcp_server, "DOWNLOAD_CHUNK_BYTES", 4096)
+    monkeypatch.setattr(mcp_server, "DOWNLOAD_TIME_BUDGET_SECONDS", 0.0)
+    out = tmp_path / "big.glb"
+
+    first = await mcp_server.download_file("outputs/big.glb", str(out))
+    assert first["complete"] is False
+    assert first["bytes_done"] == 4096
+    assert first["total_bytes"] == len(data)
+    assert (tmp_path / "big.glb.part").exists()
+    assert not out.exists()
+
+    # Same arguments again: resumes, and with a real budget it finishes.
+    monkeypatch.setattr(mcp_server, "DOWNLOAD_TIME_BUDGET_SECONDS", 40.0)
+    second = await mcp_server.download_file("outputs/big.glb", str(out))
+    assert second == {"local_path": str(out), "bytes": len(data),
+                      "complete": True}
+    assert out.read_bytes() == data
+    assert not (tmp_path / "big.glb.part").exists()   # cleaned up
+
+
+async def test_mcp_download_restarts_when_remote_changed(
+        mcp_wired_client, mock_client, tmp_path):
+    """A stale .part larger than the remote file (file was regenerated
+    smaller) must not poison the download: the tool restarts from zero."""
+    app = mcp_wired_client
+    instance_id = await _launch_connected_async(app, mock_client)
+    conn = app.state.orchestrator.connections[instance_id]
+    conn.ssh_connection().sftp_files[
+        "/lambda/nfs/manifold-data/outputs/o.bin"] = b"fresh"
+
+    out = tmp_path / "o.bin"
+    (tmp_path / "o.bin.part").write_bytes(b"x" * 100)  # stale, too big
+
+    result = await mcp_server.download_file("outputs/o.bin", str(out))
+    assert result["complete"] is True
+    assert out.read_bytes() == b"fresh"
