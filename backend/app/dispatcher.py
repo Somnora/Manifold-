@@ -178,9 +178,26 @@ def wrap_remote_command(docker_cmd: str, remote_log: str, *,
     gate: two crashed vllm-serve jobs showed green.
     """
     mkdirs = " ".join(shlex.quote(d) for d in ensure_dirs)
+    # The job must SURVIVE the streaming SSH session. A backend restart (or
+    # network blip) kills the session; when the docker client was the
+    # session's child piping into the channel, the container died with it
+    # (observed live: exit 141, SIGPIPE, 2026-07-16). So the container runs
+    # detached under nohup with its output going to the persistent LOG FILE
+    # (never the SSH pipe), then writes its exit code to <task>.exit. The
+    # session merely follows the log and waits for the exit file: if the
+    # session dies, only the tail dies, and a restarted backend re-adopts
+    # the task by polling for the exit file (_readopt_running_tasks).
+    # nohup over setsid: same immunity for this shape, and it exists on
+    # macOS too, so the wrapper tests can execute it in a real shell.
+    log_q = shlex.quote(remote_log)
+    exit_q = shlex.quote(remote_log.rsplit(".", 1)[0] + ".exit")
+    runner = f"({docker_cmd}) > {log_q} 2>&1; echo $? > {exit_q}"
     return (
-        f"mkdir -p {mkdirs} && set -o pipefail && "
-        f"({docker_cmd}) 2>&1 | tee {shlex.quote(remote_log)}"
+        f"mkdir -p {mkdirs} && rm -f {exit_q} && : > {log_q} && "
+        f"nohup bash -c {shlex.quote(runner)} < /dev/null > /dev/null 2>&1 & "
+        f"tail -n +1 -F {log_q} 2>/dev/null & TAILPID=$!; "
+        f"while [ ! -f {exit_q} ]; do sleep 2; done; sleep 1; "
+        f"kill $TAILPID 2>/dev/null; rc=$(cat {exit_q}); exit $rc"
     )
 
 
@@ -256,6 +273,7 @@ class Dispatcher:
 
     def start(self) -> None:
         self._loops = [
+            asyncio.create_task(self._readopt_running_tasks()),
             asyncio.create_task(self._task_loop()),
             asyncio.create_task(self._idle_loop()),
             asyncio.create_task(self._watch_loop()),
@@ -517,6 +535,102 @@ class Dispatcher:
         for task, instance_id, conn in self._pick_dispatchable():
             self._dispatching[task["id"]] = asyncio.create_task(
                 self._run_task_guarded(task, instance_id, conn))
+
+    async def _readopt_running_tasks(self) -> None:
+        """Re-adopt tasks left 'running' by a backend restart.
+
+        The restart kills the SSH session that was streaming the job, but the
+        container keeps running on the instance, so before this the task sat
+        'running' forever with frozen logs (found live, 2026-07-16). The
+        wrapped command persists the container's exit code to
+        task-logs/<id>.exit on the filesystem, so re-adoption is: wait for the
+        instance's connection, then poll for that file and finish the task
+        with the real exit code. Live log lines during the gap stay in the
+        archived task-logs/<id>.log (noted in the job log)."""
+        running = [t for t in self.queue.list() if t["status"] == "running"]
+        if not running:
+            return
+        await asyncio.gather(*(self._readopt_one(t) for t in running))
+
+    async def _readopt_one(self, task: dict) -> None:
+        task_id = task["id"]
+        instance_id = task.get("instance_id") or ""
+        launch = self.db.find_launch_by_instance(instance_id)
+        filesystem = (launch or {}).get("filesystem")
+        if not filesystem:
+            self._finish_task(task_id, exit_code=-1, output_paths=[],
+                              error="backend restarted; instance or its "
+                                    "filesystem is gone")
+            return
+        remote_log = f"/lambda/nfs/{filesystem}/task-logs/{task_id}.log"
+        exit_file = f"/lambda/nfs/{filesystem}/task-logs/{task_id}.exit"
+        self.queue.append_log(
+            task_id,
+            f"[manifold] backend restarted; reattached (live lines during "
+            f"the gap are in {remote_log})")
+        self.db.record_audit("backend", "task_readopt",
+                             f"{task_id} on {instance_id}")
+        template = self.templates.get(task["template"])
+        outputs = (output_paths_for(template, task["parameters"], filesystem)
+                   if template else [])
+        while True:
+            conn = self.orchestrator.connections.get(instance_id)
+            if conn is None or conn.state != ConnectionState.CONNECTED:
+                # Connection manager is (re)dialing; if the instance is truly
+                # gone the launch row flips to terminated and we fail honestly.
+                if launch and (self.db.get_launch(launch["id"]) or {}).get(
+                        "status") == "terminated":
+                    self._finish_task(
+                        task_id, exit_code=-1, output_paths=[],
+                        error="instance terminated while the task was "
+                              "detached from a backend restart")
+                    return
+                await asyncio.sleep(5.0)
+                continue
+            try:
+                code, out, _ = await conn.run(
+                    f"cat {shlex.quote(exit_file)} 2>/dev/null || "
+                    f"docker inspect -f '{{{{.State.Status}}}}' "
+                    f"manifold-task-{task_id} 2>/dev/null || echo gone")
+            except Exception:
+                await asyncio.sleep(5.0)
+                continue
+            state = out.strip().splitlines()[-1] if out.strip() else "gone"
+            if state.lstrip("-").isdigit():
+                exit_code = int(state)
+                self.queue.append_log(
+                    task_id,
+                    f"[manifold] exited {exit_code}; log archived at "
+                    f"{remote_log}")
+                self._finish_task(
+                    task_id, exit_code=exit_code, output_paths=outputs,
+                    error="" if exit_code == 0
+                          else f"container exited {exit_code}")
+                return
+            if state == "gone":
+                # No exit file and no container: it finished and was removed
+                # before the exit file existed (task predates this fix).
+                self._finish_task(
+                    task_id, exit_code=-1, output_paths=outputs,
+                    error=f"backend restarted mid-task and the container is "
+                          f"gone; result unknown, output log at {remote_log}")
+                return
+            if state == "exited":
+                # Container exists but stopped, and no exit file (old wrap):
+                # the exit code is still on the container itself.
+                try:
+                    _, code_out, _ = await conn.run(
+                        f"docker inspect -f '{{{{.State.ExitCode}}}}' "
+                        f"manifold-task-{task_id}")
+                    exit_code = int(code_out.strip())
+                except Exception:
+                    exit_code = -1
+                self._finish_task(
+                    task_id, exit_code=exit_code, output_paths=outputs,
+                    error="" if exit_code == 0
+                          else f"container exited {exit_code}")
+                return
+            await asyncio.sleep(5.0)   # still running; keep waiting
 
     async def _run_task_guarded(self, task: dict, instance_id: str,
                                 conn: ManagedConnection) -> None:

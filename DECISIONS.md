@@ -2313,3 +2313,81 @@ PermissionError, so it would otherwise have escaped as a generic 500.
 
 The raw detail is still appended in parens: the hint explains, it never hides
 what the OS said.
+
+## 2026-07-16 — Terminal still froze: show the renderer, fix the flow-control valve
+
+The freeze survived the flow-control fix (confirmed with a restarted backend
+and a hard-refreshed tab, so the fix WAS live). Two problems, both mine:
+
+**1. The safety valve defeated the mechanism.** `await_writable()` timed out
+after 5s and resumed sending. That valve exists for a client that CANNOT ack
+(an old tab predating flow control) — but a browser choking on render also
+stops acking, so the valve fired exactly when the pause was needed, and the
+backend resumed flooding mid-choke. Now the budget depends on evidence: a
+client that has NEVER acked gets FLOW_WAIT_TIMEOUT (5s, then stream unpaced —
+no stall); a client that HAS acked demonstrably speaks the protocol and is
+merely busy, so it gets FLOW_BUSY_TIMEOUT (60s), long enough for a real
+render backlog. The long bound still exists only so a browser that dies
+without closing its socket cannot wedge the shell forever; a timeout there
+now logs a warning instead of passing silently. attach() resets the ack count
+because a new viewer's protocol support is unknown again.
+
+**2. A silent fallback hid the likeliest cause.** WebGL init was wrapped in a
+bare `except`/`.catch(() => null)`, so if the GPU renderer never took (no
+context, blocklisted GPU, too many live contexts across dock tabs), the panel
+quietly ran xterm's much slower DOM renderer — indistinguishable from "the
+fix didn't work". The active renderer is now state, shown in the panel header
+(`webgl` grey / `dom` amber) with the reason logged to the console. Version
+pairing was checked and is correct (xterm 6.0 / fit 0.11 / webgl 0.19), so
+this is instrumentation to END the guessing, not a suspected mismatch.
+
+Lesson: an error path that swallows its reason turns one bug into two.
+
+## 2026-07-16 — The terminal glitch was a resize dedup that never sent
+
+Symptom: typed text wrapped back over the start of its own line, the input
+box kept stale text, and stretching the dock ("jiggling") fixed it. Not the
+renderer: it reproduced identically with ?renderer=dom, which exonerated
+WebGL after the header confirmed webgl was live.
+
+Cause, introduced by my own resize-throttling pass: doFit updated
+lastCols/lastRows BEFORE checking that the socket was open. The first fit
+runs while the WebSocket is still CONNECTING (ResizeObserver fires on
+observe), so it recorded the size and skipped the send; when ws.onopen ran
+doFit again, the dims matched lastCols/lastRows and it returned early. The
+resize was therefore NEVER sent, leaving the pty at its 80x24 default while
+the view was much wider. The app wrapped at column 80 and overwrote its own
+line; any real resize sent a fresh size and resynced it, which is exactly why
+jiggling "fixed" it.
+
+Fix: lastCols/lastRows mean "the size the pty has actually been TOLD", so
+they are only updated on a successful send - the readyState check now comes
+BEFORE the dedup. Lesson: a cache of "what the peer knows" must never be
+written on a path that did not tell the peer.
+
+## 2026-07-17 — Restart-proof jobs: detached containers + task re-adoption
+
+Live hardening pass found the worst backend bug yet: a backend restart
+(--reload on every file save) mid-job first ORPHANED the task (logs frozen,
+'running' forever), and on the second live test actually KILLED the
+container (exit 141, SIGPIPE): the docker client piped into the SSH channel,
+so the channel's death took the job with it.
+
+Fix, two layers:
+- wrap_remote_command now runs the container DETACHED (nohup, output to the
+  persistent task log, never the SSH pipe) and writes its exit code to
+  task-logs/<id>.exit; the streaming session just tails the log and waits
+  for the exit file. Any session death only kills the tail. nohup over
+  setsid because macOS has no setsid and the wrapper tests execute in a
+  real shell.
+- Dispatcher._readopt_running_tasks() (startup): every 'running' task is
+  re-adopted; poll the exit file (fallbacks: docker inspect for old-wrap
+  containers, honest 'result unknown' if both are gone) and finish with the
+  real code. Verified live: restart at tick 12/60, container survived all
+  60 ticks, task landed succeeded/exit 0.
+
+Also verified live in the same pass: idle termination fired at exactly the
+configured limit and its rescue synced 22 MB of planted valuable files to
+ephemeral-backup/ before terminating (audit: idle_termination ->
+sync_ephemeral -> data_rescue), and the auto-manage lifecycle ran
+launch -> run -> sync -> terminate with zero human input.

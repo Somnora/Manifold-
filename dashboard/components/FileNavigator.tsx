@@ -225,7 +225,7 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
 
       {mode === "sizes" && usageTruncated && (
         <p className="border-b border-amber-100 bg-amber-50 px-3 py-1 text-xs text-amber-800">
-          Very large tree — sizes below are a partial count.
+          Very large tree; sizes below are a partial count.
         </p>
       )}
       {notice && <p className="px-3 pt-2 text-xs text-emerald-700">{notice}</p>}
@@ -271,7 +271,7 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
                             entry.is_dir ? ` · ${u.file_count} files` : ""
                           }`
                         : entry.is_dir
-                          ? "—"
+                          ? ""
                           : formatBytes(entry.size_bytes)}
                     </td>
                     <td className="whitespace-nowrap px-3 py-1.5 text-right text-zinc-400">

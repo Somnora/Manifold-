@@ -338,7 +338,7 @@ class Orchestrator:
                     f"Region mismatch: filesystem '{filesystem}' lives in "
                     f"{fs.region} but the launch requests {region}. Lambda "
                     f"filesystems are region-locked and can only be attached "
-                    f"at launch — launch in {fs.region} instead, or launch "
+                    f"at launch. Launch in {fs.region} instead, or launch "
                     f"without a filesystem (scratch only).",
                 )
 
@@ -868,7 +868,7 @@ class Orchestrator:
                 elsewhere.append(f"{name} in {', '.join(sorted(regions))}")
         if not elsewhere:
             return ("None of those types have capacity in any region right "
-                    "now — try again later.")
+                    "now; try again later.")
         return ("Available right now: " + "; ".join(elsewhere)
                 + ". Relaunch there (a persistent filesystem must be in the "
                   "same region), or call list-launch-options for co-located "
@@ -893,7 +893,7 @@ class Orchestrator:
                 self.db.update_launch(
                     plan.launch_id, status="failed",
                     error=f"instance {instance_id} did not become active within "
-                          f"{policy.boot_timeout_seconds:.0f}s — it may still be "
+                          f"{policy.boot_timeout_seconds:.0f}s; it may still be "
                           f"running and billing; check the dashboard and terminate "
                           f"it if unwanted.",
                 )

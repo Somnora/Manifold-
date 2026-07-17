@@ -166,7 +166,7 @@ export default function StoragePage() {
                   className="px-4 py-8 text-center text-sm text-zinc-500"
                 >
                   {!readOk
-                    ? "Can't read files right now — the backend or storage is unreachable, so this list is unknown (not necessarily empty)."
+                    ? "Can't read files right now: the backend or storage is unreachable, so this list is unknown (not necessarily empty)."
                     : selected
                       ? "No files match."
                       : "No filesystems available."}

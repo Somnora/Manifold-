@@ -58,7 +58,7 @@ export function RecentFiles({ instanceId }: { instanceId: string }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-zinc-500">
           Recent files (last {data?.hours ?? 24}h)
-          {data?.truncated && " — large tree, list truncated"}
+          {data?.truncated && " (large tree, list truncated)"}
         </p>
         <div className="flex items-center gap-2">
           <input

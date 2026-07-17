@@ -117,7 +117,7 @@ export default function JobsPage() {
       );
       setNotice(
         autoConfig
-          ? `Queued ${task.id} (${task.template}) — Manifold will rent a ${autoConfig.gpu_type} for it`
+          ? `Queued ${task.id} (${task.template}): Manifold will rent a ${autoConfig.gpu_type} for it`
           : `Queued ${task.id} (${task.template})`,
       );
       refresh();
@@ -202,7 +202,7 @@ export default function JobsPage() {
                 ) : null}
                 {template.warnings?.map((w) => (
                   <p key={w} className="mt-1 text-amber-700">
-                    ⚠ {w}
+                    Warning: {w}
                   </p>
                 ))}
               </div>
@@ -261,7 +261,7 @@ export default function JobsPage() {
                       <button
                         key={p.model_id}
                         type="button"
-                        title={`${p.model_id} — ${p.note}`}
+                        title={`${p.model_id}: ${p.note}`}
                         onClick={() => setSeed({ model_id: p.model_id, parameters: p.parameters })}
                         className={`rounded border px-2 py-1 text-left text-xs hover:bg-white ${
                           seed?.model_id === p.model_id

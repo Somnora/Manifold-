@@ -1012,7 +1012,7 @@ def create_app(
                 503,
                 f"{task['model_id']} is still loading on this instance "
                 f"({readiness['error']}). Large models take a few minutes to "
-                f"download and load — try again shortly.",
+                f"download and load; try again shortly.",
             )
 
         db.record_audit(

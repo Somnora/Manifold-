@@ -173,7 +173,7 @@ export function AutoManageControls({
                       ? r.hasFs
                         ? " · has filesystem"
                         : ""
-                      : " — n/a for this GPU"}
+                      : " (n/a for this GPU)"}
                   </option>
                 ))}
               </select>

@@ -102,15 +102,33 @@ async def test_partial_ack_stays_paused_until_below_low_water():
     assert session._writable.is_set()
 
 
-async def test_silent_client_does_not_wedge_the_shell(monkeypatch):
-    # A client that never acks (old cached tab) must degrade to unpaced
-    # output, never a stalled shell: await_writable returns via its timeout.
+async def test_client_that_never_acked_does_not_wedge_the_shell(monkeypatch):
+    # An old cached tab can't ack, so it must degrade to unpaced output
+    # quickly rather than stall the shell: the short budget applies.
     monkeypatch.setattr("app.terminal_sessions.FLOW_WAIT_TIMEOUT", 0.01)
     session, _ = make_session()
     await _feed_past_high_water(session)
+    assert session._acks_seen == 0
     assert not session._writable.is_set()
     await session.await_writable()           # returns despite no ack
     assert session._writable.is_set()
+
+
+async def test_a_busy_acking_client_gets_the_long_budget(monkeypatch):
+    # The bug this guards: a browser choking on render ALSO stops acking, so
+    # a short timeout resumed the flood mid-choke and undid the backpressure.
+    # Once a client has acked we know it speaks the protocol, so we wait.
+    monkeypatch.setattr("app.terminal_sessions.FLOW_WAIT_TIMEOUT", 0.01)
+    monkeypatch.setattr("app.terminal_sessions.FLOW_BUSY_TIMEOUT", 5.0)
+    session, _ = make_session()
+    await _feed_past_high_water(session)
+    session.ack(1)                           # proves it speaks flow control
+    assert session._acks_seen == 1
+    assert not session._writable.is_set()    # still way over HIGH
+    # Must NOT resume on the short budget: waiting is the point.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(session.await_writable(), 0.05)
+    assert not session._writable.is_set()
 
 
 async def test_detach_clears_any_flow_pause():
