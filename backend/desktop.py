@@ -5,6 +5,12 @@ spawns (and what a double-click runs standalone). It boots the same app
 factory as development, binds strictly to loopback, and serves the bundled
 dashboard at /.
 
+`manifold-backend --mcp` runs the MCP stdio bridge instead of the server,
+so an MCP client (Claude Desktop, Claude Code) can drive Manifold with
+ONLY the installed app - no dev checkout, no uv. The bridge is the same
+HTTP-only thin client as `uv run manifold-mcp`; it needs the app (or any
+backend) already running to answer.
+
 MANIFOLD_MOCK=1 works here exactly as in development - the packaged app can
 be demoed with zero credentials and zero spend.
 """
@@ -44,7 +50,24 @@ def _watch_parent() -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
+def run_mcp() -> None:
+    """Run the MCP stdio bridge in place of the server.
+
+    stdin/stdout ARE the MCP protocol channel here, so two desktop-mode
+    behaviors must not run: the parent watchdog (it reads stdin and would
+    eat protocol frames) and the startup banner (a stray stdout line breaks
+    the client's JSON-RPC parse). The bridge talks to whatever backend is
+    listening on MANIFOLD_PORT - normally the running desktop app.
+    """
+    os.environ.setdefault("MANIFOLD_API_URL", f"http://{HOST}:{PORT}")
+    from app import mcp_server
+    mcp_server.main()
+
+
 def main() -> None:
+    if "--mcp" in sys.argv[1:]:
+        run_mcp()
+        return
     if os.environ.get("MANIFOLD_PARENT_WATCHDOG") == "1":
         _watch_parent()
     app = create_default_app()

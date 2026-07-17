@@ -2697,3 +2697,34 @@ serving never writes), so a merged model is served by path with
 model_id=/data/models/<name>. This makes the distill doc's long-standing
 claim ("vllm-serve accepts a local HF-format model path") literally true.
 A test asserts both templates agree on that shared mount.
+
+## 2026-07-17 — MCP from the installed app: the binary doubles as the bridge
+
+**`manifold-backend --mcp` runs the MCP stdio bridge instead of the
+server.** MCP was a dev-checkout feature (uv run manifold-mcp), which
+made "agents can drive Manifold" false for anyone who only has the .dmg.
+The frozen sidecar binary now dispatches on argv: `--mcp` imports
+app.mcp_server and speaks MCP on stdio, bridging to whatever backend
+listens on MANIFOLD_PORT (normally the running app). Registration is one
+line pointing at Manifold.app/Contents/MacOS/manifold-backend. Same
+HTTP-only thin client, same guards, same audit trail - only the way it
+is started changed. Alternative considered: a second frozen binary just
+for MCP - rejected because the bundle already carries every dependency
+(mcp is a main requirement), and one binary with an argv switch cannot
+drift out of sync with itself.
+
+**In --mcp mode, stdin/stdout are the protocol channel.** Two desktop
+behaviors are suppressed there, by construction (the --mcp branch returns
+before them): the parent watchdog (it reads stdin and would eat protocol
+frames) and the startup banner (a stray stdout line breaks the client's
+JSON-RPC parse). MANIFOLD_API_URL defaults to the app's own host:port
+but an explicit value is never overridden (bridging to a remote/dev
+backend stays possible). Verified against the actual frozen binary: real
+stdio handshake, 20 tools listed, and a live list_instances round-trip
+through the running backend.
+
+**sglang-serve now mounts models/ read-only (parity papercut).** Found
+during the live lora-merge verification: vllm-serve got the models/
+mount in phase-53, so a merged model served by path worked there but
+silently could not resolve on sglang-serve. Both engines now carry the
+identical mount and the distill-loop test asserts parity for both.
