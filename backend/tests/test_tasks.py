@@ -23,6 +23,7 @@ def test_coerce_applies_defaults_and_types():
         "max_context": 8192,
         "port": 8080,
         "tensor_parallel": 1,      # single GPU unless a preset says otherwise
+        "tool_call_parser": "hermes",   # structured output works by default
     }
     # String numbers are coerced to their declared type.
     params = coerce_parameters(
@@ -57,6 +58,10 @@ def test_render_docker_command_quotes_and_substitutes():
     assert "-p 127.0.0.1:8080:8080" in cmd
     assert "--gpus all" in cmd
     assert "--name manifold-task-t1" in cmd
+    # Tool calling on by default: agent frameworks (pydantic-ai, OpenAI
+    # tool use) got 400s from vLLM without these flags.
+    assert "--enable-auto-tool-choice" in cmd
+    assert "--tool-call-parser hermes" in cmd
 
 
 def test_render_substitutes_parameters_in_mounts():

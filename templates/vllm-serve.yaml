@@ -8,11 +8,18 @@ image: vllm/vllm-openai:latest
 # The image ENTRYPOINT is `vllm serve` (verified from the image config), so
 # the model is a POSITIONAL argument here, not `--model`. Passing `--model`
 # is what made this exit immediately after a successful pull.
+# Tool calling is on by default: agent frameworks (pydantic-ai, OpenAI SDK
+# tool use) get structured output via tool calls, and without these flags
+# vLLM answers those requests with 400s. The parser must match the model's
+# tool-call format: hermes fits Qwen/Hermes-style models (our presets);
+# use mistral or llama3_json for those families.
 command: >
   {{model_id}}
   --max-model-len {{max_context}}
   --port {{port}}
   --tensor-parallel-size {{tensor_parallel}}
+  --enable-auto-tool-choice
+  --tool-call-parser {{tool_call_parser}}
 
 parameters:
   - name: model_id
@@ -30,6 +37,10 @@ parameters:
     type: integer
     default: 1
     description: Shard the model across this many GPUs (set to 8 on an 8x cluster for big MoE models)
+  - name: tool_call_parser
+    type: string
+    default: hermes
+    description: Tool-call format parser, needed for structured output / agent frameworks. hermes fits Qwen and Hermes models; use mistral or llama3_json for those families.
 
 volumes:
   # HuggingFace cache on persistent storage: models survive the instance.
