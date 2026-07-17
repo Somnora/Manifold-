@@ -221,17 +221,19 @@ async def get_launch_status(launch_id: str, note: str = "") -> dict:
 
 
 @mcp.tool()
-async def wait_for_launch(launch_id: str, timeout: float = 120,
+async def wait_for_launch(launch_id: str, timeout: float = 45,
                           note: str = "") -> dict:
-    """Block until a launch settles (active | failed | terminated) or up to
-    `timeout` seconds (max 300) pass, then return the same enriched record as
-    get_launch_status. This is the efficient way to await a slow SXM4 boot:
-    ONE call parks server-side instead of dozens of get_launch_status polls.
-    If it returns still booting (settled=false), the instance is fine - just
-    call again to keep waiting. A backend restart mid-wait (dev --reload) is
-    absorbed: the wait reconnects and keeps parking; the launch itself is
-    resumed by the backend and keeps booting either way."""
-    timeout = max(1.0, min(float(timeout), 300.0))
+    """Wait (up to `timeout` seconds, max 50) for a launch to settle
+    (active | failed | terminated), then return the same enriched record
+    as get_launch_status. Each call is deliberately bounded to fit inside
+    MCP client request timeouts (~60s): a still-booting result
+    (settled=false, with boot_elapsed/remaining seconds) is NORMAL for big
+    GPUs - just call wait_for_launch again to keep waiting; the wait parks
+    server-side, not in a poll loop. A backend restart mid-wait (dev
+    --reload) is absorbed: the wait reconnects and keeps parking; the
+    launch itself is resumed by the backend and keeps booting either
+    way."""
+    timeout = max(1.0, min(float(timeout), 50.0))
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     while True:
@@ -347,19 +349,24 @@ async def delete_template(name: str, note: str = "") -> dict:
 
 
 @mcp.tool()
-async def run_command(instance_id: str, command: str, timeout: float = 120,
+async def run_command(instance_id: str, command: str, timeout: float = 45,
                       note: str = "") -> dict:
     """Run ONE shell command on the instance over the managed SSH connection
     and return {exit_code, stdout, stderr}. Full shell parity, but audited:
     every command lands in the user's activity log with its exit code, which
-    raw SSH would not. Bounded by `timeout` (max 600s) - long-running work
-    belongs in a job (run_job streams logs and survives backend restarts).
-    Use this for the quick real commands in between: inspecting files,
-    checking nvidia-smi, preparing directories."""
+    raw SSH would not. `timeout` is capped at 50s so the response always
+    arrives before an MCP client request timeout (~60s). Use this for the
+    quick real commands in between: inspecting files, checking nvidia-smi,
+    preparing directories. Anything longer belongs in a job (run_job
+    streams logs and survives restarts) - or start it detached
+    (`nohup ... > log 2>&1 &`) and check the log with a later
+    run_command."""
+    timeout = max(1.0, min(float(timeout), 50.0))
     return await _call(
         "run_command", "POST", f"/instances/{instance_id}/run",
         note=note, args={"instance_id": instance_id, "command": command[:200]},
         body={"command": command, "timeout": timeout},
+        request_timeout=timeout + 10.0,
     )
 
 
@@ -542,43 +549,98 @@ async def upload_file(local_path: str, remote_path: str = "inbox/",
     return payload
 
 
+# Resumable download tuning. Each ranged request stays small enough to
+# finish quickly; the whole tool call returns before a typical MCP client
+# request timeout (~60s) and reports progress instead of erroring, so a
+# large file is fetched by calling download_file repeatedly (it resumes
+# from the .part file automatically). A 127MB batch output used to require
+# manual split/reassemble on the instance; this bakes that pattern in.
+DOWNLOAD_CHUNK_BYTES = 16 * 1024 * 1024
+DOWNLOAD_TIME_BUDGET_SECONDS = 40.0
+
+
 @mcp.tool()
 async def download_file(remote_path: str, local_path: str,
                         instance_id: str | None = None, note: str = "") -> dict:
     """Download a file from an instance to THIS machine over the managed
     SSH connection. Relative remote paths read from the persistent
     filesystem. If instance_id is omitted and exactly one instance is
-    connected, it is used."""
+    connected, it is used.
+
+    Large files are safe here: the transfer runs in bounded chunks and
+    this returns complete=false with progress before any client timeout
+    would hit. When you see complete=false, just call download_file again
+    with the SAME arguments - it resumes from where it stopped (progress
+    lives in <local_path>.part until the file is whole and verified by
+    size, then it is moved into place)."""
     args = {"remote_path": remote_path, "local_path": local_path,
             "instance_id": instance_id}
     target = await _pick_instance(instance_id, "download_file", note, args)
     if isinstance(target, dict):
         return target
+
+    part_path = local_path + ".part"
+    parent = os.path.dirname(os.path.abspath(local_path))
+    os.makedirs(parent, exist_ok=True)
+    offset = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+
+    loop = asyncio.get_event_loop()
+    started = loop.time()
+    total = None
     try:
-        async with _http().stream(
-            "GET", f"/instances/{target}/files/download",
-            params={"path": remote_path},
-        ) as resp:
-            if resp.status_code >= 400:
-                body = (await resp.aread()).decode(errors="replace")
-                result = {"error": body[:300] or f"HTTP {resp.status_code}"}
+        while True:
+            async with _http().stream(
+                "GET", f"/instances/{target}/files/download",
+                params={"path": remote_path, "offset": offset,
+                        "max_bytes": DOWNLOAD_CHUNK_BYTES},
+            ) as resp:
+                if resp.status_code == 416:
+                    # The remote file changed under our .part: start over.
+                    await _audit("download_file", args, note,
+                                 "remote file changed; restarting from 0")
+                    os.remove(part_path)
+                    offset = 0
+                    continue
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode(errors="replace")
+                    result = {"error": body[:300] or f"HTTP {resp.status_code}"}
+                    await _audit("download_file", args, note,
+                                 f"rejected: {result['error'][:150]}")
+                    return result
+                total = int(resp.headers["X-File-Size"])
+                with open(part_path, "ab") as fh:
+                    async for chunk in resp.aiter_bytes():
+                        fh.write(chunk)
+                offset = os.path.getsize(part_path)
+
+            if offset >= total:
+                os.replace(part_path, local_path)
                 await _audit("download_file", args, note,
-                             f"rejected: {result['error'][:150]}")
-                return result
-            parent = os.path.dirname(os.path.abspath(local_path))
-            os.makedirs(parent, exist_ok=True)
-            written = 0
-            with open(local_path, "wb") as fh:
-                async for chunk in resp.aiter_bytes():
-                    fh.write(chunk)
-                    written += len(chunk)
+                             f"ok: {offset} bytes -> {local_path}")
+                return {"local_path": local_path, "bytes": offset,
+                        "complete": True}
+            if loop.time() - started > DOWNLOAD_TIME_BUDGET_SECONDS:
+                await _audit(
+                    "download_file", args, note,
+                    f"in progress: {offset}/{total} bytes")
+                return {
+                    "complete": False,
+                    "bytes_done": offset,
+                    "total_bytes": total,
+                    "detail": (
+                        f"{offset}/{total} bytes so far. Call download_file "
+                        f"again with the same arguments to resume - progress "
+                        f"is kept in {part_path}."
+                    ),
+                }
     except httpx.HTTPError as exc:
-        result = {"error": f"download failed: {exc}"}
+        result = {
+            "error": f"download interrupted: {exc}",
+            "detail": (f"progress is kept in {part_path}; call "
+                       f"download_file again to resume"),
+        }
         await _audit("download_file", args, note, result["error"])
         return result
-    await _audit("download_file", args, note,
-                 f"ok: {written} bytes -> {local_path}")
-    return {"local_path": local_path, "bytes": written}
 
 
 def main() -> None:
