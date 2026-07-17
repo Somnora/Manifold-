@@ -246,6 +246,7 @@ class Dispatcher:
         *,
         image_checker: ImageChecker | None = None,
         notifier=None,
+        worklog=None,
         clock=time.monotonic,
     ):
         self.settings = settings
@@ -260,6 +261,9 @@ class Dispatcher:
         # run for hours unattended - the point of Manifold is that you are not
         # sitting there watching the log.
         self.notifier = notifier
+        # Worklog (optional): every settled job becomes one markdown entry
+        # other agents can read (see worklog.py).
+        self.worklog = worklog
         self._clock = clock
         self._loops: list[asyncio.Task] = []
         # In-flight dispatched jobs: task id -> the asyncio task running it.
@@ -357,6 +361,7 @@ class Dispatcher:
             notify = False
         self.queue.mark_finished(task_id, exit_code=exit_code,
                                  output_paths=output_paths, error=error)
+        self._worklog_task(task_id)
         if not notify or self.notifier is None:
             return
         task = self.queue.get(task_id) or {}
@@ -377,6 +382,43 @@ class Dispatcher:
                 f"{task_id}{where}\n{(error or f'exit {exit_code}')[:200]}",
                 ref=task_id,
             )
+
+    def _worklog_task(self, task_id: str) -> None:
+        """One worklog entry per settled job: what ran, where, what it cost,
+        and where the outputs are - written where other agents can read it."""
+        if self.worklog is None:
+            return
+        try:
+            task = self.queue.get(task_id)
+            if task is None:
+                return
+            lines = [f"task {task_id}"]
+            iid = task.get("instance_id")
+            launch = self.db.find_launch_by_instance(iid) if iid else None
+            if launch:
+                lines.append(
+                    f"{launch['launched_type'] or launch['requested_type']} "
+                    f"in {launch['region']}, instance {iid}")
+            elif iid:
+                lines.append(f"instance {iid}")
+            cost = self.db.task_costs().get(task_id)
+            if cost:
+                mins = cost["runtime_seconds"] / 60.0
+                line = f"runtime {mins:.1f} min"
+                if cost["actual_cost_cents"] is not None:
+                    line += f", cost ${cost['actual_cost_cents'] / 100:.2f}"
+                lines.append(line)
+            if task.get("output_paths"):
+                lines.append("outputs: " + ", ".join(task["output_paths"]))
+            if task.get("error"):
+                lines.append(f"error: {task['error'][:200]}")
+            model = (task.get("parameters") or {}).get("model_id")
+            if model:
+                lines.append(f"model: {model}")
+            self.worklog.record(
+                f"job {task['template']} {task['status']}", lines)
+        except Exception:   # a log entry must never break the funnel
+            logger.exception("worklog entry for task %s failed", task_id)
 
     # -- idle keep-alive ---------------------------------------------------------------
 

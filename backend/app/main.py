@@ -368,12 +368,17 @@ def create_app(
         return templates[template.name]
 
     queue = SQLiteTaskQueue(db)
+    # The worklog lives next to the database, so dev, tests, and the frozen
+    # app each keep their own; the optional mirror dir comes from prefs.
+    from pathlib import Path as _P
+    from .worklog import Worklog
+    worklog = Worklog(_P(settings.db_path).with_name("worklog.md"), prefs)
     dispatcher = Dispatcher(
         settings, orchestrator, queue, templates, db, lambda_client,
-        image_checker=image_checker, notifier=notifier,
+        image_checker=image_checker, notifier=notifier, worklog=worklog,
     )
     autopilot = Autopilot(settings, orchestrator, queue, templates, db,
-                          notifier=notifier,
+                          notifier=notifier, worklog=worklog,
                           template_saver=save_custom_template_text)
     from .brains import BrainRegistry
     brains = BrainRegistry(settings, orchestrator, queue, templates)
@@ -2021,6 +2026,14 @@ def create_app(
     @app.get("/audit")
     async def list_audit(actor: str | None = None, limit: int = 200):
         return {"entries": db.list_audit(actor=actor, limit=limit)}
+
+    @app.get("/worklog")
+    async def get_worklog(limit: int = 20):
+        """Recent worklog entries (markdown, oldest first): what jobs and
+        autopilot runs accomplished. The same record any agent can read
+        from the worklog file (or its mirror); this serves it over HTTP so
+        the get_work_log MCP tool works from any machine."""
+        return {"entries": worklog.tail(limit), "path": worklog.path}
 
     # -- launches (retry status + cost history) ------------------------------------
 

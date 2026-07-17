@@ -137,11 +137,20 @@ class GuardrailPrefs:
 
 
 @dataclass(frozen=True)
+class WorklogPrefs:
+    """Where the worklog is mirrored, beyond the always-on copy in the data
+    dir. Point mirror_dir at an Obsidian vault or a repo and every agent
+    working there can read what Manifold accomplished. Empty = no mirror."""
+    mirror_dir: str = ""
+
+
+@dataclass(frozen=True)
 class Preferences:
     approvals: ApprovalPrefs = ApprovalPrefs()
     notifications: NotificationPrefs = NotificationPrefs()
     data_safety: DataSafetyPrefs = DataSafetyPrefs()
     guardrails: GuardrailPrefs = GuardrailPrefs()
+    worklog: WorklogPrefs = WorklogPrefs()
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -203,6 +212,7 @@ def preferences_from_dict(base: Preferences, raw: dict) -> Preferences:
         notifications=_coerce(base.notifications, raw.get("notifications", {})),
         data_safety=_coerce(base.data_safety, raw.get("data_safety", {})),
         guardrails=_coerce(base.guardrails, raw.get("guardrails", {})),
+        worklog=_coerce(base.worklog, raw.get("worklog", {})),
     )
 
 
