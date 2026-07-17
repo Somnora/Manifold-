@@ -26,3 +26,23 @@ MANIFOLD_MOCK=1 uv run uvicorn app.main:create_default_app --factory --reload
 ```
 
 See `CLAUDE.md` for the full command reference.
+
+## Onboard your AI agent
+
+Manifold is built to be driven by agents. Two steps:
+
+1. Connect the MCP server (with the app or a dev backend running):
+
+   ```bash
+   claude mcp add manifold -- uv run --directory <path-to-repo>/backend manifold-mcp
+   ```
+
+2. The agent's first call should be the `get_skill` tool, which returns
+   `docs/manifold-skill.md`: task recipes (launch, serve, batch, fine-tune,
+   teardown) plus the rules that keep GPU work safe and cheap. The same
+   document is served at `http://localhost:8000/skill`, and the desktop app
+   bundles it, so agents on a machine with only the .dmg get it too.
+
+The one rule, if the agent reads nothing else: go through Manifold, never
+around it. Raw Lambda API calls and hand-rolled SSH lose the budget guards,
+the audit trail, data rescue on termination, and job supervision.

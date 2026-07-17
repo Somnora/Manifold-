@@ -438,3 +438,28 @@ def test_cli_brain_drives_a_run_end_to_end(tmp_path):
         done = wait_run(client, run["id"])
         assert done["status"] == "succeeded"
         assert done["summary"] == "cli brain works"
+
+
+def test_which_fallback_finds_cli_off_path(tmp_path, monkeypatch):
+    """A Finder-launched app gets launchd's bare PATH, which hides
+    Homebrew/npm-installed CLIs; the fallback searches well-known dirs."""
+    import os
+    import stat
+    from app import brains as brains_mod
+
+    bin_dir = tmp_path / "fake-local-bin"
+    bin_dir.mkdir()
+    cli = bin_dir / "claude"
+    cli.write_text("#!/bin/sh\necho hi\n")
+    cli.chmod(cli.stat().st_mode | stat.S_IEXEC)
+
+    monkeypatch.setattr(brains_mod, "WELL_KNOWN_BIN_DIRS", (str(bin_dir),))
+    monkeypatch.setattr(brains_mod.shutil, "which", lambda name: None)
+
+    assert brains_mod.which_with_fallback("claude") == str(cli)
+    assert brains_mod.which_with_fallback("codex") is None
+
+    # Non-executable files never count.
+    plain = bin_dir / "codex"
+    plain.write_text("not a program")
+    assert brains_mod.which_with_fallback("codex") is None

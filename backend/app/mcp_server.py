@@ -30,13 +30,17 @@ mcp = FastMCP(
     "manifold",
     instructions=(
         "Manifold orchestrates Lambda Cloud GPU instances through a guarded "
-        "local backend. Launches are asynchronous: launch_gpu returns a "
-        "launch id immediately; then call wait_for_launch to block until it is "
-        "'active' or 'failed' (one call, not a poll loop - large GPU instances "
-        "can take 15-40 min to boot), or get_launch_status for a single "
-        "snapshot. Termination may be blocked by a safety hook "
-        "if unsaved files exist on the instance; sync_outputs saves them. "
-        "Pass a short `note` with each call saying why — it lands in the "
+        "local backend. FIRST call get_skill once per session: it returns "
+        "the full playbook (recipes for launching, serving models, batch "
+        "jobs, fine-tuning, teardown, and the rules that keep work safe). "
+        "Core rules: go through Manifold, never around it (no raw Lambda "
+        "API calls, no hand-rolled SSH for long work). Launches are "
+        "asynchronous: launch_gpu returns a launch id immediately; then "
+        "call wait_for_launch to block until it is 'active' or 'failed' "
+        "(one call, not a poll loop - large GPU instances can take 15-40 "
+        "min to boot). Termination may be blocked by a safety hook if "
+        "unsaved files exist on the instance; sync_outputs saves them. "
+        "Pass a short `note` with each call saying why - it lands in the "
         "audit log the user reviews."
     ),
 )
@@ -118,6 +122,25 @@ async def _call(
         return result
     await _audit(tool, args, note, "ok")
     return payload
+
+
+# -- onboarding --------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_skill(note: str = "") -> str:
+    """The Manifold playbook for AI agents: task recipes (launch a GPU,
+    serve a model, batch work, fine-tune, browse files, clean up) and the
+    rules that keep work safe and cheap. Call this ONCE at the start of a
+    session, before other Manifold tools."""
+    try:
+        resp = await _http().get("/skill")
+    except httpx.HTTPError as exc:
+        return f"Manifold backend unreachable at {API_URL}: {exc}"
+    if resp.status_code >= 400:
+        return f"skill document unavailable (HTTP {resp.status_code})"
+    await _audit("get_skill", {}, note, "ok")
+    return resp.text
 
 
 # -- instances -------------------------------------------------------------------

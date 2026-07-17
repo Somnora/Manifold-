@@ -41,6 +41,32 @@ logger = logging.getLogger("manifold.brains")
 PROBE_TIMEOUT = 1.5          # local servers answer instantly or not at all
 DETECT_CACHE_SECONDS = 10.0
 
+# A macOS app launched from Finder inherits launchd's bare PATH
+# (/usr/bin:/bin:...), which hides every user-installed CLI - the packaged
+# app reported "No brains found" to a user logged into all three frontier
+# CLIs. So CLI detection searches these well-known install dirs on top of
+# PATH. Order matters only for duplicates: PATH wins, then this list.
+WELL_KNOWN_BIN_DIRS = (
+    "/opt/homebrew/bin",      # Homebrew (Apple Silicon)
+    "/usr/local/bin",         # Homebrew (Intel), classic installs
+    "~/.local/bin",           # pipx / uv / npm prefix installs
+    "~/.npm-global/bin",      # npm with a user prefix
+    "~/.bun/bin",             # bun global installs
+    "~/bin",
+)
+
+
+def which_with_fallback(name: str) -> str | None:
+    """shutil.which, then the well-known bin dirs a GUI app's PATH misses."""
+    path = shutil.which(name)
+    if path:
+        return path
+    for d in WELL_KNOWN_BIN_DIRS:
+        candidate = os.path.join(os.path.expanduser(d), name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
 
 @dataclass
 class BrainInfo:
@@ -224,7 +250,7 @@ class BrainRegistry:
         # Injectable prober for tests: async (url) -> list[model_id] | None.
         self._http_get = http_get or self._probe_models
         # Injectable executable lookup for tests.
-        self._which = which or shutil.which
+        self._which = which or which_with_fallback
         self._local_cache: tuple[float, list[BrainInfo]] | None = None
 
     # -- discovery ------------------------------------------------------------------

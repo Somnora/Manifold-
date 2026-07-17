@@ -18,5 +18,6 @@ uv run pyinstaller --noconfirm --clean --onefile --name manifold-backend \
   --add-data "../templates${SEP}templates" \
   --add-data "../sidecar${SEP}sidecar" \
   --add-data "../config.yaml${SEP}." \
+  --add-data "../docs/manifold-skill.md${SEP}docs" \
   desktop.py
 echo "==> built backend/dist/manifold-backend"

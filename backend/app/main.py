@@ -30,6 +30,7 @@ from fastapi import (
 )
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .sidecar_client import SidecarError
@@ -431,6 +432,16 @@ def create_app(
     @app.get("/health")
     async def health():
         return {"status": "ok", "mock": mock}
+
+    @app.get("/skill", response_class=PlainTextResponse)
+    async def agent_skill():
+        """The agent onboarding document (docs/manifold-skill.md): how an
+        LLM should drive Manifold. Served so agents can fetch it at session
+        start (the MCP get_skill tool reads this route)."""
+        path = RESOURCE_ROOT / "docs" / "manifold-skill.md"
+        if not path.exists():
+            raise HTTPException(404, "manifold-skill.md not bundled")
+        return path.read_text()
 
     # -- settings (first-run setup; secrets go to .env, never echoed back) --------
 

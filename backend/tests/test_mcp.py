@@ -300,3 +300,13 @@ async def test_worked_example_transcribe_inbox_then_shut_down(mcp_wired, mock_cl
     for expected in ("launch_gpu", "run_job", "get_job_logs",
                      "terminate_instance"):
         assert expected in tools_used
+
+
+async def test_get_skill_returns_the_playbook(mcp_wired):
+    """Agent onboarding: the skill doc is served through the same thin
+    client, so any MCP-connected agent can learn the recipes first."""
+    text = await mcp_server.get_skill(note="session start")
+    assert "never around it" in text          # the one rule that matters
+    assert "wait_for_launch" in text          # launch recipe
+    assert "vllm-serve" in text               # serve recipe
+    assert "terminate_instance" in text       # teardown recipe
