@@ -2783,3 +2783,33 @@ cadence. Scope note: Autopilot runs were left out deliberately - the
 agent loop is interactive (a brain waiting on a launch that may come
 hours later holds a conversation open); the agent can already queue an
 auto-manage job, which now waits correctly.
+
+## 2026-07-17 — Mock isolation: fixture state can never touch live state
+
+Root cause of the day's worst incident: a mock backend started for README
+screenshots on the shared port swapped fixture data under a live agent
+session mid-launch, and because mock shared the real SQLite file, the
+session's in-flight launch was reconciled against a catalog that had
+never heard of it and marked terminated. The agent detected it only by
+noticing a TEST-NET IP (192.0.2.10). Three guarantees now:
+
+1. **Mock refuses to start over live state.** With launches in a
+   non-settled status (launching/retrying/booting/active) in the REAL
+   database, MANIFOLD_MOCK=1 exits with the launch ids and a plain
+   explanation. MANIFOLD_MOCK_FORCE=1 overrides for the intentional
+   case. The check reads the real db strictly read-only (sqlite
+   mode=ro URI), tolerant of a missing file or schema.
+2. **Mock gets its own database** (manifold-mock.db next to the real
+   one): even when it runs, fixture state cannot read or rewrite real
+   rows, so a real launch row can never again be "terminated" on paper
+   by a demo backend.
+3. **Fixture data is self-identifying.** /instances, /filesystems, and
+   /launch-options now carry "mock": true (health and /settings already
+   did, which only the dashboard banner used), and the MCP server
+   instructions tell agents to report demo mode instead of acting on it
+   as production state.
+
+Alternative considered: a different default port for mock mode -
+rejected because the dashboard and MCP bridge target one port by
+convention, and the failure was state substitution, not port collision;
+isolating the state removes the harm regardless of port.

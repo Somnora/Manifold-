@@ -41,7 +41,10 @@ mcp = FastMCP(
         "min to boot). Termination may be blocked by a safety hook if "
         "unsaved files exist on the instance; sync_outputs saves them. "
         "Pass a short `note` with each call saying why - it lands in the "
-        "audit log the user reviews."
+        "audit log the user reviews. If list_instances, list_filesystems, "
+        "or list_launch_options responses carry \"mock\": true, the backend "
+        "is in demo mode: everything is fixture data, no real GPUs or spend "
+        "- say so instead of acting on it as production state."
     ),
 )
 
