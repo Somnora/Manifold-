@@ -2635,3 +2635,29 @@ command), and a banner recorded in scrollback explains the wiring.
 Alternative considered: writing CLI-specific config files - rejected
 because env vars are the one interface every OpenAI-compatible tool
 already honors.
+
+## 2026-07-17 — Serve readiness on the jobs card (model loading vs ready)
+
+**The jobs card shows model-loading vs model-ready, and gates "Open in
+terminal" on it.** A serve job goes "running" the moment its container
+starts, but the OpenAI API does not answer until the weights finish
+downloading and loading - minutes later for a large model. The shipped
+"Open in terminal" button therefore had a known papercut: click it too
+early and the CLI errors on connect, with no way to tell "still loading"
+from "broken". The card now polls the existing
+GET /instances/{id}/model every 5s (the same signal the chat panel uses;
+dispatcher.model_ready caches the /v1/models probe at 3s while loading,
+30s once ready, so the poll is cheap), shows an amber "model loading" or
+green "model ready" chip, and disables the terminal button until the
+probe answers. No new backend surface: the readiness verdict already
+existed for chat and the autopilot; this only surfaces it a second place.
+
+Keyed to the card, not just the instance: the endpoint reports the ONE
+serving task per instance (ports are unique per box), so the chip trusts
+its verdict only when the returned task_id equals this card's task id -
+otherwise a second card would inherit a neighbour's "ready". A test now
+locks that task_id into the serving response, since the UI depends on it.
+Alternative considered: keep the button always enabled and let the CLI
+fail loudly - rejected because the whole point of the button is
+zero-setup, and a connect error on first use reads as "Manifold is
+broken", not "the model is still warming up".

@@ -418,6 +418,12 @@ function TaskCard({
   const [showLogs, setShowLogs] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
   const [failTail, setFailTail] = useState<string[] | null>(null);
+  // null until the first readiness probe returns; only meaningful for a
+  // running serve job (see the effect below).
+  const [readiness, setReadiness] = useState<{
+    ready: boolean;
+    detail: string;
+  } | null>(null);
   const { openModelShell } = useTerminalDock();
 
   // A running serve job is reachable at the local OpenAI proxy; this
@@ -430,6 +436,43 @@ function TaskCard({
     typeof task.parameters?.model_id === "string"
       ? (task.parameters.model_id as string)
       : "";
+
+  // "running" only means the container is up; the model API answers a few
+  // minutes later, once the weights finish downloading and loading. Probe
+  // /v1/models (backend-cached) so the chip and the terminal button reflect
+  // when the CLI will actually connect instead of erroring.
+  const instanceId = task.instance_id;
+  useEffect(() => {
+    if (!servedModel || !instanceId) {
+      setReadiness(null);
+      return;
+    }
+    let cancelled = false;
+    const probe = () =>
+      api
+        .modelStatus(instanceId)
+        .then((s) => {
+          if (cancelled) return;
+          // The endpoint reports the ONE serving task on the instance; only
+          // trust its verdict when it is reporting on THIS task's card.
+          const mine = s.serving && s.task_id === task.id;
+          setReadiness({
+            ready: mine && s.ready,
+            detail: mine ? s.status_detail ?? "" : "",
+          });
+        })
+        .catch(() => {
+          if (!cancelled) setReadiness((r) => r ?? { ready: false, detail: "" });
+        });
+    probe();
+    const id = setInterval(probe, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [servedModel, instanceId, task.id]);
+
+  const modelReady = !!readiness?.ready;
 
   const auto = task.auto_manage;
   const lc = task.lifecycle;
@@ -516,10 +559,44 @@ function TaskCard({
           )}
           <span>{formatDate(task.created_at)}</span>
           {servedModel && (
+            <span
+              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                modelReady
+                  ? "bg-emerald-100 text-emerald-800"
+                  : "bg-amber-100 text-amber-800"
+              }`}
+              title={
+                modelReady
+                  ? `${servedModel} is answering. The terminal button and in-instance chat are wired to it.`
+                  : `${servedModel} is still starting on the GPU (downloading and loading the weights). The terminal button unlocks once it answers.${
+                      readiness?.detail ? ` Last probe: ${readiness.detail}.` : ""
+                    }`
+              }
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  modelReady
+                    ? "bg-emerald-500"
+                    : "bg-amber-500 motion-safe:animate-pulse"
+                }`}
+              />
+              {modelReady ? "model ready" : "model loading"}
+            </span>
+          )}
+          {servedModel && (
             <button
-              onClick={() => openModelShell(servedModel)}
-              title={`Open a local shell wired to ${servedModel}: OPENAI_BASE_URL points at the proxy, so any OpenAI-compatible CLI talks to this model`}
-              className="rounded border border-teal-300 px-2 py-0.5 text-teal-700 hover:bg-teal-50"
+              onClick={() => modelReady && openModelShell(servedModel)}
+              disabled={!modelReady}
+              title={
+                modelReady
+                  ? `Open a local shell wired to ${servedModel}: OPENAI_BASE_URL points at the proxy, so any OpenAI-compatible CLI talks to this model`
+                  : `${servedModel} is still loading. This unlocks once the model answers, so the CLI will not error the moment it connects.`
+              }
+              className={`rounded border px-2 py-0.5 ${
+                modelReady
+                  ? "border-teal-300 text-teal-700 hover:bg-teal-50"
+                  : "cursor-not-allowed border-zinc-200 text-zinc-400"
+              }`}
             >
               Open in terminal
             </button>
