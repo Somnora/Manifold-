@@ -2542,3 +2542,28 @@ name. Alternative considered: querying the HF API for real safetensors
 sizes - rejected for v1 because it adds a network dependency and auth
 surface to a pure function, and the name heuristic catches the whole
 class of mistake this exists to catch; unknown names simply say nothing.
+
+**Agent onboarding is a served document, not tribal knowledge.** An agent
+with every Manifold MCP tool available still drove the raw Lambda API and
+lost a night to self-inflicted terminations, because nothing taught it the
+product. docs/manifold-skill.md is the playbook (recipes + rules), served
+at /skill, bundled into the frozen backend, exposed as the MCP get_skill
+tool, and the MCP server instructions tell agents to read it first. One
+source file, four delivery paths, so it cannot drift.
+
+**CLI brain detection searches well-known dirs, not just PATH.** Finder
+launches give a macOS app launchd's bare PATH, so shutil.which found no
+frontier CLI and the packaged app showed "No brains found" to a user
+logged into all three. Detection falls back to /opt/homebrew/bin,
+/usr/local/bin, ~/.local/bin, ~/.npm-global/bin, ~/.bun/bin, ~/bin.
+Invocation already used the resolved absolute path. Alternative
+considered: spawning a login shell to read the user's real PATH -
+rejected as slower, shell-dependent, and a bigger surface than a static
+list of the six places these CLIs actually install to.
+
+**MCP presence is shown as recent activity, not a connection.** The MCP
+bridge is a stateless HTTP thin client, so a "connected" badge would be
+a lie waiting to happen. Every MCP call already lands in the audit log
+with actor "mcp"; the header chip derives from the newest such row: teal
+within 5 minutes (an agent is working), grey within the hour, hidden
+after that. Honest, zero new state, click-through to Activity.

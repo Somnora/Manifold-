@@ -3,6 +3,7 @@ import { JetBrains_Mono, Space_Grotesk } from "next/font/google";
 import "./globals.css";
 import { Nav } from "@/components/Nav";
 import { BurnChip } from "@/components/BurnChip";
+import { McpChip } from "@/components/McpChip";
 import { NotificationBell } from "@/components/NotificationBell";
 import {
   TerminalDockProvider,
@@ -45,6 +46,7 @@ export default function RootLayout({
               </span>
               <Nav />
               <div className="ml-auto flex items-center gap-2">
+                <McpChip />
                 <BurnChip />
                 <TerminalDockToggle />
                 <NotificationBell />
