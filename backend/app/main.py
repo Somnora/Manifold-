@@ -2014,8 +2014,16 @@ def create_app(
                 # Browsing persistent files rides the Lambda S3 "Files" API,
                 # whose access keys live in .env separately from the Lambda
                 # API key. Without them the factory raises; surface that as a
-                # clear 503 instead of an opaque 500 that decodes to nothing.
-                raise HTTPException(503, str(exc)) from exc
+                # clear 503 instead of an opaque 500 that decodes to nothing,
+                # and teach the keyless route so a user without keys is not
+                # blind (field report: "no instance = blind filesystem").
+                raise HTTPException(
+                    503,
+                    f"{exc}. Without these keys, files are still browsable "
+                    f"whenever an instance mounting this filesystem is "
+                    f"running: use its Files panel, or the agent's "
+                    f"list_persistent_files which rides the SSH connection.",
+                ) from exc
         return storage_cache[fs.id]
 
     @app.get("/storage/files")

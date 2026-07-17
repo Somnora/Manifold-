@@ -49,7 +49,23 @@ class ParameterError(Exception):
 # -q` is the one host-side signal that exposes the A100-SXM trap: the fabric
 # manager still initializing, during which nvidia-smi looks healthy but any
 # CUDA init inside a container fails with "No CUDA GPUs are available".
-GPU_PROBE_COMMAND = "nvidia-smi -q"
+# Host CUDA readiness (fabric manager) AND container-runtime readiness in one
+# probe: the field pass showed a second race where host nvidia-smi is fine
+# but the NVIDIA container toolkit isn't serving GPUs yet, so a job dies with
+# "No CUDA GPUs are available" despite --gpus all. nvidia-container-cli talks
+# to the same library docker's --gpus path uses; probed only when installed
+# so a box without the toolkit stays fail-open.
+GPU_PROBE_COMMAND = (
+    "nvidia-smi -q && "
+    "{ ! command -v nvidia-container-cli >/dev/null || nvidia-container-cli info; }"
+)
+
+# Container stderr signatures of that same race, for the last-resort retry.
+CUDA_RACE_SIGNATURES = (
+    "No CUDA GPUs are available",
+    "could not select device driver",
+    "nvidia-container-cli: initialization error",
+)
 
 # Fabric states that mean CUDA is (or will trivially be) initializable.
 # Anything else - "In Progress" above all - means wait.
@@ -719,19 +735,39 @@ class Dispatcher:
                          f"/lambda/nfs/{filesystem}/task-logs"],
         )
 
-        try:
-            exit_code, stdout, stderr = await self._stream_run(
-                conn, wrapped, task_id
-            )
-        except ConnectionError as exc:
-            self.queue.append_log(task_id, f"[manifold] connection lost: {exc}")
-            self._finish_task(
-                task_id, exit_code=-1, output_paths=[],
-                error=f"SSH connection lost during task: {exc}",
-            )
-            return
-        finally:
-            self.touch_activity(instance_id)
+        for attempt in (1, 2):
+            try:
+                exit_code, stdout, stderr = await self._stream_run(
+                    conn, wrapped, task_id
+                )
+            except ConnectionError as exc:
+                self.queue.append_log(task_id,
+                                      f"[manifold] connection lost: {exc}")
+                self._finish_task(
+                    task_id, exit_code=-1, output_paths=[],
+                    error=f"SSH connection lost during task: {exc}",
+                )
+                return
+            finally:
+                self.touch_activity(instance_id)
+            # Boot race, last resort: the container itself reported CUDA
+            # missing even though the preflight passed. Wait for readiness
+            # again and retry ONCE, instead of confusing the user with a
+            # failure that would succeed a minute later (field report).
+            if exit_code == 0 or attempt == 2:
+                break
+            recent = " ".join(
+                r["line"] for r in self.queue.get_logs(task_id, tail=40)
+            ) + stdout + stderr
+            if not any(sig in recent for sig in CUDA_RACE_SIGNATURES):
+                break
+            self.queue.append_log(
+                task_id,
+                "[manifold] the GPU was not visible inside the container "
+                "(boot race); waiting and retrying once")
+            self._gpu_ready.discard(instance_id)
+            await asyncio.sleep(20)
+            await self._ensure_gpu_ready(conn, instance_id, task_id)
 
         for line in stderr.splitlines():
             self.queue.append_log(task_id, f"[stderr] {line}")

@@ -2412,3 +2412,21 @@ user's Mani-Terminal-Bugs folder):
   overflows, the four dock buttons collapse into a ">>" menu (Terminate
   always stays visible). Hysteresis - remember the width the full row
   needed, expand only when it is back - prevents collapse/expand flicker.
+
+## 2026-07-17 — Second GPU boot race: container runtime, not the host
+
+Gamemaker field pass: a job dispatched ~100s after active died with "No CUDA
+GPUs are available" DESPITE the fabric-manager preflight - host nvidia-smi
+was fine; the NVIDIA container toolkit wasn't serving GPUs yet. Two layers:
+
+- GPU_PROBE_COMMAND now also runs `nvidia-container-cli info` (the library
+  docker's --gpus path uses), guarded by `command -v` so a box without the
+  toolkit stays fail-open.
+- Last resort: a container that exits nonzero with a CUDA-race signature
+  ("No CUDA GPUs are available", "could not select device driver", ...) is
+  retried ONCE after re-running the readiness gate. Ordinary failures are
+  never retried (exit code preserved).
+
+Also from that pass: the no-S3-keys 503 for /storage/files now teaches the
+keyless route (instance Files panel / list_persistent_files over SSH), so
+"no instance = blind filesystem" at least explains itself.
