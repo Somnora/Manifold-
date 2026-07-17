@@ -1709,7 +1709,16 @@ def create_app(
 
     @app.get("/tasks")
     async def list_tasks():
-        return {"tasks": queue.list()}
+        """Tasks, each finished one annotated with its actual runtime and
+        cost (wall time at the launch's hourly rate) so the user can check
+        the pre-launch estimates against reality as history accumulates."""
+        costs = db.task_costs()
+        tasks = queue.list()
+        for t in tasks:
+            c = costs.get(t["id"])
+            t["runtime_seconds"] = c["runtime_seconds"] if c else None
+            t["actual_cost_cents"] = c["actual_cost_cents"] if c else None
+        return {"tasks": tasks}
 
     @app.get("/tasks/{task_id}")
     async def get_task(task_id: str):
