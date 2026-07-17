@@ -2750,3 +2750,36 @@ the quantity the pre-launch estimate predicts - comparability wins.
 Tasks on adopted instances (no launch row, unknown rate) show runtime
 but a null cost: unknown stays unknown rather than guessed, same
 honesty rule as the billing page.
+
+## 2026-07-17 — Capacity-queued jobs: scarcity parks, it never fails
+
+**An auto-manage job queued against a full region waits instead of
+failing.** The old behavior burned the launch retries into the capacity
+wall and failed the job - the opposite of fire-and-forget. Two changes,
+both in the dispatcher and both riding existing machinery:
+
+1. A capacity PRE-CHECK before request_launch: the catalog snapshot
+   (cached at watches.poll_seconds cadence so parked jobs never hammer
+   the rate-limited API on the 5s auto-manage tick) parks the job in
+   'waiting' with an honest detail line and one notification (the
+   capacity_available kind - same toggle as capacity watches). The
+   waiting state already re-enters _auto_launch each tick, so the job
+   launches on the first tick after the snapshot shows capacity, then
+   runs -> syncs -> terminates exactly as before.
+2. A lost race re-parks: the catalog can lag reality, so a launch that
+   exhausts its attempts on capacity errors ("No capacity" in the launch
+   error - the contract test_capacity_wait locks) transitions back to
+   waiting instead of failing, with that (gpu, region) pair denied until
+   the next snapshot refresh so it does not thrash. Re-parking is quiet;
+   only the first park notifies.
+
+Unknown fails open: a catalog outage returns UNKNOWN and the job
+proceeds to the real launch path, so a flaky catalog can never park work
+forever. Cancel works while parked (zero launch attempts, zero spend).
+Alternative considered: wiring parked jobs to the capacity-watch rows -
+rejected because the job queue IS already a poll loop; a second wake
+path adds coupling without adding responsiveness beyond the same poll
+cadence. Scope note: Autopilot runs were left out deliberately - the
+agent loop is interactive (a brain waiting on a launch that may come
+hours later holds a conversation open); the agent can already queue an
+auto-manage job, which now waits correctly.

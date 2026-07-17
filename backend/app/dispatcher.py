@@ -276,6 +276,15 @@ class Dispatcher:
         # default, so a user switching it OFF is not overridden next sweep.
         self._external_defaulted: set[str] = set()
         self.on_capacity_available = None   # hook for notifications (set by app)
+        # Catalog snapshot for the auto-manage capacity pre-check, refreshed
+        # at most every watches.poll_seconds so parked jobs never hammer the
+        # rate-limited catalog on the fast auto-manage tick. _capacity_denied
+        # holds (gpu_type, region) pairs whose LAUNCH failed on capacity
+        # after the snapshot said yes (the catalog lags reality); a denial
+        # stands until the next snapshot refresh.
+        self._capacity_types: dict | None = None
+        self._capacity_checked_at: float = 0.0
+        self._capacity_denied: set[tuple[str, str]] = set()
         # Model-readiness cache: task_id -> {ready, error, checked_at}. A
         # served model's task goes 'running' the instant its container is
         # launched, but vLLM needs minutes to pull the image, download
@@ -1068,6 +1077,56 @@ class Dispatcher:
         self._transition(job, "failed", detail=reason,
                          audit_action="auto_manage_failed")
 
+    async def _capacity_status(self, gpu_type: str, region: str) -> bool | None:
+        """Does the catalog report capacity for gpu_type in region right now?
+
+        None means UNKNOWN (catalog unreachable, or a type the catalog does
+        not list): callers fail open and let the launch path find out for
+        real, so a flaky catalog can never park a job forever."""
+        now = self._clock()
+        if (self._capacity_types is None
+                or now - self._capacity_checked_at
+                >= self.settings.watches.poll_seconds):
+            try:
+                self._capacity_types = \
+                    await self.orchestrator.client.list_instance_types()
+                self._capacity_denied.clear()
+            except Exception:
+                self._capacity_types = None
+            self._capacity_checked_at = now
+        if self._capacity_types is None:
+            return None
+        info = self._capacity_types.get(gpu_type)
+        if info is None:
+            return None
+        if (gpu_type, region) in self._capacity_denied:
+            return False
+        return region in info.regions_with_capacity
+
+    def _park_for_capacity(self, job: dict, *, quiet: bool = False) -> None:
+        """Hold the job in 'waiting' until its GPU has capacity again.
+
+        This is the fire-and-forget promise: a job queued against a full
+        region does not fail, it waits, and launches the moment the catalog
+        shows capacity. Notified once (capacity_available kind, same toggle
+        as capacity watches); re-parking after a lost launch race passes
+        quiet=True."""
+        first_park = not quiet and job["lifecycle"] != "waiting"
+        self._transition(
+            job, "waiting",
+            detail=(f"no {job['gpu_type']} capacity in {job['region']}; "
+                    f"will launch the moment it appears"),
+            audit_action="auto_manage_waiting_capacity")
+        if first_park and self.notifier is not None:
+            self.notifier.notify(
+                "capacity_available",
+                f"Job parked: no {job['gpu_type']} capacity",
+                f"{job['id']} ({job['template']}) is waiting for "
+                f"{job['gpu_type']} in {job['region']}. It will launch, "
+                f"run, and terminate on its own when capacity appears.",
+                ref=job["id"],
+            )
+
     async def _auto_launch(self, job: dict) -> None:
         """queued/waiting -> launching, through the guarded launch path."""
         # Image preflight FIRST: never boot (and bill) a GPU to discover at
@@ -1078,6 +1137,12 @@ class Dispatcher:
             if image_error is not None:
                 self._fail(job, image_error)
                 return
+        # Capacity pre-check: a full region parks the job instead of burning
+        # launch attempts into a wall (the old behavior failed the job after
+        # the retries ran out). Unknown fails open.
+        if await self._capacity_status(job["gpu_type"], job["region"]) is False:
+            self._park_for_capacity(job)
+            return
         try:
             launch = await self.orchestrator.request_launch(
                 instance_type=job["gpu_type"], region=job["region"],
@@ -1104,7 +1169,16 @@ class Dispatcher:
             self._fail(job, "launch record missing")
             return
         if launch["status"] == "failed":
-            self._fail(job, launch["error"] or "launch failed")
+            error = launch["error"] or "launch failed"
+            if "No capacity" in error:
+                # The pre-check's snapshot said yes but the launch lost the
+                # race (the catalog lags reality). Deny this pair until the
+                # next snapshot refresh and park again - capacity scarcity
+                # is a reason to wait, never a reason to fail the job.
+                self._capacity_denied.add((job["gpu_type"], job["region"]))
+                self._park_for_capacity(job, quiet=True)
+                return
+            self._fail(job, error)
             return
         if launch["status"] == "active":
             iid = launch["lambda_instance_id"]
