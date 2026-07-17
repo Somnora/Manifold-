@@ -2487,3 +2487,17 @@ load_settings with a log line per migration. Alternative considered: a
 defaults-overlay (load bundled config underneath the user file) - rejected
 because the seeded file is a full copy, so every key would read as a user
 choice and nothing would ever migrate.
+
+**Instance adoption runs on a sweep, not just at startup.** An instance
+launched outside Manifold (Lambda console, a raw API script, an agent with
+its own credentials) appeared in Running Instances - the list comes from
+Lambda's API - but had no managed SSH connection, so Files, model chat, and
+jobs were all dead for it until the backend restarted. Found live when an
+agent drove a launch with curl and then sat stuck. The dispatcher now calls
+adopt_running_instances every launch.adopt_poll_seconds (default 30, 0
+disables); the call already skips tracked ids, so steady state is one
+list_instances per tick. Mid-session adoptions audit as "instance_adopted"
+(reconnect_on_startup stays what it says). Alternative considered: a manual
+Connect button on the instance card - rejected because the user cannot know
+a connection is missing before clicking around a dead Files panel, which is
+exactly how this was found.
