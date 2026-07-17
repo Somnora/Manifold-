@@ -37,7 +37,13 @@ export function LifecyclePipeline({ task }: { task: Task }) {
         {(lc === "queued" || lc === "waiting") && (
           <StagePill
             state="current"
-            label={lc === "waiting" ? "Waiting for a slot" : "Queued"}
+            label={
+              lc !== "waiting"
+                ? "Queued"
+                : (task.lifecycle_detail || "").includes("capacity")
+                  ? "Waiting for capacity"
+                  : "Waiting for a slot"
+            }
           />
         )}
         {STAGES.map((stage, i) => {
