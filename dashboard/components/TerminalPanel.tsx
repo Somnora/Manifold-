@@ -60,16 +60,24 @@ export function TerminalPanel({
     // had (headless, blocklisted GPU), the terminal still runs on the DOM
     // renderer — so its import never blocks or breaks the shell.
     (async () => {
-      const [{ Terminal }, { FitAddon }, webglMod] = await Promise.all([
-        import("@xterm/xterm"),
-        import("@xterm/addon-fit"),
-        wantDom
-          ? Promise.resolve(null)
-          : import("@xterm/addon-webgl").catch((err) => {
-              console.warn("[manifold] WebGL addon failed to load:", err);
-              return null;
-            }),
-      ]);
+      const [{ Terminal }, { FitAddon }, webglMod, unicodeMod] =
+        await Promise.all([
+          import("@xterm/xterm"),
+          import("@xterm/addon-fit"),
+          wantDom
+            ? Promise.resolve(null)
+            : import("@xterm/addon-webgl").catch((err) => {
+                console.warn("[manifold] WebGL addon failed to load:", err);
+                return null;
+              }),
+          // Unicode 11 width tables. xterm's default tables are Unicode 6:
+          // the spinners, box glyphs, and emoji a TUI like Claude Code
+          // draws get the WRONG cell width there, so the app and the
+          // terminal disagree about where the cursor is - which renders as
+          // text drawing over itself. Optional: a load failure just keeps
+          // the old tables.
+          import("@xterm/addon-unicode11").catch(() => null),
+        ]);
       if (disposed) return;
 
       // Font size is a user setting: Cmd+= / Cmd+- / Cmd+0 while the
@@ -88,37 +96,70 @@ export function TerminalPanel({
           "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
         theme: { background: "#09090b", foreground: "#e4e4e7" },
         scrollback: 5000,
+        // Option behaves like Meta (iTerm-style): Option+Enter inserts a
+        // newline in the Claude CLI, Option+arrows jump words in shells.
+        macOptionIsMeta: true,
       });
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(el);
 
-      // GPU-accelerated rendering: WebGL draws glyphs on the GPU instead of
-      // the DOM renderer's per-cell layout, which is what keeps the terminal
-      // responsive under heavy output. Must load AFTER open() (it hooks the
-      // live renderer). If the context is ever lost (tab backgrounded, GPU
-      // reset) we dispose the addon and xterm silently reverts to the DOM
-      // renderer, so a lost context degrades instead of going blank.
-      if (webglMod) {
+      if (unicodeMod) {
         try {
-          const webgl = new webglMod.WebglAddon();
-          webgl.onContextLoss(() => {
-            console.warn("[manifold] WebGL context lost; falling back to DOM");
-            webgl.dispose();
-            setRenderer("dom");
+          term.loadAddon(new unicodeMod.Unicode11Addon());
+          term.unicode.activeVersion = "11";
+        } catch (err) {
+          console.warn("[manifold] Unicode 11 tables unavailable:", err);
+        }
+      }
+
+      // GPU-accelerated rendering, managed by VISIBILITY. WebGL is what
+      // keeps the terminal responsive under heavy output, but live WebGL
+      // contexts are a scarce browser resource (WebKit caps them per page,
+      // evicting the oldest). The dock keeps every tab mounted, so holding
+      // one context per HIDDEN tab is how the visible terminal gets its
+      // context evicted and silently degrades to the slow DOM renderer -
+      // which under a TUI's repaint rate reads as "the terminal is glitchy".
+      // So: acquire WebGL when this panel becomes visible, release it when
+      // hidden, and retry after a context loss instead of giving up forever.
+      let webgl: { dispose(): void } | null = null;
+      let webglFailures = 0;
+      let retryTimer = 0;
+      let panelVisible = false;
+      const releaseWebgl = () => {
+        if (!webgl) return;
+        try {
+          webgl.dispose();
+        } catch {}
+        webgl = null;
+        setRenderer("dom");
+      };
+      const acquireWebgl = () => {
+        if (!webglMod || webgl || webglFailures >= 3) return;
+        try {
+          const addon = new webglMod.WebglAddon();
+          addon.onContextLoss(() => {
+            // Evicted (too many contexts) or GPU reset. Release ours and,
+            // if we are still the visible tab, try again in a moment.
+            webglFailures += 1;
+            console.warn("[manifold] WebGL context lost; will re-acquire");
+            releaseWebgl();
+            window.clearTimeout(retryTimer);
+            retryTimer = window.setTimeout(() => {
+              if (panelVisible) acquireWebgl();
+            }, 1000);
           });
-          term.loadAddon(webgl);
+          term.loadAddon(addon);
+          webgl = addon;
           setRenderer("webgl");
         } catch (err) {
-          // No usable WebGL context (blocklisted GPU, too many live contexts,
-          // headless). Stay on the DOM renderer — but say so, loudly: a
-          // silent fallback here looks exactly like "the fix didn't work".
+          webglFailures += 1;
           console.warn(
             "[manifold] WebGL renderer unavailable, using the slower DOM "
             + "renderer:", err,
           );
         }
-      }
+      };
 
       // Fit to the host element's real box, then keep the prompt in view.
       // The host has NO padding of its own (padding lives on the wrapper),
@@ -182,25 +223,39 @@ export function TerminalPanel({
         } catch {}
         doFit();
       };
+      // This handler runs for keydown, keypress AND keyup. A combo we own
+      // must return false for EVERY phase: blocking only keydown left
+      // xterm's keypress path free to emit its own key - which is why
+      // Shift+Enter used to send our newline AND a plain Enter right
+      // behind it, submitting the message anyway.
       term.attachCustomKeyEventHandler((ev) => {
-        if (ev.type !== "keydown") return true;
+        const down = ev.type === "keydown";
         if (ev.shiftKey && ev.key === "Enter") {
-          if (ws.readyState === WebSocket.OPEN) {
+          if (down && ws.readyState === WebSocket.OPEN) {
+            // Terminals cannot natively tell Shift+Enter from Enter, so
+            // send backslash+CR: the escaped newline the Claude CLI (and
+            // every shell, as line continuation) understands.
             ws.send(JSON.stringify({ type: "input", data: "\\\r" }));
           }
           return false;
         }
         const mod = ev.metaKey || ev.ctrlKey;
         if (mod && (ev.key === "=" || ev.key === "+")) {
-          setFont(fontSize + 1);
+          if (down) setFont(fontSize + 1);
           return false;
         }
         if (mod && ev.key === "-") {
-          setFont(fontSize - 1);
+          if (down) setFont(fontSize - 1);
           return false;
         }
         if (mod && ev.key === "0") {
-          setFont(13);
+          if (down) setFont(13);
+          return false;
+        }
+        // Cmd+K clears scrollback, like every macOS terminal. Cmd only:
+        // Ctrl+K is kill-line in shells and must reach them untouched.
+        if (ev.metaKey && !ev.ctrlKey && ev.key === "k") {
+          if (down) term.clear();
           return false;
         }
         return true;
@@ -258,7 +313,35 @@ export function TerminalPanel({
       window.addEventListener("resize", doFit);
       requestAnimationFrame(doFit);
 
+      // Visibility drives the GPU renderer (see acquireWebgl): the dock
+      // hides inactive tabs with display:none, which IntersectionObserver
+      // reports as not-intersecting. On show: take a WebGL context, refit
+      // (the dock may have been resized while we were hidden), and repaint
+      // the whole viewport - a canvas that was display:none comes back
+      // stale otherwise. On hide: release the context for whoever IS
+      // visible.
+      const io = new IntersectionObserver((entries) => {
+        const nowVisible = entries.some((e) => e.isIntersecting);
+        if (nowVisible === panelVisible) return;
+        panelVisible = nowVisible;
+        if (nowVisible) {
+          acquireWebgl();
+          doFit();
+          requestAnimationFrame(() => {
+            try {
+              term.refresh(0, term.rows - 1);
+            } catch {}
+          });
+        } else {
+          releaseWebgl();
+        }
+      });
+      io.observe(el);
+
       cleanup = () => {
+        io.disconnect();
+        window.clearTimeout(retryTimer);
+        releaseWebgl();
         observer.disconnect();
         window.removeEventListener("resize", doFit);
         dataSub.dispose();
@@ -289,7 +372,10 @@ export function TerminalPanel({
       }
     >
       <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-3 py-1.5">
-        <span className="text-xs text-zinc-400">
+        <span
+          className="text-xs text-zinc-400"
+          title="Shortcuts: Shift+Return newline · Cmd +/- font size · Cmd+0 reset · Cmd+K clear"
+        >
           {label ?? "Terminal (SSH via the managed connection)"}
           {fill ? "" : " · drag the bottom-right corner to resize"}
         </span>

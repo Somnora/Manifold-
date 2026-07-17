@@ -2577,3 +2577,20 @@ parser defaulting to hermes (matches the Qwen/Hermes models our presets
 serve); tool_call_parser is a template parameter for mistral/llama3_json
 families. Always-on is safe: the parser only interprets tool-call
 markup, plain chat is untouched.
+
+**Terminal quality pass: the three real defects behind "glitchy".**
+(1) Shift+Return never worked: xterm consults the custom key handler for
+keydown, keypress AND keyup, and the handler only blocked keydown - so
+xterm's keypress path sent a plain Enter right behind our escaped
+newline, submitting anyway. Owned combos now return false for every
+phase. (2) WebGL contexts are scarce (WebKit caps them per page, evicts
+the oldest) and the dock keeps every tab mounted - one context per
+HIDDEN tab is how the visible terminal got evicted and silently fell to
+the slow DOM renderer, which under a TUI repaint load reads as glitchy /
+typing over itself. WebGL is now acquired on visibility and released on
+hide (IntersectionObserver), with re-acquire after context loss instead
+of permanent fallback. (3) xterm's default width tables are Unicode 6;
+the spinners and glyphs Claude Code draws get the wrong cell width, so
+the app and terminal disagree about the cursor column - unicode11 addon
+fixes the tables. Also: macOptionIsMeta (Option+Enter newline,
+Option+arrow word jumps), Cmd+K clear, shortcuts on the header tooltip.
