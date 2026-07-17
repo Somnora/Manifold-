@@ -2458,3 +2458,32 @@ that never carries the type will never fire.
 
 Known flake noted: test_full_task_and_idle_lifecycle intermittently fails
 under full-suite load only (timing); passes in isolation every time.
+
+## 2026-07-17 — Cancel any job (servers included) + stale-default migration
+
+Two gaps found while running the distill loop live:
+
+**Cancel was auto-manage-only.** /tasks/{id}/cancel rejected manual jobs, so
+a vllm-serve started from the Jobs page could not be stopped through
+Manifold at all - the distill guide's own serve-then-train flow needed a
+hand-rolled `docker stop` over SSH. dispatcher.cancel_task now covers every
+pre-terminal state: queued settles as cancelled; running gets its container
+stopped on the instance (`docker rm -f`, with a bracket-trick pkill for jobs
+still in image-pull where no container exists yet); auto-managed pre-run
+routes to the existing guarded teardown, and a running auto-managed job's
+lifecycle sees the settle and proceeds to sync + terminate on its own. The
+completion funnel labels a requested stop "cancelled by user" (no failure
+ping) instead of a baffling "container exited 137". Jobs-page button now
+shows Stop on running jobs.
+
+**Shipped-default fixes never reached existing installs.** The packaged app
+seeds DATA_ROOT/config.yaml once and never overwrites it (user-owned), so
+the 900->2400 boot-timeout fix silently did not apply to the desktop app -
+found live when a distill launch ran under a 900s window that a slow SXM
+boot could overrun. CONFIG_MIGRATIONS rewrites a value ONLY while it still
+exactly equals the old shipped default (a user-chosen value never matches),
+via line-level regex so comments survive; applied and persisted in
+load_settings with a log line per migration. Alternative considered: a
+defaults-overlay (load bundled config underneath the user file) - rejected
+because the seeded file is a full copy, so every key would read as a user
+choice and nothing would ever migrate.

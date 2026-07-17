@@ -384,7 +384,12 @@ function TaskCard({
   // In-flight auto-managed jobs must not be removed (their instance is still
   // being managed); they can be cancelled instead while pre-run.
   const inFlightAuto = auto && !!lc && !["done", "failed", "cancelled"].includes(lc);
-  const canCancel = auto && !!lc && CANCELLABLE.includes(lc);
+  // Any job that has not settled can be stopped: queued jobs settle as
+  // cancelled; running jobs (servers included, which never exit on their
+  // own) get their container stopped on the instance.
+  const canCancel = auto
+    ? !!lc && (CANCELLABLE.includes(lc) || lc === "running")
+    : task.status === "queued" || task.status === "running";
 
   // A failed job must show WHY inline, not just "exit -1": pull the last 10
   // lines of its retained log automatically. The full "Logs" button still
@@ -467,10 +472,14 @@ function TaskCard({
           {canCancel && (
             <button
               onClick={() => onCancel(task.id)}
-              title="Cancel and tear down any instance it launched"
+              title={
+                task.status === "running"
+                  ? "Stop the container on the instance"
+                  : "Cancel and tear down any instance it launched"
+              }
               className="rounded border border-amber-200 px-2 py-0.5 text-amber-700 hover:bg-amber-50"
             >
-              Cancel
+              {task.status === "running" ? "Stop" : "Cancel"}
             </button>
           )}
           {task.status !== "running" && !inFlightAuto && (

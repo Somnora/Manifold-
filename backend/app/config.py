@@ -9,7 +9,9 @@ Nothing in this module talks to the network or the database.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,8 @@ import yaml
 from dotenv import load_dotenv
 
 from .preferences import Preferences, preferences_from_dict
+
+logger = logging.getLogger("manifold.config")
 
 # Repo root is one level above backend/.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -245,6 +249,39 @@ def update_env_file(path: Path, updates: dict[str, str]) -> None:
     path.write_text("\n".join(out) + "\n")
 
 
+# Migrations for SHIPPED DEFAULTS that later proved wrong in the field. The
+# packaged app seeds DATA_ROOT/config.yaml ONCE and never overwrites it (it
+# is user-owned), so a corrected default would otherwise never reach an
+# existing install - found live when a desktop app still ran the old 900s
+# boot timeout and could have cut off a slow SXM boot. Each entry rewrites a
+# value ONLY while it still exactly equals the old shipped default: a value
+# the user changed never matches and is never touched. Edits are line-level
+# regex substitutions so the file's comments survive.
+CONFIG_MIGRATIONS: list[tuple[str, str, str]] = [
+    (
+        r"^(\s*)boot_timeout_seconds:\s*900\s*$",
+        r"\g<1>boot_timeout_seconds: 2400",
+        "launch.boot_timeout_seconds 900 -> 2400 "
+        "(SXM boots routinely exceed 900s; see DECISIONS.md 2026-07-14)",
+    ),
+]
+
+
+def apply_config_migrations(text: str) -> tuple[str, list[str]]:
+    """Rewrite stale shipped defaults in config text. Pure.
+
+    Returns (new_text, descriptions of what changed); an empty list means
+    the text is untouched (user-changed values never match)."""
+    applied: list[str] = []
+    for pattern, replacement, description in CONFIG_MIGRATIONS:
+        new_text, count = re.subn(pattern, replacement, text,
+                                  flags=re.MULTILINE)
+        if count:
+            text = new_text
+            applied.append(description)
+    return text, applied
+
+
 def load_settings(
     config_path: Path | None = None, env_path: Path | None = None
 ) -> Settings:
@@ -262,7 +299,21 @@ def load_settings(
         if bundled.exists():
             path.write_text(bundled.read_text())
     if path.exists():
-        raw = yaml.safe_load(path.read_text()) or {}
+        text = path.read_text()
+        text, applied = apply_config_migrations(text)
+        if applied:
+            # Persist so the fix survives and the user sees the real value
+            # when they open the file. Best-effort: a read-only file still
+            # gets the migrated values for THIS run via `text` below.
+            try:
+                path.write_text(text)
+            except OSError:
+                logger.warning("could not persist config migrations to %s",
+                               path)
+            for description in applied:
+                logger.info("config migration applied to %s: %s",
+                            path, description)
+        raw = yaml.safe_load(text) or {}
 
     guard = raw.get("guardrails", {})
     launch = raw.get("launch", {})

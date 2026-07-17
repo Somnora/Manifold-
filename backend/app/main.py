@@ -1636,10 +1636,12 @@ def create_app(
 
     @app.post("/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str):
-        """Cancel an auto-managed job that has not started running. Tears down
-        any instance its lifecycle already launched, through the guarded path."""
+        """Cancel any job: queued jobs settle as cancelled; running jobs get
+        their container stopped on the instance (including servers like
+        vllm-serve, which otherwise never exit); an auto-managed job's
+        lifecycle tears down whatever it already launched, guarded."""
         try:
-            return await dispatcher.cancel_auto_managed(task_id)
+            return await dispatcher.cancel_task(task_id)
         except LaunchRejected as exc:
             raise HTTPException(exc.status_code, exc.detail)
 

@@ -284,6 +284,9 @@ class Dispatcher:
         # backend restart re-probes once, which costs seconds and re-covers
         # any instance that was mid-boot during the restart.
         self._gpu_ready: set[str] = set()
+        # Task ids the user asked to stop: their completion is labeled
+        # "cancelled by user" instead of a raw container exit code.
+        self._cancel_requested: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -327,6 +330,13 @@ class Dispatcher:
         a job can never finish silently, which is the whole point when the
         job is running unattended on a GPU that costs money.
         """
+        if task_id in self._cancel_requested:
+            # The user asked for this stop: label it so the record says
+            # "cancelled by user", not a baffling "container exited 137",
+            # and skip the failure ping (they are standing right there).
+            self._cancel_requested.discard(task_id)
+            error = "cancelled by user"
+            notify = False
         self.queue.mark_finished(task_id, exit_code=exit_code,
                                  output_paths=output_paths, error=error)
         if not notify or self.notifier is None:
@@ -1121,6 +1131,65 @@ class Dispatcher:
                 self.db.record_audit(
                     "backend", "auto_manage_terminate_blocked",
                     f"job {job['id']} instance {iid}: {msg}")
+
+    async def cancel_task(self, task_id: str) -> dict:
+        """Cancel any job, in any pre-terminal state.
+
+        Field gap: the old endpoint only cancelled auto-managed jobs, so a
+        vllm-serve started from the Jobs page could not be stopped through
+        Manifold at all (the distill guide's own serve-then-train flow needs
+        exactly that). Routing:
+
+        - auto-managed and not yet running -> cancel_auto_managed (tears
+          down any box its lifecycle already launched, guarded);
+        - queued -> finished as cancelled, nothing ever ran;
+        - running -> stop the container on the instance; the normal
+          completion funnel then settles it, labeled "cancelled by user".
+          An auto-managed job's lifecycle sees the settle and proceeds to
+          sync + terminate on its own.
+        """
+        task = self.queue.get(task_id)
+        if task is None:
+            raise LaunchRejected(404, f"task {task_id} not found")
+        if task["auto_manage"] and task["status"] != "running":
+            return await self.cancel_auto_managed(task_id)
+        if task["status"] == "queued":
+            self._finish_task(task_id, exit_code=-1, output_paths=[],
+                              error="cancelled by user", notify=False)
+            self.db.record_audit("backend", "task_cancelled",
+                                 f"{task_id}: cancelled while queued")
+            return {"cancelled": task_id}
+        if task["status"] != "running":
+            raise LaunchRejected(409, f"job is already {task['status']}")
+
+        instance_id = task.get("instance_id") or ""
+        conn = self.orchestrator.connections.get(instance_id)
+        if conn is None or conn.state != ConnectionState.CONNECTED:
+            raise LaunchRejected(
+                409, f"no connection to {instance_id} to stop the job; if "
+                     f"the instance is gone, the task will settle on its own")
+        # Label FIRST so however the stop lands (rm -f, or the client dying
+        # mid-pull), the completion funnel records a cancel, not a crash.
+        self._cancel_requested.add(task_id)
+        # `docker rm -f` covers a running container (SIGKILL + remove); the
+        # pkill covers a job still in image-pull, where no container exists
+        # yet and the docker CLIENT is the thing to stop. The [b]racket trick
+        # keeps pkill from matching this very command line.
+        stop_cmd = (
+            f"docker rm -f manifold-task-{task_id} >/dev/null 2>&1; "
+            f"pkill -f '[m]anifold-task-{task_id}' 2>/dev/null; true"
+        )
+        try:
+            await conn.run(stop_cmd)
+        except Exception as exc:
+            self._cancel_requested.discard(task_id)
+            raise LaunchRejected(
+                502, f"could not stop the container on {instance_id}: {exc}")
+        self.queue.append_log(task_id, "[manifold] stop requested by user")
+        self.db.record_audit(
+            "backend", "task_cancelled",
+            f"{task_id} on {instance_id}: container stopped by user")
+        return {"cancelled": task_id}
 
     async def cancel_auto_managed(self, task_id: str) -> dict:
         """Cancel an auto-managed job that has not started running.
