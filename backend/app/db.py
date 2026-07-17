@@ -316,6 +316,42 @@ class Database:
                 out.append(secs)
         return out
 
+    def task_costs(self) -> dict[str, dict]:
+        """Actual runtime and cost per FINISHED task, by task id.
+
+        Cost is the task's wall time at the hourly rate of the launch its
+        instance came from - the honest attribution on a shared instance
+        (the box costs the same whether one job or three ran on it, so each
+        job is charged for the time it held the GPU). Tasks on adopted
+        instances have no launch row and therefore no cost: unknown stays
+        unknown rather than guessed. Feeds the per-job cost readout that
+        lets the user sanity-check the pre-launch estimates over time."""
+        rows = self._execute(
+            """SELECT t.id AS id, t.started_at AS s, t.finished_at AS f,
+                      l.hourly_rate_cents AS rate
+                 FROM tasks t
+            LEFT JOIN launches l ON t.instance_id = l.lambda_instance_id
+                WHERE t.started_at IS NOT NULL
+                  AND t.finished_at IS NOT NULL""",
+        ).fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            try:
+                secs = (datetime.fromisoformat(r["f"])
+                        - datetime.fromisoformat(r["s"])).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if secs < 0:
+                continue
+            rate = r["rate"]
+            out[r["id"]] = {
+                "runtime_seconds": secs,
+                "actual_cost_cents": (
+                    round(secs / 3600.0 * rate) if rate is not None else None
+                ),
+            }
+        return out
+
     def record_telemetry_sample(self, instance_id: str, *, gpu_name: str,
                                 vram_used_mib: int, vram_total_mib: int,
                                 util_pct: int) -> None:

@@ -21,7 +21,7 @@ import {
 } from "@/components/AutoManageControls";
 import { LifecyclePipeline } from "@/components/LifecyclePipeline";
 import { useTerminalDock } from "@/components/TerminalDock";
-import { formatDate } from "@/lib/format";
+import { formatDate, formatDuration } from "@/lib/format";
 
 // Accept a pasted HuggingFace URL or a bare id, and trim stray whitespace /
 // trailing punctuation (a trailing ";" once caused a serve failure).
@@ -547,6 +547,20 @@ function TaskCard({
           <span className="font-mono text-xs text-zinc-400">{task.id}</span>
         </div>
         <div className="flex items-center gap-3 text-xs text-zinc-500">
+          {finished && task.runtime_seconds !== null && (
+            <span
+              className="font-mono text-zinc-400"
+              title={
+                task.actual_cost_cents !== null
+                  ? "What this job actually cost: run time at the instance's hourly rate. Compare against the pre-launch estimate."
+                  : "Run time. No cost shown: this instance was not launched by Manifold, so its rate is unknown."
+              }
+            >
+              {formatDuration(task.runtime_seconds)}
+              {task.actual_cost_cents !== null &&
+                ` · $${(task.actual_cost_cents / 100).toFixed(2)}`}
+            </span>
+          )}
           {task.exit_code !== null && finished && (
             <span
               className={`font-mono ${

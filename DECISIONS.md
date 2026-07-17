@@ -2728,3 +2728,25 @@ during the live lora-merge verification: vllm-serve got the models/
 mount in phase-53, so a merged model served by path worked there but
 silently could not resolve on sglang-serve. Both engines now carry the
 identical mount and the distill-loop test asserts parity for both.
+
+## 2026-07-17 — Per-job actual cost: close the estimate feedback loop
+
+**Finished jobs show what they actually cost.** The pre-launch estimate
+already learns (median of past runtimes per template+GPU pair), but the
+user never saw a job's real cost afterwards, so the loop never closed
+visibly and estimate trust had nothing to stand on. GET /tasks now
+annotates every finished task with runtime_seconds and
+actual_cost_cents (wall time at the hourly rate of the launch its
+instance came from, LEFT JOIN on launches), and the Jobs card shows
+"12m . $0.26" next to the exit code. Computed at read time from
+existing rows - no schema change, and history that predates this
+feature gets costs retroactively.
+
+**Attribution choice: wall time at the instance rate, per job.** On a
+shared instance three jobs can overlap, so summed per-job costs can
+exceed the instance bill. Accepted: the question each reading answers
+is "what did holding the GPU for this job cost", which is also exactly
+the quantity the pre-launch estimate predicts - comparability wins.
+Tasks on adopted instances (no launch row, unknown rate) show runtime
+but a null cost: unknown stays unknown rather than guessed, same
+honesty rule as the billing page.

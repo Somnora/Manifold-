@@ -218,6 +218,10 @@ export type Task = {
   lifecycle_detail: string | null;
   lifecycle_events: Record<string, string>;
   launch_to_ready_seconds: number | null;
+  // Set on finished tasks: wall time and its cost at the launch's hourly
+  // rate (null on adopted instances where the rate is unknown).
+  runtime_seconds: number | null;
+  actual_cost_cents: number | null;
 };
 
 export type AutoManageConfig = {
