@@ -76,6 +76,27 @@ export default function SettingsPage() {
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
+          Credits and billing
+        </h2>
+        <p className="mt-2 text-xs">
+          Lambda does not expose credits or invoices through its API, so
+          Manifold cannot show your remaining balance here. The Activity
+          page tracks what Manifold itself spends; for the account-level
+          view (credit balance, invoices, payment methods) use{" "}
+          <a
+            href="https://cloud.lambda.ai/settings/billing"
+            target="_blank"
+            rel="noreferrer"
+            className="text-teal-600 hover:underline"
+          >
+            Lambda&apos;s billing page
+          </a>
+          .
+        </p>
+      </section>
+
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
           Where do these come from?
         </h2>
         <ol className="mt-2 list-decimal space-y-1 pl-5 text-xs">
@@ -89,8 +110,8 @@ export default function SettingsPage() {
             the Storage page).
           </li>
           <li>
-            Register an SSH key and create a persistent filesystem in the
-            Lambda console — both appear in the launch form automatically.
+            Register an SSH key in the Lambda console. Persistent
+            filesystems can be created right on the Storage page here.
           </li>
         </ol>
       </section>

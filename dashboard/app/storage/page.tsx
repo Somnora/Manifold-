@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, ApiError, type Filesystem, type StoredFile } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  type Filesystem,
+  type Region,
+  type StoredFile,
+} from "@/lib/api";
 import { formatBytes, formatDate } from "@/lib/format";
 
 // Browse and delete files on a persistent filesystem via the backend's S3
@@ -9,6 +15,14 @@ import { formatBytes, formatDate } from "@/lib/format";
 export default function StoragePage() {
   const [filesystems, setFilesystems] = useState<Filesystem[]>([]);
   const [selected, setSelected] = useState("");
+  // Create a filebase without leaving for the Lambda console: pick a
+  // region (e.g. where a GPU has capacity but no storage exists yet),
+  // name it, done. Creation is free; storage bills by GB-month used.
+  const [regions, setRegions] = useState<Region[]>([]);
+  const [newName, setNewName] = useState("");
+  const [newRegion, setNewRegion] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createNote, setCreateNote] = useState("");
   const [prefix, setPrefix] = useState("");
   const [files, setFiles] = useState<StoredFile[]>([]);
   const [loading, setLoading] = useState(false);
@@ -26,7 +40,35 @@ export default function StoragePage() {
         if (fs.length > 0) setSelected((v) => v || fs[0].name);
       })
       .catch((e) => setError(e.message));
+    api
+      .regions()
+      .then((rs) => {
+        setRegions(rs);
+        setNewRegion((v) => v || rs[0]?.code || "");
+      })
+      .catch(() => {});
   }, []);
+
+  async function createFilebase(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newName.trim() || !newRegion) return;
+    setCreating(true);
+    setCreateNote("");
+    try {
+      const fs = await api.createFilesystem(newName.trim(), newRegion);
+      setFilesystems((prev) => [...prev, fs]);
+      setSelected(fs.name);
+      setNewName("");
+      setCreateNote(
+        `Created ${fs.name} in ${fs.region}. It is ready to mount on the ` +
+          `next launch there.`,
+      );
+    } catch (err) {
+      setCreateNote(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setCreating(false);
+    }
+  }
 
   useEffect(() => {
     if (!selected) return;
@@ -100,6 +142,50 @@ export default function StoragePage() {
           </p>
         )}
       </div>
+
+      <form
+        onSubmit={createFilebase}
+        className="flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-4"
+      >
+        <label className="block text-xs font-medium text-zinc-600">
+          New filebase
+          <input
+            className="mt-1 block rounded border border-zinc-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+            placeholder="e.g. Somnora-Texas"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+          />
+        </label>
+        <label className="block text-xs font-medium text-zinc-600">
+          Region
+          <select
+            className="mt-1 block rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+            value={newRegion}
+            onChange={(e) => setNewRegion(e.target.value)}
+          >
+            {regions.map((r) => (
+              <option key={r.code} value={r.code}>
+                {r.name} ({r.code})
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="submit"
+          disabled={creating || !newName.trim()}
+          className="rounded bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
+        >
+          {creating ? "Creating..." : "Create"}
+        </button>
+        <p className="pb-1.5 text-xs text-zinc-500">
+          Creation is free; storage bills by the GB-month actually used.
+          Filesystems are region-locked: create one where you plan to
+          launch.
+        </p>
+        {createNote && (
+          <p className="w-full text-xs text-zinc-600">{createNote}</p>
+        )}
+      </form>
 
       {error && (
         <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">

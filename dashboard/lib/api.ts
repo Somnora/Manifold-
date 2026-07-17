@@ -385,6 +385,12 @@ export const api = {
   regions: () =>
     request<{ regions: Region[] }>("/regions").then((r) => r.regions),
 
+  createFilesystem: (name: string, region: string) =>
+    request<Filesystem>("/filesystems", {
+      method: "POST",
+      body: JSON.stringify({ name, region }),
+    }),
+
   filesystems: () =>
     request<{ filesystems: Filesystem[] }>("/filesystems").then(
       (r) => r.filesystems,

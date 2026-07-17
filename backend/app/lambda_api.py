@@ -100,6 +100,13 @@ class LambdaClient(abc.ABC):
     async def list_filesystems(self) -> list[FilesystemInfo]: ...
 
     @abc.abstractmethod
+    async def create_filesystem(self, *, name: str,
+                                region: str) -> FilesystemInfo:
+        """Create a persistent filesystem in `region`. Storage is billed by
+        the GB-month actually used, so creation itself costs nothing."""
+        ...
+
+    @abc.abstractmethod
     async def list_ssh_keys(self) -> list[SSHKeyInfo]: ...
 
     @abc.abstractmethod
@@ -151,6 +158,9 @@ class UnconfiguredLambdaClient(LambdaClient):
         raise self._err()
 
     async def list_filesystems(self):
+        raise self._err()
+
+    async def create_filesystem(self, *, name: str, region: str):
         raise self._err()
 
     async def list_ssh_keys(self):
@@ -212,6 +222,9 @@ class SwappableLambdaClient(LambdaClient):
 
     async def list_filesystems(self):
         return await self._inner.list_filesystems()
+
+    async def create_filesystem(self, *, name: str, region: str):
+        return await self._inner.create_filesystem(name=name, region=region)
 
     async def list_ssh_keys(self):
         return await self._inner.list_ssh_keys()
@@ -304,6 +317,24 @@ class RealLambdaClient(LambdaClient):
             )
             for fs in data
         ]
+
+    async def create_filesystem(self, *, name: str,
+                                region: str) -> FilesystemInfo:
+        # Lambda API quirk: the LIST route is /file-systems (hyphenated),
+        # the CREATE route is /filesystems. Both verified against the docs.
+        data = await self._request(
+            "POST", "/filesystems", json={"name": name, "region": region})
+        region_field = data.get("region", region)
+        if isinstance(region_field, dict):
+            region_field = region_field.get("name", region)
+        return FilesystemInfo(
+            id=data.get("id", ""),
+            name=data.get("name", name),
+            mount_point=data.get("mount_point", f"/lambda/nfs/{name}"),
+            region=region_field,
+            is_in_use=bool(data.get("is_in_use", False)),
+            bytes_used=data.get("bytes_used", 0),
+        )
 
     async def list_ssh_keys(self) -> list[SSHKeyInfo]:
         data = await self._request("GET", "/ssh-keys")
@@ -498,6 +529,24 @@ class MockLambdaClient(LambdaClient):
 
     async def list_filesystems(self) -> list[FilesystemInfo]:
         return list(self.filesystems)
+
+    async def create_filesystem(self, *, name: str,
+                                region: str) -> FilesystemInfo:
+        if any(fs.name == name for fs in self.filesystems):
+            raise LambdaAPIError(
+                code="global/duplicate",
+                message=f"A filesystem named '{name}' already exists",
+                status=400,
+            )
+        fs = FilesystemInfo(
+            id=f"fs-{name}",
+            name=name,
+            mount_point=f"/lambda/nfs/{name}",
+            region=region,
+            is_in_use=False,
+        )
+        self.filesystems.append(fs)
+        return fs
 
     async def list_ssh_keys(self) -> list[SSHKeyInfo]:
         return list(self.ssh_keys)

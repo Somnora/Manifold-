@@ -390,6 +390,19 @@ async def list_filesystems(note: str = "") -> dict:
     return await _call("list_filesystems", "GET", "/filesystems", note=note)
 
 
+@mcp.tool()
+async def create_filesystem(name: str, region: str, note: str = "") -> dict:
+    """Create a persistent filesystem in a region (e.g. before launching in
+    a region that has capacity but no filebase yet). Creation is free;
+    storage bills by the GB-month actually used. Region must be one of the
+    codes from list_launch_options / the regions the account can see."""
+    return await _call(
+        "create_filesystem", "POST", "/filesystems", note=note,
+        args={"name": name, "region": region},
+        body={"name": name, "region": region},
+    )
+
+
 async def _connected_instance_for_fs(filesystem: str | None) -> tuple | None:
     """A connected instance that mounts `filesystem` (or any, if None), as
     (instance_id, filesystem_name). None when nothing suitable is connected.

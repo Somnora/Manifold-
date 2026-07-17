@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -434,6 +435,36 @@ class Orchestrator:
         )
         self._launch_tasks[launch_id] = asyncio.create_task(self._run_launch(plan))
         return self.db.get_launch(launch_id)
+
+    async def create_filesystem(self, name: str, region: str) -> dict:
+        """Create a persistent filesystem through the guarded gateway.
+
+        Creation is free (storage bills by GB-month used), so no spend
+        guard applies; validation here exists to fail fast with a clear
+        message instead of a raw API 400, and to audit the action.
+        """
+        name = (name or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,59}", name):
+            raise LaunchRejected(
+                422,
+                "Filesystem names are 1-60 characters: letters, digits, "
+                "dots, dashes, underscores; starting with a letter or digit.",
+            )
+        from .lambda_api import KNOWN_REGIONS
+        if region not in KNOWN_REGIONS:
+            raise LaunchRejected(
+                422,
+                f"Unknown region '{region}'. Pick one from the region list.",
+            )
+        fs = await self.client.create_filesystem(name=name, region=region)
+        self.db.record_audit(
+            "dashboard", "filesystem_created", f"{fs.name} in {fs.region}",
+        )
+        return {
+            "id": fs.id, "name": fs.name, "mount_point": fs.mount_point,
+            "region": fs.region, "is_in_use": fs.is_in_use,
+            "bytes_used": fs.bytes_used,
+        }
 
     def sidecar_for(self, instance_id: str) -> SidecarClient | None:
         conn = self.connections.get(instance_id)
