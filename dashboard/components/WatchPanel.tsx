@@ -6,6 +6,7 @@ import {
   ApiError,
   type Filesystem,
   type InstanceTypeInfo,
+  type Region,
   type Watch,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
@@ -18,6 +19,7 @@ import { formatDate } from "@/lib/format";
 // the same guarded pipeline as every other launch).
 export function WatchPanel() {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
+  const [regions, setRegions] = useState<Region[]>([]);
   const [filesystems, setFilesystems] = useState<Filesystem[]>([]);
   const [instanceType, setInstanceType] = useState("");
   const [region, setRegion] = useState("");
@@ -31,30 +33,28 @@ export function WatchPanel() {
   );
 
   useEffect(() => {
-    Promise.all([api.instanceTypes(), api.filesystems()])
-      .then(([t, fs]) => {
+    Promise.all([api.instanceTypes(), api.filesystems(), api.regions()])
+      .then(([t, fs, rs]) => {
         setTypes(t);
         setFilesystems(fs);
+        setRegions(rs);
         setInstanceType((v) => v || Object.keys(t)[0] || "");
         if (fs.length > 0) setFilesystem((v) => v || fs[0].name);
+        setRegion((v) => v || rs[0]?.code || "");
       })
       .catch((e) => setError(e.message));
   }, []);
 
-  // For a watch you usually want a region where the type is NOT currently
-  // available — offer all known regions.
-  const regionOptions = useMemo(() => {
-    const all = new Set<string>();
-    for (const t of Object.values(types)) {
-      for (const r of t.regions_with_capacity) all.add(r);
-    }
-    for (const f of filesystems) all.add(f.region);
-    return [...all].sort();
-  }, [types, filesystems]);
-
-  useEffect(() => {
-    setRegion((v) => v || regionOptions[0] || "");
-  }, [regionOptions]);
+  // A watch is usually for a region where the type has NO capacity right
+  // now, so the picker offers EVERY known region (the old list only showed
+  // regions with current capacity, which hid most of the map). Each option
+  // says whether the chosen GPU has capacity there at this moment; Lambda
+  // publishes no per-type region roster beyond that, so a watch in a region
+  // that never carries the type will simply never fire.
+  const hasCapacityNow = useMemo(
+    () => new Set(types[instanceType]?.regions_with_capacity ?? []),
+    [types, instanceType],
+  );
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
@@ -108,9 +108,12 @@ export function WatchPanel() {
             value={region}
             onChange={(e) => setRegion(e.target.value)}
           >
-            {regionOptions.map((r) => (
-              <option key={r} value={r}>
-                {r}
+            {regions.map((r) => (
+              <option key={r.code} value={r.code}>
+                {r.name} ({r.code})
+                {hasCapacityNow.has(r.code)
+                  ? " · has capacity now"
+                  : ""}
               </option>
             ))}
           </select>

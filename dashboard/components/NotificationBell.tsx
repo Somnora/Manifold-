@@ -15,6 +15,7 @@ const TONE: Record<NotificationKind, string> = {
   job_failed: "text-red-400",
   run_finished: "text-sky-400",
   data_transferred: "text-teal-400",
+  capacity_available: "text-emerald-400",
 };
 
 const LABEL: Record<NotificationKind, string> = {
@@ -23,6 +24,7 @@ const LABEL: Record<NotificationKind, string> = {
   job_failed: "job",
   run_finished: "autopilot",
   data_transferred: "data",
+  capacity_available: "capacity",
 };
 
 export function NotificationBell() {

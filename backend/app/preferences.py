@@ -35,6 +35,7 @@ NOTIFICATION_KINDS = (
     "job_failed",
     "run_finished",         # an autopilot run ended (any outcome)
     "data_transferred",     # files were rescued off an instance
+    "capacity_available",   # a capacity watch found its GPU
 )
 
 
@@ -70,6 +71,9 @@ class NotificationPrefs:
     job_failed: bool = True
     run_finished: bool = True
     data_transferred: bool = True
+    # A watch without auto-launch is ONLY a notification: if this is off,
+    # capacity comes and goes silently and the watch was pointless.
+    capacity_available: bool = True
     # Also raise an OS notification (macOS Notification Center, libnotify on
     # Linux). In-app notifications are always recorded regardless; this only
     # controls the ping outside the window.

@@ -617,8 +617,8 @@ def create_app(
         Order: the known NA regions east->west first, then any extra region
         the live catalog reports (named if we know it, else its code). If the
         Lambda client is unconfigured, we still return the static NA set."""
-        from .lambda_api import NA_REGIONS, REGION_NAMES
-        codes = list(NA_REGIONS)
+        from .lambda_api import KNOWN_REGIONS, REGION_NAMES
+        codes = list(KNOWN_REGIONS)
         try:
             types = await lambda_client.list_instance_types()
             for t in types.values():

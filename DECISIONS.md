@@ -2430,3 +2430,31 @@ was fine; the NVIDIA container toolkit wasn't serving GPUs yet. Two layers:
 Also from that pass: the no-S3-keys 503 for /storage/files now teaches the
 keyless route (instance Files panel / list_persistent_files over SSH), so
 "no instance = blind filesystem" at least explains itself.
+
+## 2026-07-17 — Capacity watches: full region map, and the notification that wasn't
+
+Field QA on the watches panel found two real problems and a research answer:
+
+**The region picker showed ~5 regions.** It was built from regions with
+CURRENT capacity (plus filesystem regions) - exactly backwards for a watch,
+whose point is a region with no capacity right now. It now offers the full
+region universe from /regions, annotated per selected GPU with "has capacity
+now". REGION_NAMES gained the international regions from the console picker
+(Germany, Israel, India, Osaka, Tokyo, Sydney); NA_REGIONS renamed
+KNOWN_REGIONS to match.
+
+**A watch without auto-launch notified nobody.** The dispatcher's
+on_capacity_available hook existed but was never wired to anything, so
+capacity flipped the card to "available" silently. _check_watches now posts
+a real notification (new kind: capacity_available, togglable in Settings,
+default on) saying whether it auto-launched or the user should hurry.
+
+**"Which regions can ever carry which GPU?"** Researched: Lambda publishes
+no static per-type region roster - even their status page labels regions
+inconsistently - and the API only reports CURRENT capacity per type. So we
+deliberately do NOT hardcode a matrix (a guess presented as fact); the
+picker says what is true now and the form copy says a watch in a region
+that never carries the type will never fire.
+
+Known flake noted: test_full_task_and_idle_lifecycle intermittently fails
+under full-suite load only (timing); passes in isolation every time.

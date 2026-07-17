@@ -1230,6 +1230,20 @@ class Dispatcher:
                 "backend", "capacity_available",
                 f"{watch['instance_type']} in {watch['region']} (watch {watch['id']})",
             )
+            # A watch WITHOUT auto-launch is only this notification; it was
+            # silent before (found in field QA: the hook was never wired).
+            if self.notifier:
+                self.notifier.notify(
+                    "capacity_available",
+                    f"{watch['instance_type']} available in {watch['region']}",
+                    "Capacity watch matched. "
+                    + ("Auto-launching through the guarded pipeline."
+                       if watch["auto_launch"]
+                       and self.settings.watches.auto_launch_enabled
+                       and watch["filesystem"]
+                       else "Launch it from the dashboard while it lasts."),
+                    ref=f"watch:{watch['id']}",
+                )
             if self.on_capacity_available:
                 try:
                     self.on_capacity_available(watch)

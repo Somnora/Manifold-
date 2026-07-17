@@ -386,7 +386,7 @@ def _mock_type(name: str, description: str, cents: int, vcpus: int,
     )
 
 
-# North American Lambda regions (from the console, July 2026), listed
+# Known Lambda regions (from the console, July 2026), US listed
 # roughly east -> west. Real mode gets regions live from the API; the mock
 # spreads capacity across these. REGION_NAMES maps each code to the human
 # label the Lambda console shows, so the dashboard reads "Virginia, USA"
@@ -404,8 +404,15 @@ REGION_NAMES = {
     "us-west-1": "California, USA",
     "us-west-2": "Arizona, USA",
     "us-west-3": "Utah, USA",
+    # International (from the console's region picker, July 2026).
+    "europe-central-1": "Germany",
+    "me-west-1": "Israel",
+    "asia-south-1": "India",
+    "asia-northeast-1": "Osaka, Japan",
+    "asia-northeast-2": "Tokyo, Japan",
+    "australia-east-1": "Sydney, Australia",
 }
-NA_REGIONS = list(REGION_NAMES)
+KNOWN_REGIONS = list(REGION_NAMES)
 
 # Mirrors the real Lambda catalog (prices/specs from the console, July 2026)
 # so mock mode looks and costs like production. Types with an empty region

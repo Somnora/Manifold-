@@ -109,6 +109,7 @@ preferences:
     job_failed: true
     run_finished: true       # an autopilot run ended
     data_transferred: true   # files were rescued off an instance
+    capacity_available: true # a capacity watch found its GPU
     # Also raise a real OS notification (macOS Notification Center,
     # notify-send on Linux) so it reaches you outside the window. In-app
     # notifications are recorded either way.

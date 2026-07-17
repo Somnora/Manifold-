@@ -202,6 +202,7 @@ export function PolicySettings() {
               ["job_failed", "A job fails", ""],
               ["run_finished", "An Autopilot run ends", ""],
               ["data_transferred", "Files are saved off an instance", "Or could not be saved, which is the one you want to hear about."],
+              ["capacity_available", "A capacity watch finds its GPU", "Without auto-launch, this notification IS the watch."],
             ] as [NotificationKind, string, string][]
           ).map(([kind, label, hint]) => (
             <Toggle
