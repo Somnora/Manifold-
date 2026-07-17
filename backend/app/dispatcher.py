@@ -272,6 +272,9 @@ class Dispatcher:
         # Instances whose idle auto-termination the user switched off; also
         # persisted on the launch row (see keep_alive_enabled).
         self._keep_alive_mem: set[str] = set()
+        # Instance ids already given the external-instance keep-alive
+        # default, so a user switching it OFF is not overridden next sweep.
+        self._external_defaulted: set[str] = set()
         self.on_capacity_available = None   # hook for notifications (set by app)
         # Model-readiness cache: task_id -> {ready, error, checked_at}. A
         # served model's task goes 'running' the instant its container is
@@ -291,6 +294,10 @@ class Dispatcher:
     # -- lifecycle ---------------------------------------------------------------
 
     def start(self) -> None:
+        # Startup adoption (main's lifespan) ran just before this, so any
+        # externally-launched instance it connected gets its keep-alive
+        # default before the idle loop takes its first look.
+        self._protect_external_instances()
         self._loops = [
             asyncio.create_task(self._readopt_running_tasks()),
             asyncio.create_task(self._task_loop()),
@@ -386,6 +393,31 @@ class Dispatcher:
             f"{instance_id} idle auto-termination {'off' if enabled else 'on'}",
         )
         return {"instance_id": instance_id, "keep_alive": enabled}
+
+    def _protect_external_instances(self) -> None:
+        """Default keep-alive ON for instances Manifold did not launch.
+
+        An adopted external box's owner works over their own SSH, which the
+        idle tracker cannot see, so "no Manifold activity" is not evidence
+        it is unused. Without this, adoption (which brings Files/chat/jobs
+        to the box) would also put it on the idle termination clock and
+        Manifold would kill someone else's running work. Applied once per
+        instance id so the user can still switch keep-alive off from the
+        card; a backend restart re-applies the default, erring toward
+        keeping an externally-owned box alive.
+        """
+        for iid in list(self.orchestrator.connections):
+            if iid in self._external_defaulted:
+                continue
+            self._external_defaulted.add(iid)
+            if self.db.find_launch_by_instance(iid):
+                continue
+            self._keep_alive_mem.add(iid)
+            self.db.record_audit(
+                "backend", "keep_alive",
+                f"{iid} was launched outside Manifold; idle auto-termination "
+                f"defaulted off (switch it on from the instance card)",
+            )
 
     def idle_status(self, instance_id: str) -> dict:
         """Idle countdown info for the instance card. idle_seconds counts
@@ -1285,6 +1317,7 @@ class Dispatcher:
             await asyncio.sleep(self.settings.launch.adopt_poll_seconds)
             try:
                 await self.orchestrator.adopt_running_instances(startup=False)
+                self._protect_external_instances()
             except asyncio.CancelledError:
                 raise
             except Exception:

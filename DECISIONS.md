@@ -2501,3 +2501,19 @@ list_instances per tick. Mid-session adoptions audit as "instance_adopted"
 Connect button on the instance card - rejected because the user cannot know
 a connection is missing before clicking around a dead Files panel, which is
 exactly how this was found.
+
+**Adopted external instances default to keep-alive.** The adoption sweep
+made externally-launched boxes fully usable (Files/chat/jobs) - and thereby
+put them on the idle termination clock, where they are guaranteed to look
+idle: their owner's activity happens over their own SSH, which the idle
+tracker cannot see. Found live 25 minutes before Manifold would have
+rescued-and-terminated an agent's box mid-extraction. Rule: no launch row
+(Manifold did not launch it) -> keep-alive defaults ON at adoption, audited,
+visible on the instance card, user can switch it off; the default applies
+once per instance id so that choice is never overridden by the next sweep
+tick. A backend restart re-applies the default (errs toward keeping an
+externally-owned box alive; the cost of a wrong guess is a few $/hr, the
+cost of the other wrong guess is someone's running job). Alternative
+considered: exempting external instances from the idle loop entirely -
+rejected because it removes the user's ability to opt a forgotten external
+box INTO cost protection.
