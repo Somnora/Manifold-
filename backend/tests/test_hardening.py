@@ -64,8 +64,10 @@ def test_dispatched_command_includes_pipefail(client):
     conn = client.app.state.orchestrator.connections[instance_id]
     ssh = conn.ssh_connection()
     wrapped = next(c for c in ssh.commands if "docker run" in c)
-    assert "set -o pipefail" in wrapped
-    assert "| tee " in wrapped
+    # Restart-proof shape: detached runner + exit-file wait, not a pipeline
+    # that ties the container's life to the SSH session.
+    assert "nohup bash -c" in wrapped
+    assert ".exit" in wrapped
 
 
 # -- idle keep-alive and countdown -------------------------------------------------

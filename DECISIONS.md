@@ -2364,3 +2364,30 @@ Fix: lastCols/lastRows mean "the size the pty has actually been TOLD", so
 they are only updated on a successful send - the readyState check now comes
 BEFORE the dedup. Lesson: a cache of "what the peer knows" must never be
 written on a path that did not tell the peer.
+
+## 2026-07-17 — Restart-proof jobs: detached containers + task re-adoption
+
+Live hardening pass found the worst backend bug yet: a backend restart
+(--reload on every file save) mid-job first ORPHANED the task (logs frozen,
+'running' forever), and on the second live test actually KILLED the
+container (exit 141, SIGPIPE): the docker client piped into the SSH channel,
+so the channel's death took the job with it.
+
+Fix, two layers:
+- wrap_remote_command now runs the container DETACHED (nohup, output to the
+  persistent task log, never the SSH pipe) and writes its exit code to
+  task-logs/<id>.exit; the streaming session just tails the log and waits
+  for the exit file. Any session death only kills the tail. nohup over
+  setsid because macOS has no setsid and the wrapper tests execute in a
+  real shell.
+- Dispatcher._readopt_running_tasks() (startup): every 'running' task is
+  re-adopted; poll the exit file (fallbacks: docker inspect for old-wrap
+  containers, honest 'result unknown' if both are gone) and finish with the
+  real code. Verified live: restart at tick 12/60, container survived all
+  60 ticks, task landed succeeded/exit 0.
+
+Also verified live in the same pass: idle termination fired at exactly the
+configured limit and its rescue synced 22 MB of planted valuable files to
+ephemeral-backup/ before terminating (audit: idle_termination ->
+sync_ephemeral -> data_rescue), and the auto-manage lifecycle ran
+launch -> run -> sync -> terminate with zero human input.
