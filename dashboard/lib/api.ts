@@ -339,6 +339,10 @@ export type Preferences = {
     max_concurrent_instances: number;
     max_hourly_spend_usd: number;
   };
+  // Mirror every worklog entry into this folder (Obsidian vault, repo).
+  worklog: {
+    mirror_dir: string;
+  };
 };
 
 export type PreferencesPatch = {
@@ -346,6 +350,7 @@ export type PreferencesPatch = {
   notifications?: Partial<Record<NotificationKind | "desktop", boolean>>;
   data_safety?: Partial<Preferences["data_safety"]>;
   guardrails?: Partial<Preferences["guardrails"]>;
+  worklog?: Partial<Preferences["worklog"]>;
 };
 
 export type Notification = {

@@ -146,6 +146,19 @@ async def get_skill(note: str = "") -> str:
     return resp.text
 
 
+@mcp.tool()
+async def get_work_log(limit: int = 20, note: str = "") -> dict:
+    """What Manifold accomplished recently: one markdown entry per settled
+    job and autopilot run (template, GPU, runtime, cost, outputs, errors).
+    Call this at the start of a session to know what previous sessions -
+    including other agents and local models - already did, instead of
+    re-deriving or redoing their work."""
+    return await _call(
+        "get_work_log", "GET", "/worklog",
+        note=note, args={"limit": limit}, params={"limit": limit},
+    )
+
+
 # -- instances -------------------------------------------------------------------
 
 

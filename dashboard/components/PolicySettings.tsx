@@ -43,6 +43,7 @@ export function PolicySettings() {
       notifications: { ...prefs.notifications, ...patch.notifications },
       data_safety: { ...prefs.data_safety, ...patch.data_safety },
       guardrails: { ...prefs.guardrails, ...patch.guardrails },
+      worklog: { ...prefs.worklog, ...patch.worklog },
     };
     setPrefs(optimistic);
     setError("");
@@ -335,6 +336,40 @@ export function PolicySettings() {
             hint="Stops the billing. Those files are gone. Recorded in the audit log."
           />
         </div>
+      </section>
+
+      {/* -- worklog ---------------------------------------------------------- */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4">
+        <SectionHead title="Worklog" note={saved ? "saved" : ""} />
+        <p className="mt-1 text-xs text-zinc-500">
+          Every finished job and Autopilot run is written as a markdown entry
+          to worklog.md in the Manifold data folder. Mirror those entries
+          into a folder of yours - an Obsidian vault, a project repo - so
+          other tools and agents can read what Manifold accomplished.
+        </p>
+        <label className="mt-3 block text-xs font-medium text-zinc-600">
+          Mirror folder (blank = no mirror)
+          <input
+            type="text"
+            placeholder="/Users/you/ObsidianVault/Manifold"
+            value={prefs.worklog.mirror_dir}
+            onChange={(e) =>
+              setPrefs({
+                ...prefs,
+                worklog: { mirror_dir: e.target.value },
+              })
+            }
+            onBlur={(e) =>
+              save({ worklog: { mirror_dir: e.target.value.trim() } })
+            }
+            className="mt-1 block w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+          />
+          <span className="mt-1 block text-[11px] font-normal text-zinc-400">
+            Entries append to{" "}
+            <span className="font-mono">manifold-worklog.md</span> in that
+            folder.
+          </span>
+        </label>
       </section>
     </>
   );

@@ -136,7 +136,7 @@ class Autopilot:
     def __init__(self, settings: Settings, orchestrator: Orchestrator,
                  queue: TaskQueue, templates: dict[str, JobTemplate],
                  db: Database, *, sleep=asyncio.sleep, notifier=None,
-                 template_saver=None):
+                 template_saver=None, worklog=None):
         self.settings = settings
         self.orchestrator = orchestrator
         self.queue = queue
@@ -147,6 +147,9 @@ class Autopilot:
         # approval and when a run ends. An approval nobody hears about is a
         # stall, not a safety feature.
         self.notifier = notifier
+        # Worklog (optional): every finished run becomes one markdown entry
+        # other agents can read (see worklog.py).
+        self.worklog = worklog
         # template_saver(yaml_text) -> JobTemplate: the same validated save
         # path the Jobs page and MCP use. Lets a run author the job it needs
         # (save_template action) instead of dead-ending when no bundled
@@ -337,6 +340,19 @@ class Autopilot:
             (summary or error or f"{steps} step(s)")[:200],
             ref=run_id,
         )
+        if self.worklog is not None:
+            try:
+                run = self.db.get_agent_run(run_id) or {}
+                lines = [f"run {run_id}, {steps} step(s)"]
+                if run.get("goal"):
+                    lines.append(f"goal: {run['goal'][:300]}")
+                if summary:
+                    lines.append(f"summary: {summary[:500]}")
+                if error:
+                    lines.append(f"error: {error[:300]}")
+                self.worklog.record(f"autopilot run {status}", lines)
+            except Exception:
+                logger.exception("worklog entry for run %s failed", run_id)
 
     def _notify(self, kind: str, title: str, body: str,
                 ref: str | None = None) -> None:

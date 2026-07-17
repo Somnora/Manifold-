@@ -114,8 +114,16 @@ accepts losing the listed files.
 
 ## Habits of a good Manifold agent
 
+- Start with `get_work_log`: it lists what previous sessions (yours,
+  other agents', local models') already accomplished - jobs, runs,
+  costs, output locations - so you build on their work instead of
+  redoing it.
 - Pass a short `note` on every MCP call. It lands in the audit log the
   user reads; "probing why the sidecar is down" beats a blank.
+- If the manifold tools vanish from your tool list mid-session, the MCP
+  bridge process died (backend restarts do NOT cause this - the bridge
+  reports "backend unreachable" instead). Ask the user to reconnect the
+  server (/mcp in Claude Code) or restart the client.
 - Prefer `wait_for_launch` and job status over sleep-and-poll loops.
 - Check `get_job_logs` before concluding anything about a failure; exit
   codes and the last 50 log lines usually name the real cause.

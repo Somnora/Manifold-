@@ -2841,3 +2841,27 @@ says so. run_command gets the same 50s cap with explicit guidance:
 longer work belongs in run_job or a detached nohup + follow-up check.
 Alternative considered: raising the client's own timeout - not ours to
 control; the server fitting inside the contract works with every client.
+
+## 2026-07-18 — Worklog: cross-agent memory as a markdown file
+
+**Every settled job and autopilot run writes one markdown entry.** The
+platform vision item: work done through Manifold (including by local
+models) should land "in the same basket" as work done with Claude or
+Codex, so the next session - any agent - knows what already happened.
+The canonical worklog.md lives next to the database (dev, tests, and
+the frozen app each get their own); Settings > Worklog adds an optional
+mirror directory that receives the same entries in manifold-worklog.md.
+Pointing the mirror at an Obsidian vault IS the Obsidian integration -
+vaults are just files - and pointing it at a repo makes GPU work visible
+to every agent session in that repo. Entries carry template, GPU,
+region, instance, runtime, actual cost, output paths, and errors; the
+job funnel and the autopilot _finish hook write them, and a write
+failure can never break the work it describes.
+
+**get_work_log MCP tool + GET /worklog.** Agents on another machine (or
+too lazy to read files) get the same entries over the guarded gateway;
+the agent skill now says to call it FIRST, before re-deriving state.
+Alternative considered: a structured JSON log - rejected because every
+consumer here reads prose (humans, LLMs, Obsidian); the database
+already holds the structured truth and to_dict'ing it again adds a
+format nobody asked for.
