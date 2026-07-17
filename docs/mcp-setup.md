@@ -9,10 +9,40 @@ An agent cannot spend what you have not permitted.
 
 ## Prerequisites
 
-The backend must be running (`uv run uvicorn app.main:create_default_app
---factory` from `backend/`, or mock mode with `MANIFOLD_MOCK=1`). The MCP
-server is a thin bridge to it; if the backend is down, every tool returns
-a clear "backend unreachable" error.
+The backend must be running (the desktop app, or in a dev checkout
+`uv run uvicorn app.main:create_default_app --factory` from `backend/`,
+or mock mode with `MANIFOLD_MOCK=1`). The MCP server is a thin bridge to
+it; if the backend is down, every tool returns a clear "backend
+unreachable" error.
+
+## From the installed desktop app (no dev checkout)
+
+The app's bundled backend binary doubles as the MCP server: run it with
+`--mcp` and it speaks MCP on stdio, bridging to the running app. On macOS
+the binary lives inside the app bundle, so registering in Claude Code is
+one command:
+
+```bash
+claude mcp add manifold -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
+```
+
+Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "manifold": {
+      "command": "/Applications/Manifold.app/Contents/MacOS/manifold-backend",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+Keep the Manifold app running: the bridge talks to it on
+localhost:8000 (or MANIFOLD_PORT if you changed it; set the same value in
+the MCP server's env). Everything below about dev-checkout registration
+still works and behaves identically - it is the same bridge.
 
 ## Registering in Claude Code
 

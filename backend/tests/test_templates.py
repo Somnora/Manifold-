@@ -62,11 +62,12 @@ def test_lora_merge_closes_the_distill_loop():
     src = next(v for v in merge.volumes if v.container == "/data/output")
     assert src.host == "{persistent}/outputs" and src.read_only
 
-    # vllm-serve must mount the SAME models/ dir, or model_id=/data/models/<name>
-    # would not resolve inside the serve container.
-    vllm = templates["vllm-serve"]
-    serve_models = next(v for v in vllm.volumes if v.container == "/data/models")
-    assert serve_models.host == "{persistent}/models" and serve_models.read_only
+    # BOTH serve engines must mount the SAME models/ dir, or
+    # model_id=/data/models/<name> would not resolve inside the container.
+    for engine in ("vllm-serve", "sglang-serve"):
+        serve = templates[engine]
+        mnt = next(v for v in serve.volumes if v.container == "/data/models")
+        assert mnt.host == "{persistent}/models" and mnt.read_only, engine
 
 
 ILLEGAL_MOUNT = """
