@@ -73,7 +73,10 @@ desktop app or a dev backend must be running). GET /health confirms it.
    room to breathe. A 27B model, even 4-bit, wants an A100 40 GB.
 2. `run_job` with template `vllm-serve` and the model id. The template
    handles CUDA, drivers, and loopback binding; do not hand-roll a venv
-   or install drivers.
+   or install drivers. Tool calling / structured output works out of the
+   box (the template passes --enable-auto-tool-choice with the hermes
+   parser, which fits Qwen and Hermes models; set the tool_call_parser
+   parameter to mistral or llama3_json for those families).
 3. `get_job_status` until running, then poll readiness: the model needs
    minutes to download and load after the container starts.
 4. Talk to it at http://localhost:8000/v1 (OpenAI-compatible proxy on the

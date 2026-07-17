@@ -2567,3 +2567,13 @@ a lie waiting to happen. Every MCP call already lands in the audit log
 with actor "mcp"; the header chip derives from the newest such row: teal
 within 5 minutes (an agent is working), grey within the hour, hidden
 after that. Honest, zero new state, click-through to Activity.
+
+**vllm-serve enables tool calling by default.** Agent frameworks
+(pydantic-ai, OpenAI SDK tool use) request structured output via tool
+calls, and vLLM 400s every such request unless started with
+--enable-auto-tool-choice and a --tool-call-parser. Found by a field
+agent who lost a debugging round to it. The template now passes both,
+parser defaulting to hermes (matches the Qwen/Hermes models our presets
+serve); tool_call_parser is a template parameter for mistral/llama3_json
+families. Always-on is safe: the parser only interprets tool-call
+markup, plain chat is untouched.
