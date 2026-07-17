@@ -1967,6 +1967,21 @@ def create_app(
             template, instance_type, durations, rate_cents
         ).to_dict()
 
+    @app.get("/estimate/model-fit")
+    async def model_fit_route(model: str, instance_type: str):
+        """Advisory pre-launch check: will this model's weights plausibly
+        fit in that GPU's VRAM? Estimated from the model name; never blocks."""
+        from .estimates import model_fit
+        gpu_description = ""
+        try:
+            types = await lambda_client.list_instance_types()
+            info = types.get(instance_type)
+            if info is not None:
+                gpu_description = info.gpu_description or info.description
+        except Exception:
+            pass   # unconfigured/unreachable: verdict comes back "unknown"
+        return model_fit(model, instance_type, gpu_description)
+
     @app.get("/launches/{launch_id}/utilization")
     async def launch_utilization(launch_id: str):
         """Post-run utilization verdict + conservative right-size hint, from

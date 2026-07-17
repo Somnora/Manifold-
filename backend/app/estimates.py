@@ -13,6 +13,7 @@ Two jobs:
 
 from __future__ import annotations
 
+import re
 import statistics
 from dataclasses import dataclass
 
@@ -94,7 +95,7 @@ def estimate_job(
         else:
             conf, basis = "rough", (
                 f"based on only {n} past run{'s' if n != 1 else ''} on "
-                f"{instance_type} — still learning, treat as rough"
+                f"{instance_type}; still learning, treat as rough"
             )
         return Estimate(template, instance_type, minutes, cost(minutes),
                         conf, basis, n)
@@ -104,12 +105,12 @@ def estimate_job(
     if default is None:
         return Estimate(
             template, instance_type, None, None, "none",
-            f"{template} runs until you stop it — no fixed runtime to estimate",
+            f"{template} runs until you stop it; no fixed runtime to estimate",
             0,
         )
     return Estimate(
         template, instance_type, default, cost(default), "rough",
-        f"no history yet for {template} on {instance_type} — coarse default, "
+        f"no history yet for {template} on {instance_type}; coarse default, "
         f"rough", 0,
     )
 
@@ -191,7 +192,7 @@ def utilization_summary(
     hint = ""
     if hint_fires:
         hint = (
-            f"Peak VRAM was only {frac * 100:.0f}% of this card — a "
+            f"Peak VRAM was only {frac * 100:.0f}% of this card, so a "
             f"smaller/cheaper GPU likely would have fit. (Advisory: check a "
             f"real run before downsizing; peak, not average, is what OOMs.)"
         )
@@ -199,13 +200,118 @@ def utilization_summary(
         # Close-but-not-clear: stay silent on downsizing, but note the headroom
         # honestly rather than implying the card was fully used.
         hint = (
-            f"Peak VRAM was {frac * 100:.0f}% of capacity — some headroom, but "
+            f"Peak VRAM was {frac * 100:.0f}% of capacity: some headroom, but "
             f"not clearly enough to recommend a smaller card."
         )
     elif not enough:
-        hint = "Limited telemetry for this run — no right-size call made."
+        hint = "Limited telemetry for this run; no right-size call made."
 
     return Utilization(
         gpu, runtime_seconds, peak_vram_used_mib, vram_total_mib,
         avg_util_pct, sample_count, hint_fires, verdict, hint,
     )
+
+
+# -- model-fit preflight ------------------------------------------------------------
+
+# Does this model plausibly fit on that GPU? Everything here is estimated
+# from the MODEL NAME alone (parameter count and quantization markers), not
+# from downloaded weights, so every verdict is advisory and says so. Born
+# from a real night lost to it: a 27B GPTQ-Int4 checkpoint OOMing an A10
+# during weight load, discovered only after boot + download + reboot.
+
+# Effective bytes per parameter for the weights as loaded, including the
+# usual buffers/overhead. fp16/bf16 is the default when no marker matches.
+BYTES_PER_PARAM_FP16 = 2.1
+_QUANT_MARKERS: list[tuple[tuple[str, ...], float, str]] = [
+    (("int4", "4bit", "4-bit", "gptq", "awq", "nf4", "q4"), 0.65, "4-bit"),
+    (("int8", "8bit", "8-bit", "fp8", "q8"), 1.15, "8-bit"),
+    (("q2",), 0.45, "2-bit"),
+    (("q3",), 0.55, "3-bit"),
+    (("q5",), 0.80, "5-bit"),
+    (("q6",), 0.90, "6-bit"),
+]
+
+# Weights-to-VRAM ratio tiers. Above FIT there is no room for KV cache and
+# CUDA context on top of the weights; a server will be cramped well before
+# that, hence the TIGHT band.
+FIT_RATIO = 0.70
+TIGHT_RATIO = 0.92
+
+_MOE_RE = re.compile(r"(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", re.I)
+_PARAMS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", re.I)
+_VRAM_RE = re.compile(r"(\d+)\s*GB", re.I)
+_GPU_COUNT_RE = re.compile(r"gpu_(\d+)x", re.I)
+
+
+def parse_model_params_b(model_id: str) -> float | None:
+    """Billions of parameters, read from the model name. None when the name
+    carries no size (e.g. 'gpt2', 'whisper-large-v3')."""
+    moe = _MOE_RE.search(model_id)
+    if moe:
+        return int(moe.group(1)) * float(moe.group(2))
+    matches = _PARAMS_RE.findall(model_id)
+    # Names put the size after the family version ("Llama-3.1-8B"), so when
+    # several tokens look like sizes, the last one is the parameter count.
+    return float(matches[-1]) if matches else None
+
+
+def parse_quant_bytes(model_id: str) -> tuple[float, str]:
+    """(bytes per parameter, human label) from quantization markers in the
+    name. Default fp16/bf16 when nothing matches."""
+    lowered = model_id.lower()
+    for markers, bytes_pp, label in _QUANT_MARKERS:
+        if any(m in lowered for m in markers):
+            return bytes_pp, label
+    return BYTES_PER_PARAM_FP16, "fp16/bf16"
+
+
+def parse_vram_gb(instance_type_name: str, gpu_description: str) -> float | None:
+    """Total VRAM of an instance type: per-GPU size from the description
+    ('A10 (24 GB PCIe)') times the GPU count from the name ('gpu_8x_a100')."""
+    m = _VRAM_RE.search(gpu_description or "")
+    if not m:
+        return None
+    per_gpu = float(m.group(1))
+    count = _GPU_COUNT_RE.search(instance_type_name or "")
+    return per_gpu * (int(count.group(1)) if count else 1)
+
+
+def model_fit(model_id: str, instance_type_name: str,
+              gpu_description: str) -> dict:
+    """Advisory pre-launch check: will this model's weights plausibly fit in
+    that GPU's VRAM? Never blocks anything; the caller shows the note."""
+    params_b = parse_model_params_b(model_id)
+    vram_gb = parse_vram_gb(instance_type_name, gpu_description)
+    base = {
+        "model": model_id,
+        "instance_type": instance_type_name,
+        "params_b": params_b,
+        "vram_gb": vram_gb,
+        "basis": "estimated from the model name, not from downloaded weights",
+    }
+    if params_b is None or not vram_gb:
+        return {**base, "verdict": "unknown", "est_weights_gb": None,
+                "note": ""}
+    bytes_pp, quant = parse_quant_bytes(model_id)
+    est_weights_gb = round(params_b * bytes_pp, 1)
+    ratio = est_weights_gb / vram_gb
+    if ratio <= FIT_RATIO:
+        verdict, note = "fits", ""
+    elif ratio <= TIGHT_RATIO:
+        verdict = "tight"
+        note = (
+            f"Tight fit: ~{est_weights_gb:.0f} GB of {quant} weights "
+            f"(~{params_b:g}B params) in {vram_gb:.0f} GB VRAM leaves little "
+            f"room for KV cache. Expect a small context window or an OOM; "
+            f"a bigger GPU is safer."
+        )
+    else:
+        verdict = "no"
+        note = (
+            f"Unlikely to fit: ~{est_weights_gb:.0f} GB of {quant} weights "
+            f"(~{params_b:g}B params) will not load into {vram_gb:.0f} GB "
+            f"VRAM. Pick a bigger GPU or a smaller/more quantized model."
+        )
+    return {**base, "verdict": verdict, "est_weights_gb": est_weights_gb,
+            "note": note}

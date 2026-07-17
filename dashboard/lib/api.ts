@@ -248,6 +248,17 @@ export type Estimate = {
   sample_size: number;
 };
 
+export type ModelFit = {
+  model: string;
+  instance_type: string;
+  params_b: number | null;
+  vram_gb: number | null;
+  est_weights_gb: number | null;
+  verdict: "fits" | "tight" | "no" | "unknown";
+  note: string;
+  basis: string;
+};
+
 export type Utilization = {
   available: boolean;
   reason?: string;
@@ -480,6 +491,12 @@ export const api = {
   estimate: (template: string, instanceType: string) =>
     request<Estimate>(
       `/estimate?template=${encodeURIComponent(template)}` +
+        `&instance_type=${encodeURIComponent(instanceType)}`,
+    ),
+
+  modelFit: (model: string, instanceType: string) =>
+    request<ModelFit>(
+      `/estimate/model-fit?model=${encodeURIComponent(model)}` +
         `&instance_type=${encodeURIComponent(instanceType)}`,
     ),
 
