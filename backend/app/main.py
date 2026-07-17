@@ -736,7 +736,15 @@ def create_app(
         sidecar = orchestrator.sidecar_for(instance_id)
         if sidecar is None:
             raise HTTPException(409, f"no managed connection to {instance_id}")
-        return await sidecar.metrics()
+        try:
+            return await sidecar.metrics()
+        except SidecarError:
+            # No sidecar on this box (launched outside Manifold): same
+            # payload from nvidia-smi over the managed SSH connection.
+            payload = await orchestrator.gpu_metrics_via_ssh(instance_id)
+            if payload is not None:
+                return payload
+            raise
 
     async def _drive_terminal(
         ws: WebSocket,
@@ -1510,8 +1518,21 @@ def create_app(
         try:
             async for payload in sidecar.metrics_stream():
                 await ws.send_json(payload)
-        except (WebSocketDisconnect, SidecarError):
+        except WebSocketDisconnect:
             pass
+        except SidecarError:
+            # No sidecar (externally-launched box): poll nvidia-smi over
+            # the managed SSH connection instead, same payload shape.
+            try:
+                while True:
+                    payload = await orchestrator.gpu_metrics_via_ssh(
+                        instance_id)
+                    if payload is None:
+                        break
+                    await ws.send_json(payload)
+                    await asyncio.sleep(3.0)
+            except (WebSocketDisconnect, RuntimeError):
+                pass
         finally:
             try:
                 await ws.close()

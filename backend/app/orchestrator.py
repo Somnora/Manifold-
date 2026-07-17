@@ -66,6 +66,12 @@ from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 
 logger = logging.getLogger("manifold.orchestrator")
 
+# Sidecar-free GPU sampling (gpu_metrics_via_ssh): one CSV line per GPU.
+NVIDIA_SMI_METRICS = (
+    "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu "
+    "--format=csv,noheader,nounits"
+)
+
 
 class LaunchRejected(Exception):
     """A launch request refused before any Lambda API launch call.
@@ -434,6 +440,40 @@ class Orchestrator:
         if conn is None:
             return None
         return self._sidecar_factory(conn)
+
+    async def gpu_metrics_via_ssh(self, instance_id: str) -> dict | None:
+        """GPU metrics without a sidecar, same payload shape as the
+        sidecar's /metrics. Instances launched outside Manifold never got
+        our cloud-init, so no sidecar runs on them - but the managed SSH
+        connection is there, and nvidia-smi answers over it. Returns None
+        when the connection is down or the box has no working nvidia-smi.
+        """
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            return None
+        try:
+            code, out, _err = await conn.run(NVIDIA_SMI_METRICS, timeout=15)
+        except Exception:
+            return None
+        if code != 0:
+            return None
+        gpus = []
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 4:
+                continue
+            try:
+                gpus.append({
+                    "name": parts[0],
+                    "vram_used_mib": int(float(parts[1])),
+                    "vram_total_mib": int(float(parts[2])),
+                    "utilization_pct": int(float(parts[3])),
+                })
+            except ValueError:
+                continue
+        if not gpus:
+            return None
+        return {"available": True, "gpus": gpus, "source": "ssh"}
 
     async def diagnose_sidecar(self, instance_id: str) -> dict:
         """Ask the instance directly why its sidecar is not answering, over
