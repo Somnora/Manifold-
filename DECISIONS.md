@@ -2529,3 +2529,16 @@ the 30s sampling loop, GET /metrics, and the chart's WS relay (3s poll).
 Alternative considered: installing the sidecar onto adopted boxes over
 SSH - rejected for now because mutating a machine Manifold does not own
 is a bigger decision than reading nvidia-smi from it.
+
+**Model-fit preflight estimates from the name, not the weights.** The
+Jobs page now warns before launch when a model's weights plausibly exceed
+the chosen GPU's VRAM (born from a 27B GPTQ-Int4 checkpoint OOMing a
+24 GB A10 after the full boot + download tax was paid). Parameter count
+and quantization are parsed from the model id (27B, 8x7B, GPTQ/AWQ/Int4,
+fp8, q4...), VRAM from the instance type; verdict tiers fits / tight
+(weights above 70% of VRAM leave little KV-cache room) / no (above 92%).
+Advisory only, never blocks, and the copy says it was estimated from the
+name. Alternative considered: querying the HF API for real safetensors
+sizes - rejected for v1 because it adds a network dependency and auth
+surface to a pure function, and the name heuristic catches the whole
+class of mistake this exists to catch; unknown names simply say nothing.

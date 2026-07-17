@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Template, TemplateParameter } from "@/lib/api";
 
 // The whole point of this component: it renders ANY template's parameter
@@ -10,6 +10,7 @@ export function ParameterForm({
   onSubmit,
   submitting,
   initialValues,
+  onModelChange,
 }: {
   template: Template;
   onSubmit: (values: Record<string, unknown>) => void;
@@ -17,6 +18,10 @@ export function ParameterForm({
   // Seed field values (e.g. a model preset filling model_id). Remount the
   // form with a new `key` to re-seed; the user can still edit afterward.
   initialValues?: Record<string, string>;
+  // Fires with the effective model_id value (typed, seeded, or default) so
+  // the page can run the advisory model-vs-VRAM fit check. "" when the
+  // template has no model_id parameter.
+  onModelChange?: (model: string) => void;
 }) {
   const [values, setValues] = useState<Record<string, string>>(
     () => ({ ...initialValues }),
@@ -26,6 +31,13 @@ export function ParameterForm({
     if (p.name in values) return values[p.name];
     return p.default != null ? String(p.default) : "";
   }
+
+  const modelParam = template.parameters.find((p) => p.name === "model_id");
+  const modelValue = modelParam ? currentValue(modelParam) : "";
+  useEffect(() => {
+    onModelChange?.(modelValue);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelValue]);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();

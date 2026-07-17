@@ -5,6 +5,7 @@ import {
   api,
   ApiError,
   type Instance,
+  type ModelFit,
   type ModelPreset,
   type Task,
   type Template,
@@ -87,6 +88,30 @@ export default function JobsPage() {
 
   const template = templates.find((t) => t.name === selected);
   const isVllm = selected === "vllm-serve";
+
+  // Advisory model-vs-VRAM preflight. The GPU it checks against follows the
+  // launch decision: auto-manage's chosen type, else the targeted (or first
+  // connected) instance. Never blocks queueing; it just warns before the
+  // boot + weight-download tax is paid on a model that cannot fit.
+  const [fitModel, setFitModel] = useState("");
+  const [fit, setFit] = useState<ModelFit | null>(null);
+  const fitInstanceType = auto.enabled
+    ? auto.gpu_type
+    : ((connected.find((i: Instance) => i.id === targetInstance) ??
+        connected[0])?.instance_type ?? "");
+  useEffect(() => {
+    if (!fitModel || !fitInstanceType) {
+      setFit(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      api
+        .modelFit(normalizeModelId(fitModel), fitInstanceType)
+        .then(setFit)
+        .catch(() => setFit(null));
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [fitModel, fitInstanceType]);
 
   async function enqueue(values: Record<string, unknown>) {
     setSubmitting(true);
@@ -279,11 +304,25 @@ export default function JobsPage() {
                 </div>
               )}
 
+              {fit && (fit.verdict === "no" || fit.verdict === "tight") && (
+                <p
+                  className={`rounded border px-3 py-2 text-xs ${
+                    fit.verdict === "no"
+                      ? "border-red-200 bg-red-50 text-red-700"
+                      : "border-amber-200 bg-amber-50 text-amber-700"
+                  }`}
+                >
+                  {fit.note} Estimated from the model name, so treat it as a
+                  sanity check, not a guarantee.
+                </p>
+              )}
+
               <ParameterForm
                 key={`${template.name}:${seed?.model_id ?? ""}`}
                 template={template}
                 onSubmit={enqueue}
                 submitting={submitting}
+                onModelChange={setFitModel}
                 initialValues={
                   isVllm && seed
                     ? { model_id: seed.model_id, ...seed.parameters }
