@@ -24,12 +24,15 @@ def test_model_endpoint_reports_not_serving(client):
 
 
 def test_model_endpoint_reports_served_model(client):
-    make_serving_task(client, "i-serve")
+    task_id = make_serving_task(client, "i-serve")
     body = client.get("/instances/i-serve/model").json()
     assert body["serving"] is True
     assert body["model_id"] == "meta-llama/Llama-3.1-8B-Instruct"
     assert body["port"] == 8080          # host side of the template mapping
     assert body["template"] == "vllm-serve"
+    # The jobs-page readiness chip keys its verdict to a specific task card,
+    # so the serving response MUST name the task it is reporting on.
+    assert body["task_id"] == task_id
     # A different instance is not serving.
     assert client.get("/instances/i-other/model").json() == {"serving": False, "ready": False}
 
