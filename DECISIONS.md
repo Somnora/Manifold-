@@ -2391,3 +2391,24 @@ configured limit and its rescue synced 22 MB of planted valuable files to
 ephemeral-backup/ before terminating (audit: idle_termination ->
 sync_ephemeral -> data_rescue), and the auto-manage lifecycle ran
 launch -> run -> sync -> terminate with zero human input.
+
+## 2026-07-17 — Terminal UX pass: lost cursor, Shift+Enter, font size, overflow
+
+Four issues from field use inside the dock terminal (screenshots in the
+user's Mani-Terminal-Bugs folder):
+
+- **Typing over the current line / lost cursor.** Output arriving while the
+  viewport was scrolled up left the user typing "blind" below the fold;
+  typing now snaps the view to the cursor (term.scrollToBottom in onData,
+  once per keystroke, cheap), and a full term.refresh follows every real
+  grid change: the manual "jiggle the handle" fix, automated.
+- **Shift+Enter sends instead of newline.** Terminals cannot distinguish
+  Shift+Enter from Enter on the wire, so the key handler sends
+  backslash+CR: the escaped-newline form the Claude CLI understands, and
+  plain line continuation in every shell.
+- **Font size.** Cmd/Ctrl +/-/0 while the terminal is focused (8-24px,
+  persisted in localStorage, refit + PTY resize after each change).
+- **Instance-card buttons flying off the card.** When the action row
+  overflows, the four dock buttons collapse into a ">>" menu (Terminate
+  always stays visible). Hysteresis - remember the width the full row
+  needed, expand only when it is back - prevents collapse/expand flicker.

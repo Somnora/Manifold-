@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -21,6 +21,32 @@ export function InstanceCard({
   onChanged: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
+  // When the dock (or a narrow window) squeezes the card, the action row
+  // used to push its buttons off the page. Below the needed width the dock
+  // buttons collapse into a ">>" menu; Terminate always stays visible.
+  // Hysteresis: remember the width the full row NEEDED when it overflowed,
+  // and only expand again once that much room is back (no flicker).
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const neededWidth = useRef(0);
+  const [collapsed, setCollapsed] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  useEffect(() => {
+    const row = actionsRef.current;
+    if (!row) return;
+    const check = () => {
+      if (!collapsed && row.scrollWidth > row.clientWidth + 1) {
+        neededWidth.current = row.scrollWidth;
+        setCollapsed(true);
+      } else if (collapsed && row.clientWidth >= neededWidth.current) {
+        setCollapsed(false);
+        setMenuOpen(false);
+      }
+    };
+    check();
+    const obs = new ResizeObserver(check);
+    obs.observe(row);
+    return () => obs.disconnect();
+  }, [collapsed]);
   // Terminal / Chat / Files / Browse all open in the DOCK (snappable bottom
   // or right, tabs or split) instead of unrolling inside this card.
   const { dockInstance, dockPanel } = useTerminalDock();
@@ -175,28 +201,58 @@ export function InstanceCard({
             {instance.region} at {formatMoney(instance.hourly_rate_usd)}/hr
           </p>
         </div>
-        <div className="flex items-center gap-2 text-right">
-          {everConnected && (
-            <>
-              {(
-                [
-                  ["Terminal", () => dockInstance(instance.id, instance.name || instance.id)],
-                  ["Chat", () => dockPanel("chat", instance.id, instance.name || instance.id)],
-                  ["Files", () => dockPanel("files", instance.id, instance.name || instance.id)],
-                  ["Browse", () => dockPanel("browse", instance.id, instance.name || instance.id)],
-                ] as [string, () => void][]
-              ).map(([label, action]) => (
-                <button
-                  key={label}
-                  onClick={action}
-                  title={`Open ${label.toLowerCase()} in the dock (snap it bottom or right)`}
-                  className="rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                >
-                  {label}
-                </button>
-              ))}
-            </>
-          )}
+        <div
+          ref={actionsRef}
+          className="flex items-center gap-2 overflow-hidden text-right"
+        >
+          {everConnected &&
+            (() => {
+              const dockActions = [
+                ["Terminal", () => dockInstance(instance.id, instance.name || instance.id)],
+                ["Chat", () => dockPanel("chat", instance.id, instance.name || instance.id)],
+                ["Files", () => dockPanel("files", instance.id, instance.name || instance.id)],
+                ["Browse", () => dockPanel("browse", instance.id, instance.name || instance.id)],
+              ] as [string, () => void][];
+              if (!collapsed) {
+                return dockActions.map(([label, action]) => (
+                  <button
+                    key={label}
+                    onClick={action}
+                    title={`Open ${label.toLowerCase()} in the dock (snap it bottom or right)`}
+                    className="rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                  >
+                    {label}
+                  </button>
+                ));
+              }
+              return (
+                <div className="relative">
+                  <button
+                    onClick={() => setMenuOpen((o) => !o)}
+                    title="More panels (not enough room to show every button)"
+                    className="rounded border border-zinc-300 px-2 py-1 font-mono text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                  >
+                    {">>"}
+                  </button>
+                  {menuOpen && (
+                    <div className="absolute right-0 z-30 mt-1 w-32 rounded border border-zinc-200 bg-white py-1 shadow-lg">
+                      {dockActions.map(([label, action]) => (
+                        <button
+                          key={label}
+                          onClick={() => {
+                            setMenuOpen(false);
+                            action();
+                          }}
+                          className="block w-full px-3 py-1.5 text-left text-xs text-zinc-700 hover:bg-zinc-50"
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           {confirming ? (
             <div className="flex items-center gap-2">
               <span className="text-xs text-zinc-500">Terminate?</span>
