@@ -176,6 +176,15 @@ CREATE TABLE IF NOT EXISTS instance_names (
     name        TEXT NOT NULL
 );
 
+-- The Autopilot project brief: ONE persistent description of what the user
+-- is working on overall, included in every run's system prompt so a goal
+-- reads as a step in the project instead of an isolated command.
+CREATE TABLE IF NOT EXISTS project_brief (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    content     TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -887,6 +896,25 @@ class Database:
     def instance_names(self) -> dict[str, str]:
         rows = self._execute("SELECT * FROM instance_names").fetchall()
         return {r["instance_id"]: r["name"] for r in rows}
+
+    # -- project brief --------------------------------------------------------------
+
+    def get_project_brief(self) -> dict:
+        row = self._execute(
+            "SELECT content, updated_at FROM project_brief WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return {"content": "", "updated_at": None}
+        return {"content": row["content"], "updated_at": row["updated_at"]}
+
+    def set_project_brief(self, content: str) -> None:
+        self._execute(
+            """INSERT INTO project_brief (id, content, updated_at)
+               VALUES (1, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET content = excluded.content,
+                                             updated_at = excluded.updated_at""",
+            (content, utcnow()),
+        )
 
     # -- capacity watches -----------------------------------------------------------
 

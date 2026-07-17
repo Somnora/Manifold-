@@ -2865,3 +2865,18 @@ Alternative considered: a structured JSON log - rejected because every
 consumer here reads prose (humans, LLMs, Obsidian); the database
 already holds the structured truth and to_dict'ing it again adds a
 format nobody asked for.
+
+## 2026-07-18 — Autopilot project brief: runs get project context
+
+**One persistent brief, included in every run's system prompt.** Autopilot
+goals were isolated commands; the user's ask was for the agent to know
+"the overall job". A single project_brief row (Autopilot page textarea,
+GET/PUT /project-brief, audited) is inserted into the system prompt
+BEFORE the goal line, framed as "the goal below is one step in this
+project". Read at run start so editing mid-run never shifts a live run;
+a read failure degrades to no brief, never a failed run. Alternative
+considered: per-run brief parameter - rejected because the whole point
+is persistence across runs; the goal field already covers one-off
+context. Note: agents driving Manifold through MCP (Claude, Codex in a
+repo) already have their own project context and do not use this - the
+brief is for the standalone Autopilot case.

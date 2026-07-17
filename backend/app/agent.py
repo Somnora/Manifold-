@@ -218,9 +218,25 @@ class Autopilot:
     async def _run_loop(self, run_id: str, goal: str, client_fn,
                         brain_model: str, brain_port: int,
                         max_steps: int, gated: frozenset[str]) -> None:
+        # The project brief (Autopilot page) frames every run: the goal
+        # reads as one step in the user's project, not an isolated command.
+        # Read at run start, so editing the brief never shifts a live run.
+        brief = ""
+        try:
+            content = self.db.get_project_brief()["content"].strip()
+            if content:
+                brief = (
+                    "\nProject context (set by the user; the goal below is "
+                    "one step in this project):\n" + content + "\n"
+                )
+        except Exception:
+            logger.exception("project brief read failed; run continues")
+        template = SYSTEM_PROMPT
+        if brief:
+            template = template.replace("Goal: {goal}", brief + "\nGoal: {goal}")
         messages: list[dict] = [
             # .replace, not .format: the prompt is full of literal JSON braces.
-            {"role": "system", "content": SYSTEM_PROMPT.replace("{goal}", goal)},
+            {"role": "system", "content": template.replace("{goal}", goal)},
             {"role": "user", "content": "Begin. What is your first action?"},
         ]
         failures = 0

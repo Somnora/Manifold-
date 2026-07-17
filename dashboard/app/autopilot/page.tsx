@@ -48,6 +48,27 @@ export default function AutopilotPage() {
   const [gates, setGates] = useState<GateableAction[] | null>(null);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
+  // Persistent project brief: included in every run's system prompt so a
+  // goal reads as one step in the project, not an isolated command.
+  const [brief, setBrief] = useState("");
+  const [briefSaved, setBriefSaved] = useState(false);
+
+  useEffect(() => {
+    api
+      .projectBrief()
+      .then((r) => setBrief(r.content))
+      .catch(() => {});
+  }, []);
+
+  async function saveBrief(content: string) {
+    try {
+      await api.setProjectBrief(content);
+      setBriefSaved(true);
+      setTimeout(() => setBriefSaved(false), 1500);
+    } catch {
+      // Non-fatal: the run still works without the brief.
+    }
+  }
 
   const { data: runs, refresh } = usePolling(() => api.autopilotRuns(), 2000);
   // Every model that can drive Manifold: served on a GPU instance, running
@@ -178,6 +199,31 @@ export default function AutopilotPage() {
               done.&rdquo; If no template fits the work, the agent can author
               a custom one mid-run (it stays in your Jobs page afterwards).
             </p>
+            <div className="rounded border border-zinc-200 bg-zinc-50 p-2.5">
+              <div className="flex items-baseline justify-between">
+                <p className="text-xs font-medium text-zinc-600">
+                  Project brief (saved; included in every run)
+                </p>
+                {briefSaved && (
+                  <span className="font-mono text-[11px] text-teal-500">
+                    saved
+                  </span>
+                )}
+              </div>
+              <textarea
+                className="mt-1.5 w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+                rows={2}
+                placeholder='What you are working on overall, e.g. "Red Hope: a 3D colony game. Assets pipeline lives on Somnora-East under red_hope/; outputs go to models/."'
+                value={brief}
+                onChange={(e) => setBrief(e.target.value)}
+                onBlur={(e) => saveBrief(e.target.value.trim())}
+              />
+              <p className="mt-1 text-[11px] text-zinc-400">
+                Persistent context for the agent: the goal above becomes one
+                step in this project instead of an isolated command. Leave
+                blank for none.
+              </p>
+            </div>
             <div className="rounded border border-zinc-200 bg-zinc-50 p-2.5">
               <p className="text-xs font-medium text-zinc-600">
                 Ask me before the agent...
