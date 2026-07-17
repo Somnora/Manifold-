@@ -2391,3 +2391,99 @@ configured limit and its rescue synced 22 MB of planted valuable files to
 ephemeral-backup/ before terminating (audit: idle_termination ->
 sync_ephemeral -> data_rescue), and the auto-manage lifecycle ran
 launch -> run -> sync -> terminate with zero human input.
+
+## 2026-07-17 — Terminal UX pass: lost cursor, Shift+Enter, font size, overflow
+
+Four issues from field use inside the dock terminal (screenshots in the
+user's Mani-Terminal-Bugs folder):
+
+- **Typing over the current line / lost cursor.** Output arriving while the
+  viewport was scrolled up left the user typing "blind" below the fold;
+  typing now snaps the view to the cursor (term.scrollToBottom in onData,
+  once per keystroke, cheap), and a full term.refresh follows every real
+  grid change: the manual "jiggle the handle" fix, automated.
+- **Shift+Enter sends instead of newline.** Terminals cannot distinguish
+  Shift+Enter from Enter on the wire, so the key handler sends
+  backslash+CR: the escaped-newline form the Claude CLI understands, and
+  plain line continuation in every shell.
+- **Font size.** Cmd/Ctrl +/-/0 while the terminal is focused (8-24px,
+  persisted in localStorage, refit + PTY resize after each change).
+- **Instance-card buttons flying off the card.** When the action row
+  overflows, the four dock buttons collapse into a ">>" menu (Terminate
+  always stays visible). Hysteresis - remember the width the full row
+  needed, expand only when it is back - prevents collapse/expand flicker.
+
+## 2026-07-17 — Second GPU boot race: container runtime, not the host
+
+Gamemaker field pass: a job dispatched ~100s after active died with "No CUDA
+GPUs are available" DESPITE the fabric-manager preflight - host nvidia-smi
+was fine; the NVIDIA container toolkit wasn't serving GPUs yet. Two layers:
+
+- GPU_PROBE_COMMAND now also runs `nvidia-container-cli info` (the library
+  docker's --gpus path uses), guarded by `command -v` so a box without the
+  toolkit stays fail-open.
+- Last resort: a container that exits nonzero with a CUDA-race signature
+  ("No CUDA GPUs are available", "could not select device driver", ...) is
+  retried ONCE after re-running the readiness gate. Ordinary failures are
+  never retried (exit code preserved).
+
+Also from that pass: the no-S3-keys 503 for /storage/files now teaches the
+keyless route (instance Files panel / list_persistent_files over SSH), so
+"no instance = blind filesystem" at least explains itself.
+
+## 2026-07-17 — Capacity watches: full region map, and the notification that wasn't
+
+Field QA on the watches panel found two real problems and a research answer:
+
+**The region picker showed ~5 regions.** It was built from regions with
+CURRENT capacity (plus filesystem regions) - exactly backwards for a watch,
+whose point is a region with no capacity right now. It now offers the full
+region universe from /regions, annotated per selected GPU with "has capacity
+now". REGION_NAMES gained the international regions from the console picker
+(Germany, Israel, India, Osaka, Tokyo, Sydney); NA_REGIONS renamed
+KNOWN_REGIONS to match.
+
+**A watch without auto-launch notified nobody.** The dispatcher's
+on_capacity_available hook existed but was never wired to anything, so
+capacity flipped the card to "available" silently. _check_watches now posts
+a real notification (new kind: capacity_available, togglable in Settings,
+default on) saying whether it auto-launched or the user should hurry.
+
+**"Which regions can ever carry which GPU?"** Researched: Lambda publishes
+no static per-type region roster - even their status page labels regions
+inconsistently - and the API only reports CURRENT capacity per type. So we
+deliberately do NOT hardcode a matrix (a guess presented as fact); the
+picker says what is true now and the form copy says a watch in a region
+that never carries the type will never fire.
+
+Known flake noted: test_full_task_and_idle_lifecycle intermittently fails
+under full-suite load only (timing); passes in isolation every time.
+
+## 2026-07-17 — Cancel any job (servers included) + stale-default migration
+
+Two gaps found while running the distill loop live:
+
+**Cancel was auto-manage-only.** /tasks/{id}/cancel rejected manual jobs, so
+a vllm-serve started from the Jobs page could not be stopped through
+Manifold at all - the distill guide's own serve-then-train flow needed a
+hand-rolled `docker stop` over SSH. dispatcher.cancel_task now covers every
+pre-terminal state: queued settles as cancelled; running gets its container
+stopped on the instance (`docker rm -f`, with a bracket-trick pkill for jobs
+still in image-pull where no container exists yet); auto-managed pre-run
+routes to the existing guarded teardown, and a running auto-managed job's
+lifecycle sees the settle and proceeds to sync + terminate on its own. The
+completion funnel labels a requested stop "cancelled by user" (no failure
+ping) instead of a baffling "container exited 137". Jobs-page button now
+shows Stop on running jobs.
+
+**Shipped-default fixes never reached existing installs.** The packaged app
+seeds DATA_ROOT/config.yaml once and never overwrites it (user-owned), so
+the 900->2400 boot-timeout fix silently did not apply to the desktop app -
+found live when a distill launch ran under a 900s window that a slow SXM
+boot could overrun. CONFIG_MIGRATIONS rewrites a value ONLY while it still
+exactly equals the old shipped default (a user-chosen value never matches),
+via line-level regex so comments survive; applied and persisted in
+load_settings with a log line per migration. Alternative considered: a
+defaults-overlay (load bundled config underneath the user file) - rejected
+because the seeded file is a full copy, so every key would read as a user
+choice and nothing would ever migrate.

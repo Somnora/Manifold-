@@ -305,7 +305,8 @@ export type NotificationKind =
   | "job_succeeded"
   | "job_failed"
   | "run_finished"
-  | "data_transferred";
+  | "data_transferred"
+  | "capacity_available";
 
 export type Preferences = {
   approvals: Record<GateableAction, boolean>;

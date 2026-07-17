@@ -9,10 +9,16 @@ the fabric state to settle (bounded, fail-open).
 """
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
-from app.dispatcher import Dispatcher, GPU_PROBE_COMMAND, gpu_readiness
+from app.dispatcher import (
+    CUDA_RACE_SIGNATURES,
+    Dispatcher,
+    GPU_PROBE_COMMAND,
+    gpu_readiness,
+)
 from app.lambda_api import MockLambdaClient
 from app.orchestrator import Orchestrator
 from app.task_queue import SQLiteTaskQueue
@@ -143,6 +149,118 @@ async def test_gate_fails_open_after_timeout(dispatcher):
     log = task_log(dispatcher, task_id)
     assert any("dispatching anyway" in ln for ln in log)
     assert "i-stuck" in dispatcher._gpu_ready  # later jobs not re-gated
+
+
+def test_probe_also_checks_the_container_runtime():
+    """Field pass round 2: host nvidia-smi was fine but the container
+    toolkit wasn't serving GPUs yet. The probe covers both, guarded so a
+    box without nvidia-container-cli stays fail-open."""
+    assert "nvidia-smi -q" in GPU_PROBE_COMMAND
+    assert "nvidia-container-cli info" in GPU_PROBE_COMMAND
+    assert "command -v nvidia-container-cli" in GPU_PROBE_COMMAND
+
+
+class RunTaskConn:
+    """Enough of ManagedConnection for _run_task's fallback path."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        from app.connections import ConnectionState
+        self.state = ConnectionState.CONNECTED
+
+    def ssh_connection(self):
+        return object()          # truthy, no create_process -> run() fallback
+
+    async def run(self, command, **kwargs):
+        return self.script.pop(0) if len(self.script) > 1 else self.script[0]
+
+
+async def test_cuda_race_failure_retries_once_and_succeeds(tmp_path, db):
+    """A container that dies with 'No CUDA GPUs are available' is retried
+    once after re-checking readiness, instead of failing the job (the boot
+    race a solo user's first job hit in the field)."""
+    from app.config import TaskSettings
+    from app.lambda_api import MockLambdaClient
+    from app.orchestrator import Orchestrator
+    from app.task_queue import SQLiteTaskQueue
+    from app.templates import load_templates
+    from tests.conftest import make_settings, mock_connect_fn
+
+    templates, _ = load_templates(
+        Path(__file__).resolve().parent.parent.parent / "templates")
+    settings = make_settings(tmp_path, tasks=TaskSettings(
+        poll_seconds=0.02, gpu_ready_poll_seconds=0.001,
+        gpu_ready_timeout_seconds=0.05))
+    orch = Orchestrator(settings, MockLambdaClient(), db,
+                        connect_fn=mock_connect_fn)
+    queue = SQLiteTaskQueue(db)
+    d = Dispatcher(settings, orch, queue, templates, db, MockLambdaClient())
+
+    launch_id = db.create_launch(requested_type="gpu_1x_a10",
+                                 region="us-east-1",
+                                 filesystem="manifold-data",
+                                 connection_mode="direct-ssh",
+                                 hourly_rate_cents=129)
+    db.update_launch(launch_id, status="active", lambda_instance_id="i-race")
+    task_id = queue.enqueue(template="gpu-smoke", parameters={})
+    task = queue.get(task_id)
+
+    conn = RunTaskConn([
+        (0, PCIE_BOX, ""),                                   # preflight ok
+        (1, "RuntimeError: No CUDA GPUs are available", ""),  # race failure
+        (0, PCIE_BOX, ""),                                   # re-check ok
+        (0, "smoke ok", ""),                                 # retry succeeds
+    ])
+    real_sleep = asyncio.sleep
+    import app.dispatcher as disp_mod
+    orig = disp_mod.asyncio.sleep
+    disp_mod.asyncio.sleep = lambda s: real_sleep(0)   # skip the 20s wait
+    try:
+        await d._run_task(task, "i-race", conn)
+    finally:
+        disp_mod.asyncio.sleep = orig
+
+    done = queue.get(task_id)
+    assert done["status"] == "succeeded"
+    assert done["exit_code"] == 0
+    log = " ".join(r["line"] for r in queue.get_logs(task_id))
+    assert "retrying once" in log
+
+
+async def test_non_cuda_failures_are_not_retried(tmp_path, db):
+    from app.config import TaskSettings
+    from app.lambda_api import MockLambdaClient
+    from app.orchestrator import Orchestrator
+    from app.task_queue import SQLiteTaskQueue
+    from app.templates import load_templates
+    from tests.conftest import make_settings, mock_connect_fn
+
+    templates, _ = load_templates(
+        Path(__file__).resolve().parent.parent.parent / "templates")
+    settings = make_settings(tmp_path, tasks=TaskSettings(
+        poll_seconds=0.02, gpu_ready_poll_seconds=0.001,
+        gpu_ready_timeout_seconds=0.05))
+    orch = Orchestrator(settings, MockLambdaClient(), db,
+                        connect_fn=mock_connect_fn)
+    queue = SQLiteTaskQueue(db)
+    d = Dispatcher(settings, orch, queue, templates, db, MockLambdaClient())
+    launch_id = db.create_launch(requested_type="gpu_1x_a10",
+                                 region="us-east-1",
+                                 filesystem="manifold-data",
+                                 connection_mode="direct-ssh",
+                                 hourly_rate_cents=129)
+    db.update_launch(launch_id, status="active", lambda_instance_id="i-fail")
+    task_id = queue.enqueue(template="gpu-smoke", parameters={})
+    conn = RunTaskConn([
+        (0, PCIE_BOX, ""),                      # preflight ok
+        (7, "some ordinary crash", ""),         # real failure: no retry
+    ])
+    await d._run_task(queue.get(task_id), "i-fail", conn)
+    done = queue.get(task_id)
+    assert done["status"] == "failed"
+    assert done["exit_code"] == 7
+    assert "retrying once" not in " ".join(
+        r["line"] for r in queue.get_logs(task_id))
 
 
 async def test_gate_fails_open_on_probe_error(dispatcher):

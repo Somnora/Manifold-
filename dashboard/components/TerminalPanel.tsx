@@ -72,9 +72,18 @@ export function TerminalPanel({
       ]);
       if (disposed) return;
 
+      // Font size is a user setting: Cmd+= / Cmd+- / Cmd+0 while the
+      // terminal is focused, remembered across sessions.
+      const FONT_STORE = "manifold-term-font";
+      let fontSize = 13;
+      try {
+        const saved = parseInt(localStorage.getItem(FONT_STORE) || "", 10);
+        if (saved >= 8 && saved <= 24) fontSize = saved;
+      } catch {}
+
       const term = new Terminal({
         cursorBlink: true,
-        fontSize: 13,
+        fontSize,
         fontFamily:
           "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
         theme: { background: "#09090b", foreground: "#e4e4e7" },
@@ -152,8 +161,50 @@ export function TerminalPanel({
               rows: term.rows,
             }),
           );
+          // Full repaint after a grid change: the manual "jiggle the handle
+          // until it reorganizes" fix, done automatically.
+          term.refresh(0, term.rows - 1);
         });
       };
+
+      // Keyboard niceties, handled BEFORE xterm's own key processing:
+      // - Shift+Enter inserts a newline instead of sending the message.
+      //   Terminals can't natively tell Shift+Enter from Enter, so we send
+      //   backslash+CR, the escaped-newline form the Claude CLI (and every
+      //   shell, as line continuation) understands.
+      // - Cmd/Ctrl +/-/0 adjusts the font size (persisted), then refits so
+      //   the PTY learns the new cols/rows.
+      const setFont = (px: number) => {
+        fontSize = Math.min(24, Math.max(8, px));
+        term.options.fontSize = fontSize;
+        try {
+          localStorage.setItem(FONT_STORE, String(fontSize));
+        } catch {}
+        doFit();
+      };
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== "keydown") return true;
+        if (ev.shiftKey && ev.key === "Enter") {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "input", data: "\\\r" }));
+          }
+          return false;
+        }
+        const mod = ev.metaKey || ev.ctrlKey;
+        if (mod && (ev.key === "=" || ev.key === "+")) {
+          setFont(fontSize + 1);
+          return false;
+        }
+        if (mod && ev.key === "-") {
+          setFont(fontSize - 1);
+          return false;
+        }
+        if (mod && ev.key === "0") {
+          setFont(13);
+          return false;
+        }
+        return true;
+      });
 
       const path = wsPath ?? `/instances/${instanceId}/terminal`;
       const qs = sessionId
@@ -190,6 +241,11 @@ export function TerminalPanel({
       ws.onerror = () => setStatus("closed");
 
       const dataSub = term.onData((data) => {
+        // Typing always snaps the view to the cursor (a real terminal's
+        // behavior). Without this, output that arrived while scrolled up
+        // left the user typing "blind" below the fold, which reads as
+        // text overwriting itself with no visible cursor.
+        term.scrollToBottom();
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "input", data }));
         }

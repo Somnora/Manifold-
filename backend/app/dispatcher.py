@@ -49,7 +49,23 @@ class ParameterError(Exception):
 # -q` is the one host-side signal that exposes the A100-SXM trap: the fabric
 # manager still initializing, during which nvidia-smi looks healthy but any
 # CUDA init inside a container fails with "No CUDA GPUs are available".
-GPU_PROBE_COMMAND = "nvidia-smi -q"
+# Host CUDA readiness (fabric manager) AND container-runtime readiness in one
+# probe: the field pass showed a second race where host nvidia-smi is fine
+# but the NVIDIA container toolkit isn't serving GPUs yet, so a job dies with
+# "No CUDA GPUs are available" despite --gpus all. nvidia-container-cli talks
+# to the same library docker's --gpus path uses; probed only when installed
+# so a box without the toolkit stays fail-open.
+GPU_PROBE_COMMAND = (
+    "nvidia-smi -q && "
+    "{ ! command -v nvidia-container-cli >/dev/null || nvidia-container-cli info; }"
+)
+
+# Container stderr signatures of that same race, for the last-resort retry.
+CUDA_RACE_SIGNATURES = (
+    "No CUDA GPUs are available",
+    "could not select device driver",
+    "nvidia-container-cli: initialization error",
+)
 
 # Fabric states that mean CUDA is (or will trivially be) initializable.
 # Anything else - "In Progress" above all - means wait.
@@ -268,6 +284,9 @@ class Dispatcher:
         # backend restart re-probes once, which costs seconds and re-covers
         # any instance that was mid-boot during the restart.
         self._gpu_ready: set[str] = set()
+        # Task ids the user asked to stop: their completion is labeled
+        # "cancelled by user" instead of a raw container exit code.
+        self._cancel_requested: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -311,6 +330,13 @@ class Dispatcher:
         a job can never finish silently, which is the whole point when the
         job is running unattended on a GPU that costs money.
         """
+        if task_id in self._cancel_requested:
+            # The user asked for this stop: label it so the record says
+            # "cancelled by user", not a baffling "container exited 137",
+            # and skip the failure ping (they are standing right there).
+            self._cancel_requested.discard(task_id)
+            error = "cancelled by user"
+            notify = False
         self.queue.mark_finished(task_id, exit_code=exit_code,
                                  output_paths=output_paths, error=error)
         if not notify or self.notifier is None:
@@ -719,19 +745,39 @@ class Dispatcher:
                          f"/lambda/nfs/{filesystem}/task-logs"],
         )
 
-        try:
-            exit_code, stdout, stderr = await self._stream_run(
-                conn, wrapped, task_id
-            )
-        except ConnectionError as exc:
-            self.queue.append_log(task_id, f"[manifold] connection lost: {exc}")
-            self._finish_task(
-                task_id, exit_code=-1, output_paths=[],
-                error=f"SSH connection lost during task: {exc}",
-            )
-            return
-        finally:
-            self.touch_activity(instance_id)
+        for attempt in (1, 2):
+            try:
+                exit_code, stdout, stderr = await self._stream_run(
+                    conn, wrapped, task_id
+                )
+            except ConnectionError as exc:
+                self.queue.append_log(task_id,
+                                      f"[manifold] connection lost: {exc}")
+                self._finish_task(
+                    task_id, exit_code=-1, output_paths=[],
+                    error=f"SSH connection lost during task: {exc}",
+                )
+                return
+            finally:
+                self.touch_activity(instance_id)
+            # Boot race, last resort: the container itself reported CUDA
+            # missing even though the preflight passed. Wait for readiness
+            # again and retry ONCE, instead of confusing the user with a
+            # failure that would succeed a minute later (field report).
+            if exit_code == 0 or attempt == 2:
+                break
+            recent = " ".join(
+                r["line"] for r in self.queue.get_logs(task_id, tail=40)
+            ) + stdout + stderr
+            if not any(sig in recent for sig in CUDA_RACE_SIGNATURES):
+                break
+            self.queue.append_log(
+                task_id,
+                "[manifold] the GPU was not visible inside the container "
+                "(boot race); waiting and retrying once")
+            self._gpu_ready.discard(instance_id)
+            await asyncio.sleep(20)
+            await self._ensure_gpu_ready(conn, instance_id, task_id)
 
         for line in stderr.splitlines():
             self.queue.append_log(task_id, f"[stderr] {line}")
@@ -1086,6 +1132,65 @@ class Dispatcher:
                     "backend", "auto_manage_terminate_blocked",
                     f"job {job['id']} instance {iid}: {msg}")
 
+    async def cancel_task(self, task_id: str) -> dict:
+        """Cancel any job, in any pre-terminal state.
+
+        Field gap: the old endpoint only cancelled auto-managed jobs, so a
+        vllm-serve started from the Jobs page could not be stopped through
+        Manifold at all (the distill guide's own serve-then-train flow needs
+        exactly that). Routing:
+
+        - auto-managed and not yet running -> cancel_auto_managed (tears
+          down any box its lifecycle already launched, guarded);
+        - queued -> finished as cancelled, nothing ever ran;
+        - running -> stop the container on the instance; the normal
+          completion funnel then settles it, labeled "cancelled by user".
+          An auto-managed job's lifecycle sees the settle and proceeds to
+          sync + terminate on its own.
+        """
+        task = self.queue.get(task_id)
+        if task is None:
+            raise LaunchRejected(404, f"task {task_id} not found")
+        if task["auto_manage"] and task["status"] != "running":
+            return await self.cancel_auto_managed(task_id)
+        if task["status"] == "queued":
+            self._finish_task(task_id, exit_code=-1, output_paths=[],
+                              error="cancelled by user", notify=False)
+            self.db.record_audit("backend", "task_cancelled",
+                                 f"{task_id}: cancelled while queued")
+            return {"cancelled": task_id}
+        if task["status"] != "running":
+            raise LaunchRejected(409, f"job is already {task['status']}")
+
+        instance_id = task.get("instance_id") or ""
+        conn = self.orchestrator.connections.get(instance_id)
+        if conn is None or conn.state != ConnectionState.CONNECTED:
+            raise LaunchRejected(
+                409, f"no connection to {instance_id} to stop the job; if "
+                     f"the instance is gone, the task will settle on its own")
+        # Label FIRST so however the stop lands (rm -f, or the client dying
+        # mid-pull), the completion funnel records a cancel, not a crash.
+        self._cancel_requested.add(task_id)
+        # `docker rm -f` covers a running container (SIGKILL + remove); the
+        # pkill covers a job still in image-pull, where no container exists
+        # yet and the docker CLIENT is the thing to stop. The [b]racket trick
+        # keeps pkill from matching this very command line.
+        stop_cmd = (
+            f"docker rm -f manifold-task-{task_id} >/dev/null 2>&1; "
+            f"pkill -f '[m]anifold-task-{task_id}' 2>/dev/null; true"
+        )
+        try:
+            await conn.run(stop_cmd)
+        except Exception as exc:
+            self._cancel_requested.discard(task_id)
+            raise LaunchRejected(
+                502, f"could not stop the container on {instance_id}: {exc}")
+        self.queue.append_log(task_id, "[manifold] stop requested by user")
+        self.db.record_audit(
+            "backend", "task_cancelled",
+            f"{task_id} on {instance_id}: container stopped by user")
+        return {"cancelled": task_id}
+
     async def cancel_auto_managed(self, task_id: str) -> dict:
         """Cancel an auto-managed job that has not started running.
 
@@ -1194,6 +1299,20 @@ class Dispatcher:
                 "backend", "capacity_available",
                 f"{watch['instance_type']} in {watch['region']} (watch {watch['id']})",
             )
+            # A watch WITHOUT auto-launch is only this notification; it was
+            # silent before (found in field QA: the hook was never wired).
+            if self.notifier:
+                self.notifier.notify(
+                    "capacity_available",
+                    f"{watch['instance_type']} available in {watch['region']}",
+                    "Capacity watch matched. "
+                    + ("Auto-launching through the guarded pipeline."
+                       if watch["auto_launch"]
+                       and self.settings.watches.auto_launch_enabled
+                       and watch["filesystem"]
+                       else "Launch it from the dashboard while it lasts."),
+                    ref=f"watch:{watch['id']}",
+                )
             if self.on_capacity_available:
                 try:
                     self.on_capacity_available(watch)

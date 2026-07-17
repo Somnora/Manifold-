@@ -1,12 +1,12 @@
 """The /regions endpoint: full region universe with human names."""
 
-from app.lambda_api import NA_REGIONS, REGION_NAMES
+from app.lambda_api import KNOWN_REGIONS, REGION_NAMES
 
 
-def test_region_name_map_covers_na_regions():
+def test_region_name_map_covers_known_regions():
     # Every region code we advertise has a human label.
-    for code in NA_REGIONS:
-        assert REGION_NAMES[code].endswith("USA")
+    for code in KNOWN_REGIONS:
+        assert REGION_NAMES[code]      # non-empty label (US or international)
     assert REGION_NAMES["us-east-1"] == "Virginia, USA"
     assert REGION_NAMES["us-west-2"] == "Arizona, USA"
     # Both Washington DC regions from the console are present.
@@ -19,7 +19,7 @@ def test_regions_endpoint_returns_named_universe(client):
     regions = body["regions"]
     codes = [r["code"] for r in regions]
     # All twelve NA regions are present, east->west order preserved.
-    assert codes[: len(NA_REGIONS)] == NA_REGIONS
+    assert codes[: len(KNOWN_REGIONS)] == KNOWN_REGIONS
     virginia = next(r for r in regions if r["code"] == "us-east-1")
     assert virginia["name"] == "Virginia, USA"
 
@@ -49,4 +49,4 @@ def test_regions_endpoint_survives_unconfigured_backend(tmp_path):
     )
     with TestClient(app) as c:
         codes = [r["code"] for r in c.get("/regions").json()["regions"]]
-        assert codes == NA_REGIONS
+        assert codes == KNOWN_REGIONS

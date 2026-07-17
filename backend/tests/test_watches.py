@@ -72,6 +72,11 @@ def test_watch_flips_to_available_when_capacity_appears(
         )
         assert watch["triggered_at"] is not None
 
+        # A watch WITHOUT auto-launch IS this notification (it was silent
+        # before: the hook existed but was never wired to the bell).
+        notes = client.get("/notifications").json()["notifications"]
+        assert any(n["kind"] == "capacity_available" for n in notes)
+
 
 def test_watch_wrong_region_does_not_trigger(
     tmp_path, mock_client, mock_storage, mock_sidecar

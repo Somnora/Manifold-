@@ -617,8 +617,8 @@ def create_app(
         Order: the known NA regions east->west first, then any extra region
         the live catalog reports (named if we know it, else its code). If the
         Lambda client is unconfigured, we still return the static NA set."""
-        from .lambda_api import NA_REGIONS, REGION_NAMES
-        codes = list(NA_REGIONS)
+        from .lambda_api import KNOWN_REGIONS, REGION_NAMES
+        codes = list(KNOWN_REGIONS)
         try:
             types = await lambda_client.list_instance_types()
             for t in types.values():
@@ -1636,10 +1636,12 @@ def create_app(
 
     @app.post("/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str):
-        """Cancel an auto-managed job that has not started running. Tears down
-        any instance its lifecycle already launched, through the guarded path."""
+        """Cancel any job: queued jobs settle as cancelled; running jobs get
+        their container stopped on the instance (including servers like
+        vllm-serve, which otherwise never exit); an auto-managed job's
+        lifecycle tears down whatever it already launched, guarded."""
         try:
-            return await dispatcher.cancel_auto_managed(task_id)
+            return await dispatcher.cancel_task(task_id)
         except LaunchRejected as exc:
             raise HTTPException(exc.status_code, exc.detail)
 
@@ -2014,8 +2016,16 @@ def create_app(
                 # Browsing persistent files rides the Lambda S3 "Files" API,
                 # whose access keys live in .env separately from the Lambda
                 # API key. Without them the factory raises; surface that as a
-                # clear 503 instead of an opaque 500 that decodes to nothing.
-                raise HTTPException(503, str(exc)) from exc
+                # clear 503 instead of an opaque 500 that decodes to nothing,
+                # and teach the keyless route so a user without keys is not
+                # blind (field report: "no instance = blind filesystem").
+                raise HTTPException(
+                    503,
+                    f"{exc}. Without these keys, files are still browsable "
+                    f"whenever an instance mounting this filesystem is "
+                    f"running: use its Files panel, or the agent's "
+                    f"list_persistent_files which rides the SSH connection.",
+                ) from exc
         return storage_cache[fs.id]
 
     @app.get("/storage/files")
