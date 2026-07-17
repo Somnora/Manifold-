@@ -21,6 +21,7 @@ export function TerminalPanel({
   label,
   fill,
   sessionId,
+  model,
 }: {
   instanceId?: string;
   wsPath?: string;
@@ -29,6 +30,9 @@ export function TerminalPanel({
   // by the terminal drawer, whose own top-edge handle does the resizing.
   fill?: boolean;
   sessionId?: string;
+  // Local shells only: pre-wire the shell's environment to this served
+  // model via the OpenAI proxy (OPENAI_BASE_URL etc., set backend-side).
+  model?: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<"connecting" | "open" | "closed">(
@@ -262,9 +266,10 @@ export function TerminalPanel({
       });
 
       const path = wsPath ?? `/instances/${instanceId}/terminal`;
-      const qs = sessionId
-        ? `?session=${encodeURIComponent(sessionId)}`
-        : "";
+      const params = new URLSearchParams();
+      if (sessionId) params.set("session", sessionId);
+      if (model) params.set("model", model);
+      const qs = params.size > 0 ? `?${params.toString()}` : "";
       const ws = new WebSocket(`${wsBase()}${path}${qs}`);
 
       ws.onopen = () => {
@@ -361,7 +366,7 @@ export function TerminalPanel({
       disposed = true;
       cleanup?.();
     };
-  }, [instanceId, wsPath, sessionId]);
+  }, [instanceId, wsPath, sessionId, model]);
 
   return (
     <div

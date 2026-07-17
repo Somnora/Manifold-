@@ -20,6 +20,7 @@ import {
   type AutoManageState,
 } from "@/components/AutoManageControls";
 import { LifecyclePipeline } from "@/components/LifecyclePipeline";
+import { useTerminalDock } from "@/components/TerminalDock";
 import { formatDate } from "@/lib/format";
 
 // Accept a pasted HuggingFace URL or a bare id, and trim stray whitespace /
@@ -417,6 +418,18 @@ function TaskCard({
   const [showLogs, setShowLogs] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
   const [failTail, setFailTail] = useState<string[] | null>(null);
+  const { openModelShell } = useTerminalDock();
+
+  // A running serve job is reachable at the local OpenAI proxy; this
+  // opens a local shell whose env is already pointed at it, so any
+  // OpenAI-compatible CLI (aider, opencode, ...) talks to the served
+  // model with zero setup.
+  const servedModel =
+    task.status === "running" &&
+    (task.template === "vllm-serve" || task.template === "sglang-serve") &&
+    typeof task.parameters?.model_id === "string"
+      ? (task.parameters.model_id as string)
+      : "";
 
   const auto = task.auto_manage;
   const lc = task.lifecycle;
@@ -502,6 +515,15 @@ function TaskCard({
             </span>
           )}
           <span>{formatDate(task.created_at)}</span>
+          {servedModel && (
+            <button
+              onClick={() => openModelShell(servedModel)}
+              title={`Open a local shell wired to ${servedModel}: OPENAI_BASE_URL points at the proxy, so any OpenAI-compatible CLI talks to this model`}
+              className="rounded border border-teal-300 px-2 py-0.5 text-teal-700 hover:bg-teal-50"
+            >
+              Open in terminal
+            </button>
+          )}
           <button
             onClick={() => setShowLogs((s) => !s)}
             className="rounded border border-zinc-300 px-2 py-0.5 hover:bg-zinc-50"
