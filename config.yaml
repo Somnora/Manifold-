@@ -22,6 +22,10 @@ launch:
   # 900s cut those off mid-boot. 2400s (40 min) covers the observed worst case.
   boot_timeout_seconds: 2400
   boot_poll_seconds: 10
+  # How often to sweep for active instances with no managed connection
+  # (launched from the Lambda console, a raw API script, or while the
+  # backend was down) and connect to them. 0 disables the sweep.
+  adopt_poll_seconds: 30
 
 ssh:
   # Name of the SSH key as registered with Lambda (GET /ssh-keys),

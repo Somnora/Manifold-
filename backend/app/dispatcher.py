@@ -299,6 +299,8 @@ class Dispatcher:
             asyncio.create_task(self._telemetry_loop()),
             asyncio.create_task(self._auto_manage_loop()),
         ]
+        if self.settings.launch.adopt_poll_seconds > 0:
+            self._loops.append(asyncio.create_task(self._adopt_loop()))
 
     async def stop(self) -> None:
         for loop in self._loops:
@@ -1269,6 +1271,24 @@ class Dispatcher:
                 vram_total_mib=int(g.get("vram_total_mib", 0)),
                 util_pct=int(g.get("utilization_pct", 0)),
             )
+
+    # -- adoption sweep ----------------------------------------------------------------
+
+    async def _adopt_loop(self) -> None:
+        # An instance launched outside Manifold (Lambda console, raw API
+        # script) used to get a managed connection only at backend startup,
+        # leaving Files/chat/jobs dead for it until a restart. This sweep
+        # connects to any active-but-untracked instance within a poll
+        # interval. adopt_running_instances skips ids it already tracks,
+        # so the steady-state cost is one list_instances call per tick.
+        while True:
+            await asyncio.sleep(self.settings.launch.adopt_poll_seconds)
+            try:
+                await self.orchestrator.adopt_running_instances(startup=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("adoption sweep iteration failed")
 
     # -- capacity watch loop ----------------------------------------------------------
 

@@ -75,6 +75,10 @@ class LaunchPolicy:
     # still booting; 2400s (40 min) is the observed ceiling with headroom.
     boot_timeout_seconds: float = 2400.0
     boot_poll_seconds: float = 10.0
+    # How often the backend sweeps for active instances it has no managed
+    # connection to (launched from the Lambda console or a raw API script,
+    # or launched while the backend was down). 0 disables the sweep.
+    adopt_poll_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -353,6 +357,7 @@ def load_settings(
             fallback_instance_types=tuple(launch.get("fallback_instance_types") or ()),
             boot_timeout_seconds=float(launch.get("boot_timeout_seconds", 2400)),
             boot_poll_seconds=float(launch.get("boot_poll_seconds", 10)),
+            adopt_poll_seconds=float(launch.get("adopt_poll_seconds", 30)),
         ),
         tasks=TaskSettings(
             poll_seconds=float(tasks.get("poll_seconds", 1.0)),

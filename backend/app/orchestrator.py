@@ -921,10 +921,12 @@ class Orchestrator:
         conn.start()
         self.connections[instance.id] = conn
 
-    async def adopt_running_instances(self) -> int:
-        """Re-establish managed connections to instances still running on
-        Lambda but not tracked in memory. Called once at startup so a backend
-        restart re-attaches to live instances instead of orphaning them.
+    async def adopt_running_instances(self, *, startup: bool = True) -> int:
+        """Establish managed connections to instances running on Lambda but
+        not tracked in memory. Called at startup so a backend restart
+        re-attaches to live instances, and periodically by the dispatcher's
+        adoption sweep so an instance launched outside Manifold (Lambda
+        console, raw API script) gets Files/chat/jobs without a restart.
 
         Best-effort: an unconfigured/unreachable Lambda client, or a single
         instance we can't classify, must not stop the backend from starting.
@@ -933,10 +935,19 @@ class Orchestrator:
         try:
             instances = await self.client.list_instances()
         except LambdaAPIError as exc:
-            logger.info("skip reconnect-on-startup: %s", exc.message)
+            # info at startup, debug on the 30s sweep so an unconfigured
+            # API key does not fill the log with the same line forever.
+            log = logger.info if startup else logger.debug
+            log("skip instance adoption: %s", exc.message)
             return 0
         except Exception:
-            logger.exception("skip reconnect-on-startup: could not list instances")
+            if startup:
+                logger.exception(
+                    "skip instance adoption: could not list instances")
+            else:
+                logger.debug(
+                    "skip adoption sweep: could not list instances",
+                    exc_info=True)
             return 0
 
         adopted = 0
@@ -964,10 +975,18 @@ class Orchestrator:
             except Exception:
                 logger.exception("failed to reconnect to instance %s", inst.id)
         if adopted:
-            self.db.record_audit(
-                "backend", "reconnect_on_startup",
-                f"re-established connections to {adopted} running instance(s)",
-            )
+            if startup:
+                self.db.record_audit(
+                    "backend", "reconnect_on_startup",
+                    f"re-established connections to {adopted} "
+                    f"running instance(s)",
+                )
+            else:
+                self.db.record_audit(
+                    "backend", "instance_adopted",
+                    f"connected to {adopted} running instance(s) "
+                    f"launched outside Manifold",
+                )
         return adopted
 
     async def resume_pending_launches(self) -> int:
