@@ -108,9 +108,18 @@ Watch loss in the job logs. The LoRA adapter lands in
 ## 5. Use it
 
 - Download the adapter folder from Files (tar.gz) and run it anywhere, or
-- merge and serve on the box: vllm-serve accepts a local HF-format model
-  path once merged. Merging is one `script-run` job with peft; ask the
-  in-dashboard chat (Tools on) to queue it for you.
+- merge and serve on the box, in two jobs:
+  1. `lora-merge` with `adapter_dir: distill-v1` folds the adapter into the
+     base weights and writes a standalone HF model to `models/merged`. The
+     base repo is read from the adapter itself, so you usually pass nothing
+     else (override with `base_model` only if you retargeted it).
+  2. `vllm-serve` with `model_id: /data/models/merged` serves it. A merged
+     model is a normal HF folder, so tool calling, context length, and every
+     other vllm-serve flag work unchanged.
+
+Older builds had no merge template and suggested a hand-rolled `script-run`
+peft job; `lora-merge` replaces that. If you would rather have it done for you,
+the in-dashboard chat (Tools on) can queue both jobs on request.
 
 ## Costs, honestly
 

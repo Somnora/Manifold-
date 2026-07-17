@@ -41,6 +41,34 @@ def test_parameter_schema_is_served():
     }
 
 
+def test_lora_merge_closes_the_distill_loop():
+    """lora-merge reads the adapter from outputs/ and writes to models/, and
+    vllm-serve mounts that same models/ dir so the result is servable by path.
+    This is the contract the distill guide (step 5) now depends on."""
+    templates, errors = load_templates(REPO_TEMPLATES)
+    assert errors == {}
+    merge = templates["lora-merge"]
+
+    # Required input, defaulted output name, optional base override.
+    params = {p.name: p for p in merge.parameters}
+    assert params["adapter_dir"].required is True
+    assert params["output_name"].default == "merged"
+    assert params["base_model"].default == ""      # empty = read from adapter
+
+    # The adapter source is mounted read-only (a merge never mutates it);
+    # the merged model is written to the shared models/ directory.
+    out = next(v for v in merge.volumes if v.container == "/data/models")
+    assert out.host == "{persistent}/models"
+    src = next(v for v in merge.volumes if v.container == "/data/output")
+    assert src.host == "{persistent}/outputs" and src.read_only
+
+    # vllm-serve must mount the SAME models/ dir, or model_id=/data/models/<name>
+    # would not resolve inside the serve container.
+    vllm = templates["vllm-serve"]
+    serve_models = next(v for v in vllm.volumes if v.container == "/data/models")
+    assert serve_models.host == "{persistent}/models" and serve_models.read_only
+
+
 ILLEGAL_MOUNT = """
 name: evil
 description: tries to read the host
