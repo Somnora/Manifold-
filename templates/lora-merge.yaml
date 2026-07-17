@@ -1,0 +1,99 @@
+# Merge a LoRA adapter into its base model, producing a standalone HF-format
+# model on persistent storage. This closes the distill loop: axolotl-finetune
+# writes an adapter to outputs/, lora-merge folds it into the base weights and
+# writes to models/, and vllm-serve serves that folder by path. See
+# docs/distill-your-own-model.md step 5.
+name: lora-merge
+description: Merge a LoRA adapter into its base model, writing a standalone HF model to <filesystem>/models (serve it with vllm-serve, model_id=/data/models/<output_name>)
+image: axolotlai/axolotl:main-latest
+
+# Base-model-agnostic: the base repo is read from the adapter's own
+# adapter_config.json, so a plain axolotl-finetune output needs only its
+# directory name. The merge script rides an env var (MERGE_PY) and takes the
+# user params as POSITIONAL args ($1..$3) -> python argv, so nothing
+# user-supplied is ever interpolated into the program text. The single quotes
+# keep the instance shell from expanding $MERGE_PY to empty (it is set in the
+# container, not on the host) - the same env-script rule script-run follows
+# (see DECISIONS.md 2026-07-12).
+command: >
+  bash -c 'python3 -c "$MERGE_PY" "$1" "$2" "$3"' manifold {{adapter_dir}} {{output_name}} {{base_model}}
+
+parameters:
+  - name: adapter_dir
+    type: string
+    description: LoRA adapter directory name under <filesystem>/outputs (the axolotl-finetune output_dir, e.g. distill-v1)
+  - name: output_name
+    type: string
+    default: merged
+    description: Name for the merged model, created under <filesystem>/models
+  - name: base_model
+    type: string
+    default: ""
+    description: Optional base model override (HF id or local path). Empty = read base_model_name_or_path from the adapter's adapter_config.json
+
+volumes:
+  # The adapter to merge. Read-only: merging never mutates the source, so a
+  # bad run can always be retried from the same adapter.
+  - host: "{persistent}/outputs"
+    container: /data/output
+    read_only: true
+  # The merged model lands here. vllm-serve mounts this same directory, so the
+  # result is servable by path with model_id=/data/models/<output_name>.
+  - host: "{persistent}/models"
+    container: /data/models
+  # Base weights are pulled into (and reused from) the shared HF cache, exactly
+  # where axolotl-finetune already downloaded them.
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+  - host: /workspace/ephemeral/merge-tmp
+    container: /tmp/merge
+
+env:
+  HF_HOME: /root/.cache/huggingface
+  TMPDIR: /tmp/merge
+  MERGE_PY: |
+    import json, os, sys
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    adapter = "/data/output/" + sys.argv[1]
+    out = "/data/models/" + sys.argv[2]
+    override = sys.argv[3] if len(sys.argv) > 3 else ""
+
+    cfg_path = os.path.join(adapter, "adapter_config.json")
+    if not os.path.isfile(cfg_path):
+        sys.exit("manifold: no adapter_config.json in " + adapter +
+                 " (is adapter_dir the finetune output_dir?)")
+    base = override or json.load(open(cfg_path))["base_model_name_or_path"]
+    print("manifold: base=" + base + "  adapter=" + adapter + "  ->  " + out,
+          flush=True)
+
+    # Merge in the training dtype (bf16 where the GPU supports it) so the folded
+    # weights match what the adapter was trained against. device_map="auto"
+    # uses the GPU when present and offloads to CPU otherwise.
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    model = AutoModelForCausalLM.from_pretrained(
+        base, torch_dtype=dtype, device_map="auto", trust_remote_code=True)
+    model = PeftModel.from_pretrained(model, adapter)
+    print("manifold: merging adapter into base weights...", flush=True)
+    model = model.merge_and_unload()
+
+    os.makedirs(out, exist_ok=True)
+    model.save_pretrained(out, safe_serialization=True)
+    # Prefer a tokenizer saved next to the adapter (the finetune may have added
+    # special tokens); fall back to the base model's tokenizer otherwise.
+    tok_src = adapter if os.path.isfile(
+        os.path.join(adapter, "tokenizer_config.json")) else base
+    AutoTokenizer.from_pretrained(
+        tok_src, trust_remote_code=True).save_pretrained(out)
+    print("manifold: merged model written to " + out +
+          " (serve with vllm-serve, model_id=/data/models/" + sys.argv[2] + ")",
+          flush=True)
+
+gpu:
+  min_vram_gib: 24
+  recommended_types:
+    - gpu_1x_a100_sxm4
+    - gpu_1x_h100_sxm5
+    - gpu_1x_a6000

@@ -43,6 +43,9 @@ CASES = [
      {"script": "run.py", "args": "a b c"}, "a b c"),
     ("sdxl-generate", "huggingface/transformers-pytorch-gpu:latest", "PYCODE",
      {"prompt": "a red cat on a mat"}, "a red cat on a mat"),
+    ("lora-merge", "axolotlai/axolotl:main-latest", "MERGE_PY",
+     {"adapter_dir": "distill-v1", "output_name": "merged",
+      "base_model": "Qwen/Qwen3-8B"}, "Qwen/Qwen3-8B"),
 ]
 
 

@@ -2661,3 +2661,39 @@ Alternative considered: keep the button always enabled and let the CLI
 fail loudly - rejected because the whole point of the button is
 zero-setup, and a connect error on first use reads as "Manifold is
 broken", not "the model is still warming up".
+
+## 2026-07-17 — lora-merge template: the missing rung in the distill loop
+
+**A first-class lora-merge template replaces the "hand-roll a peft
+script" hand-wave.** distill-your-own-model.md step 5 told the user to
+merge the LoRA adapter with a bespoke script-run job "and ask the chat
+to queue it" - the one manual break in an otherwise one-click pipeline
+(synthesize -> finetune -> merge -> serve). lora-merge folds an adapter
+from outputs/ into its base weights and writes a standalone HF model to
+models/. It is base-model-agnostic: the base repo is read from the
+adapter's own adapter_config.json, so a plain axolotl-finetune output
+needs only its directory name (base_model is an optional override).
+
+**Merge via peft, not axolotl's own merge_lora.** Alternative
+considered: `axolotl.cli.merge_lora <config>`, which reuses the finetune
+config. Rejected because it only works for adapters axolotl produced and
+needs the exact training config still present and consistent; the peft
+path (AutoModelForCausalLM + PeftModel.merge_and_unload) merges ANY LoRA
+adapter and derives the base from the adapter itself. Reuses the axolotl
+image (torch/transformers/peft already there and already cached on the
+box that just finetuned), so no fresh multi-GB pull.
+
+**Injection-safe like script-run.** The merge program rides an env var
+(MERGE_PY) and the user params arrive as POSITIONAL args ($1..$3) ->
+python argv, never interpolated into the program text; render_docker_command
+shlex-quotes every substituted value. Added to the env-script quoting
+regression (test_template_quoting.py) so it can't silently regress to the
+host-expands-to-empty no-op.
+
+**vllm-serve now mounts models/ read-only.** A merged model is useless if
+it cannot be served, and vllm-serve previously mounted only the HF cache.
+It now also mounts {persistent}/models -> /data/models (read-only;
+serving never writes), so a merged model is served by path with
+model_id=/data/models/<name>. This makes the distill doc's long-standing
+claim ("vllm-serve accepts a local HF-format model path") literally true.
+A test asserts both templates agree on that shared mount.
