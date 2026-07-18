@@ -2986,3 +2986,27 @@ multi-byte-glyph flood through /local/terminal's pty - 20,000/20,000
 received, zero U+FFFD - proving the incremental decoder on the wire, not
 just in unit tests. No GPU was launched: live-instance validation waits
 for an instance that exists for real work, per the no-spend rule.
+
+## 2026-07-18 — Phase 65: pty lifecycle (zombie reaping, process-group hangup)
+
+**Every local shell is now reaped; hangups take the whole group.** Nothing
+ever waitpid()ed the pty child, so every exited local shell sat as a
+zombie until the backend itself exited; and close_pty signalled only the
+shell leader, so children it left running (a backgrounded watcher, a hung
+CLI) lingered. _end_shell_group killpg-HUPs the group (pty.fork made the
+child a session leader, so pid == pgid), reaps with waitpid, and
+escalates to SIGKILL after ~5s if the group ignores the hangup. Wired
+into both exits: explicit close AND natural shell exit. Three regression
+tests fork real processes and assert ps shows the pid fully gone;
+live-verified against the running backend (open+close -> zero zombies).
+
+**What the phase-65 prompt asked for that already existed (no churn):**
+WebSocket backpressure (ack-based 128KB/16KB watermarks + bounded pty
+queue, superior to the requested socket-buffer heuristic), session
+reattachment with capped ring-buffer replay (200KB scrollback +
+session-token hot-swap, race-fixed in phase 63), and crash signatures in
+the worklog (exit code + last output, phase 64). The requested 60s grace
+window was rejected: the refresh-proof dock exists precisely so a frozen
+tab can be reopened at leisure; grace stays the configurable 900s
+(hub.terminal_grace_seconds). Local shell exits stay OUT of the worklog:
+it records units of work, not UI session churn.
