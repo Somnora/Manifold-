@@ -11,6 +11,29 @@ same entries to connected agents directly.
 
 Writes must never break the work they describe: any I/O failure here is
 logged and swallowed.
+
+Entry schema (the cross-agent contract; consumers parse entries split on
+"\n## "). One markdown block per settled unit of work:
+
+    ## <YYYY-MM-DD HH:MM UTC> - job <template> <succeeded|failed>
+    - task <id>
+    - <gpu_type> in <region>, instance <id>     (when a launch is known)
+    - runtime <m> min, cost $<d>                (when timing is recorded)
+    - exit code <n>                             (when the container ran)
+    - outputs: <path>, ...                      (when outputs exist)
+    - error: <message>                          (failures)
+    - last output: <line> / <line> / <line>     (failures: crash signature)
+    - model: <model_id>                         (serving/merge jobs)
+
+    ## <stamp> - autopilot run <succeeded|failed|exhausted|cancelled|done>
+    - run <id>, <n> step(s)
+    - goal: <goal>
+    - summary: <summary>                        (clean finishes)
+    - error: <message>                          (failures/cancels)
+
+Every status lands here - including cancelled and crashed runs - so the
+next agent session is never blind to what did NOT finish. Fields are
+best-effort: absence means unknown, never success.
 """
 
 from __future__ import annotations

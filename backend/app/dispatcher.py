@@ -408,10 +408,20 @@ class Dispatcher:
                 if cost["actual_cost_cents"] is not None:
                     line += f", cost ${cost['actual_cost_cents'] / 100:.2f}"
                 lines.append(line)
+            if task.get("exit_code") is not None:
+                lines.append(f"exit code {task['exit_code']}")
             if task.get("output_paths"):
                 lines.append("outputs: " + ", ".join(task["output_paths"]))
             if task.get("error"):
                 lines.append(f"error: {task['error'][:200]}")
+            if task.get("status") != "succeeded":
+                # The last output lines are the crash signature: they let the
+                # next agent session judge the failure without an instance to
+                # inspect (the full log may be gone with the box).
+                tail = self.queue.get_logs(task_id, tail=3)
+                if tail:
+                    joined = " / ".join(r["line"].strip() for r in tail)
+                    lines.append(f"last output: {joined[:300]}")
             model = (task.get("parameters") or {}).get("model_id")
             if model:
                 lines.append(f"model: {model}")

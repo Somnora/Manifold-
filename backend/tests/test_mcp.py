@@ -324,3 +324,15 @@ async def test_unreachable_backend_is_not_reported_as_no_instances(
     assert result.get("unreachable") is True
     assert "unreachable" in result["error"]
     assert "(none)" not in result["error"]
+
+
+async def test_no_destructive_filesystem_tool_on_the_bridge():
+    """The interlock from phase 62: a whole-volume destroy has no rescue
+    path, so it stays a human action (type-the-name in the dashboard).
+    The bridge may create filesystems but must never grow a tool that
+    deletes one - this fails the build if anyone adds it."""
+    tools = await mcp_server.mcp.list_tools()
+    names = {t.name for t in tools}
+    assert "create_filesystem" in names          # creation stays agent-safe
+    assert "delete_filesystem" not in names
+    assert not any("delete" in n and "filesystem" in n for n in names)
