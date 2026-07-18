@@ -31,6 +31,11 @@ export default function StoragePage() {
   // "no files" / count copy) after a read that actually succeeded.
   const [readOk, setReadOk] = useState(false);
   const [confirmKey, setConfirmKey] = useState<string | null>(null);
+  // Filesystem deletion: destroys the whole volume, so the user proves
+  // intent by typing the name back (the backend refuses without it).
+  const [deleting, setDeleting] = useState(false);
+  const [deleteTyped, setDeleteTyped] = useState<string | null>(null);
+  const [deleteNote, setDeleteNote] = useState("");
 
   useEffect(() => {
     api
@@ -67,6 +72,26 @@ export default function StoragePage() {
       setCreateNote(err instanceof ApiError ? err.message : String(err));
     } finally {
       setCreating(false);
+    }
+  }
+
+  async function deleteFilebase() {
+    if (!fs || deleteTyped !== fs.name) return;
+    setDeleting(true);
+    setDeleteNote("");
+    try {
+      const r = await api.deleteFilesystem(fs.name, deleteTyped);
+      setFilesystems((prev) => prev.filter((f) => f.name !== r.deleted));
+      setSelected((v) => {
+        const rest = filesystems.filter((f) => f.name !== r.deleted);
+        return v === r.deleted ? (rest[0]?.name ?? "") : v;
+      });
+      setDeleteTyped(null);
+      setDeleteNote(`Deleted ${r.deleted} (${r.region}).`);
+    } catch (err) {
+      setDeleteNote(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -186,6 +211,65 @@ export default function StoragePage() {
           <p className="w-full text-xs text-zinc-600">{createNote}</p>
         )}
       </form>
+
+      {fs && (
+        <div className="rounded-lg border border-zinc-200 bg-white p-4">
+          {deleteTyped === null ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                onClick={() => {
+                  setDeleteTyped("");
+                  setDeleteNote("");
+                }}
+                disabled={fs.is_in_use}
+                title={
+                  fs.is_in_use
+                    ? "Attached to a running instance; terminate it first"
+                    : `Delete ${fs.name} and everything on it`
+                }
+                className="rounded border border-red-300 px-3 py-1.5 text-sm text-red-700 hover:bg-red-50 disabled:opacity-40"
+              >
+                Delete {fs.name}...
+              </button>
+              <p className="text-xs text-zinc-500">
+                Deletes the filesystem and every file on it. Permanent; no
+                undo, no rescue.
+                {fs.is_in_use &&
+                  " Unavailable while attached to a running instance."}
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="block text-xs font-medium text-red-700">
+                Type {fs.name} to confirm permanent deletion of{" "}
+                {formatBytes(fs.bytes_used ?? 0)} in {fs.region}
+                <input
+                  autoFocus
+                  className="mt-1 block w-64 rounded border border-red-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+                  value={deleteTyped}
+                  onChange={(e) => setDeleteTyped(e.target.value)}
+                />
+              </label>
+              <button
+                onClick={deleteFilebase}
+                disabled={deleting || deleteTyped !== fs.name}
+                className="rounded bg-red-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-40"
+              >
+                {deleting ? "Deleting..." : "Delete forever"}
+              </button>
+              <button
+                onClick={() => setDeleteTyped(null)}
+                className="rounded border border-zinc-300 px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-50"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+          {deleteNote && (
+            <p className="mt-2 text-xs text-zinc-600">{deleteNote}</p>
+          )}
+        </div>
+      )}
 
       {error && (
         <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">

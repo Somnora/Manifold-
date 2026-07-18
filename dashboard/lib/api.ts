@@ -405,6 +405,12 @@ export const api = {
       (r) => r.filesystems,
     ),
 
+  deleteFilesystem: (name: string, confirmName: string) =>
+    request<{ deleted: string; region: string; bytes_destroyed: number }>(
+      `/filesystems/${encodeURIComponent(name)}?confirm_name=${encodeURIComponent(confirmName)}`,
+      { method: "DELETE" },
+    ),
+
   sshKeys: () =>
     request<{ ssh_keys: string[]; default: string }>("/ssh-keys"),
 

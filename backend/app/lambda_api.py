@@ -107,6 +107,12 @@ class LambdaClient(abc.ABC):
         ...
 
     @abc.abstractmethod
+    async def delete_filesystem(self, fs_id: str) -> None:
+        """Permanently delete a filesystem by id. The API refuses (400,
+        filesystem-in-use) while any instance has it attached."""
+        ...
+
+    @abc.abstractmethod
     async def list_ssh_keys(self) -> list[SSHKeyInfo]: ...
 
     @abc.abstractmethod
@@ -161,6 +167,9 @@ class UnconfiguredLambdaClient(LambdaClient):
         raise self._err()
 
     async def create_filesystem(self, *, name: str, region: str):
+        raise self._err()
+
+    async def delete_filesystem(self, fs_id: str):
         raise self._err()
 
     async def list_ssh_keys(self):
@@ -225,6 +234,9 @@ class SwappableLambdaClient(LambdaClient):
 
     async def create_filesystem(self, *, name: str, region: str):
         return await self._inner.create_filesystem(name=name, region=region)
+
+    async def delete_filesystem(self, fs_id: str):
+        return await self._inner.delete_filesystem(fs_id)
 
     async def list_ssh_keys(self):
         return await self._inner.list_ssh_keys()
@@ -335,6 +347,10 @@ class RealLambdaClient(LambdaClient):
             is_in_use=bool(data.get("is_in_use", False)),
             bytes_used=data.get("bytes_used", 0),
         )
+
+    async def delete_filesystem(self, fs_id: str) -> None:
+        # Same route-naming quirk as create: /filesystems, not /file-systems.
+        await self._request("DELETE", f"/filesystems/{fs_id}")
 
     async def list_ssh_keys(self) -> list[SSHKeyInfo]:
         data = await self._request("GET", "/ssh-keys")
@@ -547,6 +563,19 @@ class MockLambdaClient(LambdaClient):
         )
         self.filesystems.append(fs)
         return fs
+
+    async def delete_filesystem(self, fs_id: str) -> None:
+        match = [fs for fs in self.filesystems if fs.id == fs_id]
+        if not match:
+            raise LambdaAPIError(
+                code="global/object-does-not-exist",
+                message=f"No filesystem with id '{fs_id}'", status=404)
+        if match[0].is_in_use:
+            raise LambdaAPIError(
+                code="instance-operations/filesystem/filesystem-in-use",
+                message=f"Filesystem '{match[0].name}' is attached to an "
+                        f"instance and cannot be deleted", status=400)
+        self.filesystems = [fs for fs in self.filesystems if fs.id != fs_id]
 
     async def list_ssh_keys(self) -> list[SSHKeyInfo]:
         return list(self.ssh_keys)
