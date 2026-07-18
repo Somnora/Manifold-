@@ -72,45 +72,89 @@ from .terminal_sessions import TerminalSession, TerminalSessionManager
 logger = logging.getLogger("manifold.main")
 
 
-def _end_shell_group(pid: int) -> None:
+# How each local shell's teardown ended: "sighup" = the group obeyed the
+# hangup (the normal case), "sigkill" = it ignored the hangup past the
+# grace window and was force-killed. A rising sigkill count is the smell
+# of a rogue utility or wedged CLI living inside the terminals.
+TERMINAL_TEARDOWNS = {"sighup": 0, "sigkill": 0}
+
+# Strong references to in-flight reap tasks. asyncio.create_task keeps
+# only a weak reference; without this set a pending reap could be
+# garbage-collected mid-flight - and a vanished reap means zombies and
+# never-fired escalations.
+_REAP_TASKS: set = set()
+
+
+def _end_shell_group(pid: int, *, grace_seconds: float = 5.0,
+                     label: str = "", on_escalation=None):
     """End a local terminal shell and everything it spawned, then reap it.
 
-    pty.fork made the child a session leader, so its pid doubles as a
-    process-group id: killpg catches children the shell left running (a
-    backgrounded watcher, a hung CLI), where a bare kill(pid) let them
-    linger. The reap task waitpid()s the child - without it EVERY exited
-    local shell stayed a zombie until the backend itself exited - and
-    escalates to SIGKILL if the group ignores the hangup.
+    The escalation ladder: SIGHUP to the whole group first (pty.fork made
+    the child a session leader, so its pid doubles as a process-group id -
+    killpg catches children the shell left running, where a bare
+    kill(pid) let them linger), then a non-blocking waitpid(WNOHANG)
+    verification loop for `grace_seconds`, then SIGKILL to the group if
+    the hangup was ignored. The reap waitpid()s the child - without it
+    EVERY exited local shell stayed a zombie until the backend itself
+    exited. Each outcome bumps TERMINAL_TEARDOWNS by which rung ended the
+    shell; `on_escalation` (best-effort) fires just before the SIGKILL so
+    the caller can record pgid + shell context to the audit trail.
 
-    Safe to call on an already-dead shell: signalling errors are ignored
-    and the reap still collects the zombie. POSIX only (the local
-    terminal endpoint already refuses Windows)."""
+    Returns the reap task (production callers ignore it; tests await it
+    for deterministic counter visibility). Safe to call on an
+    already-dead shell: signalling errors are ignored and the reap still
+    collects the zombie. POSIX only (the local terminal endpoint already
+    refuses Windows)."""
     import signal
 
-    try:
-        os.killpg(pid, signal.SIGHUP)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    def signal_group(sig: int) -> None:
+        """killpg, falling back to a direct kill if the group does not
+        exist YET: pty.fork's child calls setsid in the child, so a
+        teardown racing a just-forked shell (tab opened and instantly
+        closed) can beat the setsid - killpg raises ProcessLookupError
+        while the process itself is alive and un-signalled."""
+        try:
+            os.killpg(pid, sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    signal_group(signal.SIGHUP)
 
     async def _reap() -> None:
-        for _ in range(50):                       # ~5s of grace to die
+        for _ in range(max(1, int(grace_seconds / 0.1))):
             try:
                 done, _ = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
+                TERMINAL_TEARDOWNS["sighup"] += 1
                 return                            # already collected
             if done:
+                TERMINAL_TEARDOWNS["sighup"] += 1
                 return
             await asyncio.sleep(0.1)
-        try:
-            os.killpg(pid, signal.SIGKILL)        # it ignored the hangup
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        TERMINAL_TEARDOWNS["sigkill"] += 1
+        logger.warning(
+            "terminal %s (pgid %d) ignored SIGHUP for %.1fs; escalating "
+            "to SIGKILL", label or "shell", pid, grace_seconds)
+        if on_escalation is not None:
+            try:
+                on_escalation()
+            except Exception:
+                pass
+        signal_group(signal.SIGKILL)              # it ignored the hangup
         try:
             os.waitpid(pid, 0)
         except ChildProcessError:
             pass
 
-    asyncio.get_running_loop().create_task(_reap())
+    task = asyncio.get_running_loop().create_task(_reap())
+    _REAP_TASKS.add(task)
+    task.add_done_callback(_REAP_TASKS.discard)
+    return task
 
 
 class LaunchRequest(BaseModel):
@@ -1083,7 +1127,15 @@ def create_app(
                 pass
             # Hangup + reap the whole process group (see _end_shell_group):
             # a closed tab must never leave zombies or orphaned children.
-            _end_shell_group(pid)
+            # An escalation to SIGKILL is worth an audit row: it means
+            # something inside the shell ignored the hangup, and the last
+            # output is the best clue to what that was.
+            _end_shell_group(
+                pid, label=shell,
+                on_escalation=lambda: db.record_audit(
+                    "dashboard", "terminal_sigkill_escalation",
+                    f"{shell} pgid {pid} ignored SIGHUP; last output: "
+                    f"{session.tail_text()!r}"))
 
         def close_pty() -> None:
             teardown_once()
