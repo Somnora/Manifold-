@@ -310,3 +310,17 @@ async def test_get_skill_returns_the_playbook(mcp_wired):
     assert "wait_for_launch" in text          # launch recipe
     assert "vllm-serve" in text               # serve recipe
     assert "terminate_instance" in text       # teardown recipe
+
+
+async def test_unreachable_backend_is_not_reported_as_no_instances(
+        mcp_wired, monkeypatch, tmp_path):
+    """Auto-instance-selection over a dead backend used to answer
+    "connected instances: (none)" - presenting a crashed backend as a
+    healthy account with nothing running. It must say "unreachable"."""
+    flaky = _FlakyClient(mcp_server._client, fail_first=10_000)
+    monkeypatch.setattr(mcp_server, "_client", flaky)
+    result = await mcp_server.download_file(
+        "outputs/x.bin", str(tmp_path / "x.bin"), note="backend down")
+    assert result.get("unreachable") is True
+    assert "unreachable" in result["error"]
+    assert "(none)" not in result["error"]

@@ -708,11 +708,32 @@ export const api = {
     const form = new FormData();
     form.append("file", file);
     form.append("dest", dest);
-    // No content-type header: the browser sets the multipart boundary.
-    const resp = await fetch(
-      `${API_BASE}/instances/${instanceId}/files/upload`,
-      { method: "POST", body: form },
-    );
+    // Hand-rolled fetch (multipart cannot ride request()'s JSON headers),
+    // so it needs the same two guarantees request() gives everything else:
+    // a dead backend surfaces as a typed ApiError instead of a raw
+    // TypeError, and a stalled transfer cannot hang forever. The budget is
+    // generous - it covers the whole upload, not a round-trip.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 120_000);
+    let resp: Response;
+    try {
+      resp = await fetch(`${API_BASE}/instances/${instanceId}/files/upload`, {
+        method: "POST",
+        body: form,
+        signal: ctrl.signal,
+      });
+    } catch {
+      if (ctrl.signal.aborted) {
+        throw new ApiError(
+          0,
+          "Upload made no progress for 120s; the instance or its " +
+            "connection is likely stalled.",
+        );
+      }
+      throw new ApiError(0, "Backend unreachable. Is it running on :8000?");
+    } finally {
+      clearTimeout(timer);
+    }
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       throw new ApiError(resp.status, body.detail ?? `HTTP ${resp.status}`);

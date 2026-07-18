@@ -13,6 +13,7 @@ Run modes:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import os
 import shlex
@@ -971,13 +972,22 @@ def create_app(
         proxy_base = f"http://127.0.0.1:{proxy_port}/v1"
         pid, fd = pty.fork()
         if pid == 0:                       # child: become the user's shell
-            if model:
-                os.environ["OPENAI_BASE_URL"] = proxy_base
-                os.environ["OPENAI_API_BASE"] = proxy_base   # older SDKs
-                os.environ["OPENAI_API_KEY"] = (
-                    settings.proxy_api_key or "manifold")
-                os.environ["MANIFOLD_MODEL"] = model
-            os.execvp(shell, [shell, "-l"])
+            # The child must NEVER return into this code: if exec fails (a
+            # bad $SHELL, permissions), falling through would run a second
+            # FastAPI process against the parent's inherited fds and
+            # database handles. _exit skips all of that - no unwinding, no
+            # atexit, no shared-state teardown.
+            try:
+                if model:
+                    os.environ["OPENAI_BASE_URL"] = proxy_base
+                    os.environ["OPENAI_API_BASE"] = proxy_base  # older SDKs
+                    os.environ["OPENAI_API_KEY"] = (
+                        settings.proxy_api_key or "manifold")
+                    os.environ["MANIFOLD_MODEL"] = model
+                os.execvp(shell, [shell, "-l"])
+            except BaseException:
+                pass
+            os._exit(127)
 
         loop = asyncio.get_event_loop()
         # Bounded so a firehose can't grow unboundedly here: when it fills, we
@@ -1026,6 +1036,13 @@ def create_app(
             close=close_pty,
         )
 
+        # A 4096-byte pty read can split a multi-byte UTF-8 sequence (a TUI's
+        # box glyphs, spinners, emoji); decoding each chunk in isolation
+        # turned the split halves into U+FFFD garbage on screen. The
+        # incremental decoder holds the partial sequence until its tail
+        # arrives in the next chunk.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
         async def pump_output():
             nonlocal reader_paused
             while True:
@@ -1038,7 +1055,12 @@ def create_app(
                     loop.add_reader(fd, on_readable)
                 if data is None:
                     break
-                await session.feed(data.decode(errors="replace"))
+                text = decoder.decode(data)
+                if text:
+                    await session.feed(text)
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                await session.feed(tail)
             await session.mark_exited()
 
         session.pump_task = asyncio.create_task(pump_output())
@@ -2056,7 +2078,10 @@ def create_app(
         autopilot runs accomplished. The same record any agent can read
         from the worklog file (or its mirror); this serves it over HTTP so
         the get_work_log MCP tool works from any machine."""
-        return {"entries": worklog.tail(limit), "path": worklog.path}
+        # Off-loop: the file grows for the life of the install, and a slow
+        # read must not stall every other request while it runs.
+        entries = await asyncio.to_thread(worklog.tail, limit)
+        return {"entries": entries, "path": worklog.path}
 
     # -- launches (retry status + cost history) ------------------------------------
 

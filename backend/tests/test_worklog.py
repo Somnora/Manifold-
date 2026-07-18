@@ -51,6 +51,16 @@ def test_tail_of_missing_file_is_empty(tmp_path):
     assert Worklog(tmp_path / "nope.md").tail() == []
 
 
+def test_tail_never_doubles_the_first_entry_mark(tmp_path):
+    # A file that starts at "## " directly (hand-trimmed, or a mirror that
+    # had content before Manifold's first write) kept its own mark through
+    # the split, and the normalizer prepended another: "## ## ...".
+    path = tmp_path / "worklog.md"
+    path.write_text("## 2026-07-18 01:00 UTC - job done\n- line\n")
+    entries = Worklog(path).tail()
+    assert entries == ["## 2026-07-18 01:00 UTC - job done\n- line"]
+
+
 # -- funnel integration: a settled job writes an entry ---------------------------
 
 

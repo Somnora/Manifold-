@@ -62,11 +62,13 @@ def _http() -> httpx.AsyncClient:
 
 async def _audit(tool: str, args: dict, note: str, result: str) -> None:
     """Best-effort audit post; an unreachable backend already failed the
-    real call, so audit failures must not mask the original error."""
+    real call, so audit failures must not mask the original error. Its own
+    timeout is short: a wedged backend must not stack a second 60s wait on
+    top of the failed call's (the MCP client kills the request at ~60s)."""
     try:
         await _http().post("/audit/agent", json={
             "tool": tool, "args": args, "note": note, "result": result[:500],
-        })
+        }, timeout=5.0)
     except httpx.HTTPError:
         pass
 
@@ -514,6 +516,11 @@ async def _pick_instance(instance_id: str | None, tool: str, note: str,
     if instance_id:
         return instance_id
     listing = await _call(tool, "GET", "/instances", note="", args={})
+    if listing.get("error"):
+        # An unreachable backend must surface as exactly that - reporting
+        # "connected instances: (none)" here would present a dead backend
+        # as a healthy account with nothing running.
+        return listing
     connected = [i["id"] for i in listing.get("instances", [])
                  if i.get("connection_state") == "connected"]
     if len(connected) != 1:
@@ -548,7 +555,13 @@ async def upload_file(local_path: str, remote_path: str = "inbox/",
                 files={"file": (os.path.basename(local_path), fh)},
                 data={"dest": remote_path},
             )
-        payload = resp.json()
+        # Same guard as _call: a 500 that escaped the route is a plain-text
+        # page, and .json() on it would raise instead of reporting the status.
+        try:
+            payload = resp.json() if resp.content else {}
+        except ValueError:
+            payload = {"detail": (resp.text or "").strip()[:300]
+                       or f"HTTP {resp.status_code} (non-JSON response)"}
     except httpx.HTTPError as exc:
         result = {"error": f"upload failed: {exc}"}
         await _audit("upload_file", args, note, result["error"])

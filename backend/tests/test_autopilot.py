@@ -280,6 +280,11 @@ def test_cancel_mid_run(tmp_path, mock_client, mock_storage, mock_sidecar):
         assert resp.status_code == 200
         run = wait_run(client, run_id, timeout=5.0)
         assert run["status"] == "cancelled"
+        # Cancelled runs land in the worklog too: the outcomes the next
+        # agent session most needs to know about are the ones that did NOT
+        # finish cleanly.
+        entries = client.get("/worklog").json()["entries"]
+        assert any("autopilot run cancelled" in e for e in entries)
 
 
 def test_run_requires_a_served_brain(client):

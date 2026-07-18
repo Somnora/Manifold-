@@ -177,16 +177,27 @@ class TerminalSession:
                 await old.close()
             except Exception:
                 pass
-        if self._scrollback:
-            await ws.send_text("".join(self._scrollback))
+        # Snapshot the scrollback and adopt the socket BEFORE the (awaited)
+        # replay send. While that send is in flight the pump may feed() new
+        # output; with `_ws` already set it goes to this socket, and frame
+        # order is preserved because the replay frame was submitted first.
+        # (Binding after the send lost exactly those chunks: recorded in
+        # scrollback but never delivered to the new viewer.)
+        replay = "".join(self._scrollback)
         self._ws = ws
         self.detached_at = None
-        # Fresh viewer: reset flow accounting (the scrollback replay above is
-        # a one-shot bulk render, not something to pace or wait on). Its
+        # Fresh viewer: reset flow accounting (the scrollback replay is a
+        # one-shot bulk render, not something to pace or wait on). Its
         # protocol support is unknown again until it acks.
         self._outstanding = 0
         self._acks_seen = 0
         self._writable.set()
+        if replay:
+            try:
+                await ws.send_text(replay)
+            except Exception:
+                # The browser vanished mid-attach (refresh); keep the shell.
+                self.detach(ws)
 
     def detach(self, ws=None) -> None:
         """Let go of the terminal but keep the shell running. `ws` guards a

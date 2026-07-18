@@ -190,10 +190,15 @@ class Autopilot:
         if client_fn is None:
             instance_id = brain_ref.partition(":")[2] or brain_ref
             client_fn = lambda: self.orchestrator.model_client_for(instance_id)  # noqa: E731
-        self.tasks[run_id] = asyncio.create_task(
+        task = asyncio.create_task(
             self._run_loop(run_id, goal, client_fn, brain_model,
                            brain_port, max_steps, gated)
         )
+        self.tasks[run_id] = task
+        # Settled runs drop out of the registry; without this, a long-lived
+        # backend accumulates every finished task object forever and stop()
+        # re-cancels hundreds of already-done runs.
+        task.add_done_callback(lambda _t: self.tasks.pop(run_id, None))
         return run_id
 
     def cancel_run(self, run_id: str) -> bool:
@@ -204,9 +209,11 @@ class Autopilot:
         return True
 
     async def stop(self) -> None:
-        for task in self.tasks.values():
+        # Snapshot: done-callbacks pop entries from the dict as tasks settle.
+        tasks = list(self.tasks.values())
+        for task in tasks:
             task.cancel()
-        for task in self.tasks.values():
+        for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
@@ -312,6 +319,7 @@ class Autopilot:
                 error="cancelled by user",
             )
             self.db.record_audit("autopilot", "run_cancelled", run_id)
+            self._worklog_run(run_id, "cancelled", error="cancelled by user")
             raise
         except Exception as exc:   # never leave a run stuck 'running'
             logger.exception("autopilot run %s crashed", run_id)
@@ -319,6 +327,8 @@ class Autopilot:
                 run_id, status="failed", finished_at=utcnow(),
                 error=f"internal error: {exc}",
             )
+            self._worklog_run(run_id, "failed",
+                              error=f"internal error: {exc}")
 
     @staticmethod
     def _trim(messages: list[dict]) -> list[dict]:
@@ -356,19 +366,31 @@ class Autopilot:
             (summary or error or f"{steps} step(s)")[:200],
             ref=run_id,
         )
-        if self.worklog is not None:
-            try:
-                run = self.db.get_agent_run(run_id) or {}
-                lines = [f"run {run_id}, {steps} step(s)"]
-                if run.get("goal"):
-                    lines.append(f"goal: {run['goal'][:300]}")
-                if summary:
-                    lines.append(f"summary: {summary[:500]}")
-                if error:
-                    lines.append(f"error: {error[:300]}")
-                self.worklog.record(f"autopilot run {status}", lines)
-            except Exception:
-                logger.exception("worklog entry for run %s failed", run_id)
+        self._worklog_run(run_id, status, steps=steps, summary=summary,
+                          error=error)
+
+    def _worklog_run(self, run_id: str, status: str, *,
+                     steps: int | None = None, summary: str = "",
+                     error: str = "") -> None:
+        """One worklog entry per settled run - including cancelled and
+        crashed ones, which are exactly the outcomes the next agent session
+        most needs to know about."""
+        if self.worklog is None:
+            return
+        try:
+            run = self.db.get_agent_run(run_id) or {}
+            if steps is None:
+                steps = run.get("steps_taken") or 0
+            lines = [f"run {run_id}, {steps} step(s)"]
+            if run.get("goal"):
+                lines.append(f"goal: {run['goal'][:300]}")
+            if summary:
+                lines.append(f"summary: {summary[:500]}")
+            if error:
+                lines.append(f"error: {error[:300]}")
+            self.worklog.record(f"autopilot run {status}", lines)
+        except Exception:
+            logger.exception("worklog entry for run %s failed", run_id)
 
     def _notify(self, kind: str, title: str, body: str,
                 ref: str | None = None) -> None:

@@ -2905,3 +2905,58 @@ read-only scope) extends coverage to gated repos the account accepted.
 Follows the image-checker injection rule: real lookup only in production
 wiring, so tests never touch the network. estimates.py stays pure - the
 I/O lives in hf_lookup.py and arrives as an optional `exact` argument.
+
+## 2026-07-18 — Phase 63: swarm-audit hardening (worklog, bridge death, terminal)
+
+A concurrent Gemini Flash audit (run-flash-swarm over the google.antigravity
+SDK, workers on Vertex via gcloud ADC) swept the worklog, bridge-recovery,
+and terminal code; every finding was verified against the code before any
+fix, and roughly half were rejected as hallucinated or already-handled
+(startup reconciliation of stale agent runs already existed; the download
+416 "infinite loop" is unreachable; WebSocket text frames cannot split
+UTF-8 client-side; scrollback replay bypassing flow control is a
+documented one-shot design). What was real and is now fixed:
+
+**Connection loss re-adopts instead of failing (dispatcher).** A transient
+SSH drop mid-stream marked the task failed while its container - detached
+under nohup by design - kept running (and billing) unseen. The
+ConnectionError path now hands off to the same exit-file poller a backend
+restart uses, settling the task with the container's real result. The
+re-adopt probe also demands a NON-EMPTY exit file (`[ -s ... ]`): a bare
+`cat` racing the wrapper's `echo $? > file` create-then-write read empty
+output as "container gone" and failed a task that had just finished fine.
+
+**Reconnect survives long outages (connections).** `base * 2**attempt`
+overflowed float after ~1000 retries (an instance offline overnight), and
+the OverflowError - raised inside the retry handler - silently killed the
+supervisor. Exponent clamped; the delay was already capped.
+
+**Terminal reattach no longer drops live output (terminal_sessions).**
+attach() bound the socket only AFTER the awaited scrollback send, so
+output pumped during the replay was recorded but never delivered. The
+socket is bound before the send; frame order is preserved because the
+replay frame is submitted first. Local pty output also flows through an
+incremental UTF-8 decoder (a 4096-byte read can split a multi-byte
+sequence; per-chunk decode rendered the halves as U+FFFD), and the
+pty.fork child _exits(127) if exec fails instead of returning into
+FastAPI with inherited fds.
+
+**Honest state over guessed state (mcp_server, diagnostics).**
+_pick_instance propagates "backend unreachable" instead of reporting
+"connected instances: (none)"; sidecar diagnosis classifies a mid-probe
+connection loss as probe-error (and stops probing the dead channel)
+instead of concluding "sidecar-starting" from partial answers; _audit
+posts carry a 5s timeout so a wedged backend cannot stack a second 60s
+wait past the MCP client's kill window; upload_file gets _call's
+non-JSON-500 guard. Worklog: cancelled and crashed autopilot runs now
+write entries too (the outcomes the next agent most needs), tail() no
+longer doubles the first entry's mark, and the GET /worklog read runs
+off-loop. Worklog writes stay synchronous ON PURPOSE: single-process
+single-writer (the MCP bridge only reads over HTTP), so file locking
+would be theater, and tests assert entries immediately after the funnel.
+
+**Dashboard.** Dock session ids fold in a monotonic counter (two clicks in
+one millisecond minted colliding React keys); setOpen/setSessions updaters
+are pure again (StrictMode runs them twice); uploadFile surfaces a dead
+backend as a typed ApiError with a 120s stall budget instead of a raw
+TypeError.
