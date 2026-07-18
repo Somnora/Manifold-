@@ -3010,3 +3010,33 @@ window was rejected: the refresh-proof dock exists precisely so a frozen
 tab can be reopened at leisure; grace stays the configurable 900s
 (hub.terminal_grace_seconds). Local shell exits stay OUT of the worklog:
 it records units of work, not UI session churn.
+
+## 2026-07-18 — Phase 66: pty master-fd lifecycle (leak fix, idempotent teardown)
+
+**The detached-exit fd leak.** Tracing the master fd from pty.fork
+showed the leak was NOT the attached case (a live WebSocket funnels
+teardown through kill -> close_pty either way) but the detached one: a
+shell that exited after a refresh-and-never-reattach was only reaped
+(phase 65) - its master fd was never closed, and the registry dropped
+the exited session without closing it. One leaked descriptor per such
+shell for the life of the backend. Proven by A/B: the new detached-exit
+test fails on pre-fix code, passes with it.
+
+**One idempotent teardown for both halves.** teardown_once() guards fd
+close AND process-group hangup behind a single flag, because both are
+unsafe to repeat after the kernel recycles the identifier: a closed fd
+number may be an unrelated descriptor, a reaped pid may lead an
+unrelated process group. The second hazard was found by an independent
+zero-trust audit pass (fresh-context subagent), which failed its
+sign-off on exactly the killpg half after passing the fd half - the
+double-teardown call ordering (pump EOF, then the WS funnel's kill) is
+real and routine, only the recycle window is narrow. Audit areas that
+came back clean: no bare os.close paths, no add_reader on a closed fd
+(kill cancels the pump before closing), no parent-held slave fd, no
+registry pop that outruns closure.
+
+**Measurement note.** The fd-churn tests count /dev/fd synchronously; an
+asyncio.run inside the measurement window opens its own kqueue +
+socketpair and reads as a phantom 3-fd leak. (The prompt's target file
+"backpressure_pty_wrapper.py" does not exist; the audited subsystem
+lives in main.py local_terminal + terminal_sessions.py.)
