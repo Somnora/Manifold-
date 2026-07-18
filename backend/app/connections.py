@@ -128,8 +128,13 @@ class HostKeyStore:
 
 
 def backoff_delay(attempt: int, base: float, cap: float) -> float:
-    """Exponential backoff: base * 2^attempt, capped. attempt is 0-indexed."""
-    return min(base * (2 ** attempt), cap)
+    """Exponential backoff: base * 2^attempt, capped. attempt is 0-indexed.
+
+    The exponent is clamped: after ~1000 retries (an instance offline
+    overnight and beyond) `base * 2**attempt` overflows float, and that
+    OverflowError - raised inside the supervisor's retry handler - killed
+    the supervisor task, so the connection never retried again."""
+    return min(base * (2 ** min(attempt, 62)), cap)
 
 
 class ManagedConnection:
@@ -376,7 +381,10 @@ class _MockStream:
 
     async def read(self, n: int = -1) -> str:
         if self._buffer:
-            data, self._buffer = self._buffer[:n], self._buffer[n:]
+            if n < 0:      # read-all: slicing [:n] would drop the last char
+                data, self._buffer = self._buffer, ""
+            else:
+                data, self._buffer = self._buffer[:n], self._buffer[n:]
             return data
         if self._eof:
             return ""

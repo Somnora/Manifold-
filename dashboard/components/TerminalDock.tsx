@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import { createPortal } from "react-dom";
@@ -169,18 +170,24 @@ export function TerminalDockProvider({
     }
   }, [hydrated, sessions, active, open, position, arrangement, height, width]);
 
+  // Monotonic per-mount counter folded into generated session ids: two
+  // clicks inside the same millisecond used to mint the same Date.now() id,
+  // and duplicate ids as React keys break the tab list outright.
+  const idSeq = useRef(0);
+
   const toggleLocal = useCallback(() => {
     setSessions((s) => (s.some((x) => x.id === "local") ? s : [LOCAL, ...s]));
-    setOpen((o) => {
-      // If the dock is open but local is buried behind another tab, the
+    // Branch on the rendered snapshot, not inside the setOpen updater:
+    // updaters must stay pure (StrictMode runs them twice), so the
+    // setActive side effect lives out here.
+    if (open && active !== "local" && arrangement === "tabs") {
+      // The dock is open but local is buried behind another tab: the
       // button surfaces it instead of closing the dock.
-      if (o && active !== "local" && arrangement === "tabs") {
-        setActive("local");
-        return true;
-      }
-      return !o;
-    });
-    if (!open) setActive("local");
+      setActive("local");
+    } else {
+      setOpen(!open);
+      if (!open) setActive("local");
+    }
   }, [open, active, arrangement]);
 
   const dockInstance = useCallback((instanceId: string, name: string) => {
@@ -204,11 +211,20 @@ export function TerminalDockProvider({
 
   const addLocal = useCallback(() => {
     const n = sessions.filter((x) => x.kind === "local").length + 1;
-    const id = n === 1 ? "local" : `local-${Date.now()}`;
-    setSessions((s) => [
-      ...s,
-      { ...LOCAL, id, label: n === 1 ? LOCAL.label : `${LOCAL.label} ${n}` },
-    ]);
+    const id =
+      n === 1 ? "local" : `local-${Date.now()}-${++idSeq.current}`;
+    setSessions((s) =>
+      s.some((x) => x.id === id)
+        ? s
+        : [
+            ...s,
+            {
+              ...LOCAL,
+              id,
+              label: n === 1 ? LOCAL.label : `${LOCAL.label} ${n}`,
+            },
+          ],
+    );
     setActive(id);
     setOpen(true);
   }, [sessions]);
@@ -217,7 +233,7 @@ export function TerminalDockProvider({
   // WebSocket, a fresh pty) and a numbered label.
   const duplicate = useCallback(
     (s: Session) => {
-      const id = `${s.id}~${Date.now()}`;
+      const id = `${s.id}~${Date.now()}-${++idSeq.current}`;
       const base = s.label.replace(/ \d+$/, "");
       const n =
         sessions.filter(
@@ -265,14 +281,15 @@ export function TerminalDockProvider({
 
   const closeSession = useCallback(
     (id: string) => {
-      setSessions((s) => {
-        const next = s.filter((x) => x.id !== id);
-        if (next.length === 0) setOpen(false);
-        else if (active === id) setActive(next[next.length - 1].id);
-        return next;
-      });
+      // The filter runs functionally (correct under rapid closes); the
+      // focus/open corrections use the rendered snapshot so the updater
+      // itself stays pure (StrictMode runs updaters twice).
+      setSessions((s) => s.filter((x) => x.id !== id));
+      const next = sessions.filter((x) => x.id !== id);
+      if (next.length === 0) setOpen(false);
+      else if (active === id) setActive(next[next.length - 1].id);
     },
-    [active],
+    [sessions, active],
   );
 
   // Reserve the dock's footprint at the matching page edge (see above).

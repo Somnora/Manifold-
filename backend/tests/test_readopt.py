@@ -99,3 +99,64 @@ async def test_readopt_ignores_finished_tasks(rig):
     queue.mark_finished(task_id, exit_code=0, output_paths=[])
     await d._readopt_running_tasks()   # no running tasks: returns instantly
     assert queue.get(task_id)["status"] == "succeeded"
+
+
+class RecordingConn(ScriptedConn):
+    def __init__(self, script):
+        super().__init__(script)
+        self.commands = []
+
+    async def run(self, command, **kwargs):
+        self.commands.append(command)
+        return await super().run(command, **kwargs)
+
+
+async def test_readopt_probe_requires_a_nonempty_exit_file(rig):
+    """The wrapper's `echo $? > file` creates-then-writes; a bare `cat`
+    racing that write succeeded with EMPTY output, which read as "gone"
+    and failed a task whose container had just finished fine. The probe
+    must demand a non-empty file (falling through to docker inspect)."""
+    d, orch, queue, db = rig
+    task_id = plant_running_task(queue, db)
+    conn = RecordingConn([(0, "0\n", "")])
+    orch.connections["i-test"] = conn
+    await d._readopt_running_tasks()
+    assert queue.get(task_id)["status"] == "succeeded"
+    assert "[ -s " in conn.commands[0]
+
+
+async def test_connection_loss_hands_off_to_the_exit_file_poller(
+        rig, monkeypatch):
+    """A transient SSH drop mid-stream must NOT fail the task: the container
+    survives the session by design (nohup + exit file), so the dispatcher
+    re-adopts it exactly like a backend restart and settles it with the
+    container's real result."""
+    from pathlib import Path
+
+    from app.templates import load_templates
+
+    d, orch, queue, db = rig
+    d.templates, _ = load_templates(
+        Path(__file__).resolve().parent.parent.parent / "templates")
+    task_id = plant_running_task(queue, db)
+    task = queue.get(task_id)
+    d._gpu_ready.add("i-test")                       # skip the CUDA probe
+
+    async def no_preflight(template):
+        return None
+    monkeypatch.setattr(d, "_image_preflight", no_preflight)
+
+    async def dead_stream(conn, command, tid):
+        raise ConnectionError("session dropped")
+    monkeypatch.setattr(d, "_stream_run", dead_stream)
+
+    # The poller answers immediately with the container's persisted exit 0.
+    conn = RecordingConn([(0, "0\n", "")])
+    orch.connections["i-test"] = conn
+    await d._run_task(task, "i-test", conn)
+
+    settled = queue.get(task_id)
+    assert settled["status"] == "succeeded"          # NOT "failed"
+    assert settled["exit_code"] == 0
+    log = " ".join(r["line"] for r in queue.get_logs(task_id))
+    assert "connection lost; reattached" in log

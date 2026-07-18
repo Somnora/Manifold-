@@ -74,10 +74,31 @@ def test_probe_failure_never_sinks_the_report():
             raise ConnectionError("ssh dropped mid-probe")
         return (0, "status: done", "")
     d = asyncio.run(diagnose_sidecar(run))
-    # Still returns a structured report; the failed probe is captured inline.
-    assert d["cause"] == "unknown"
+    # Still returns a structured report; the failed probe is captured inline
+    # and the classification says the channel died - it must not guess a
+    # sidecar state from the partial answers (a dead SSH session used to
+    # read as "sidecar-starting").
+    assert d["cause"] == "probe-error"
+    assert "unknown" in d["summary"]
     svc = next(c for c in d["checks"] if "service" in c["label"])
     assert "probe failed" in svc["output"]
+
+
+def test_probe_loss_stops_probing_the_dead_channel():
+    calls = []
+
+    async def run(cmd):
+        calls.append(cmd)
+        raise ConnectionError("Connection reset")
+
+    d = asyncio.run(diagnose_sidecar(run))
+    assert d["cause"] == "probe-error"
+    # One failure aborts the sweep: each further probe would only burn its
+    # own timeout against a channel we already know is dead.
+    assert len(calls) == 1
+    outputs = [c["output"] for c in d["checks"]]
+    assert sum("probe skipped" in o for o in outputs) == 3
+    assert len(d["checks"]) == 4                 # shape preserved for the UI
 
 
 def test_diagnose_route_is_wired(client):

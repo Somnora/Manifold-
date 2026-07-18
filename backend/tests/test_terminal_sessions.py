@@ -61,6 +61,30 @@ async def test_attach_replays_scrollback():
     assert ws.sent[-1] == "live"
 
 
+async def test_attach_does_not_drop_output_fed_during_replay():
+    """Output arriving WHILE the scrollback replay is in flight must reach
+    the new viewer. Binding the socket only after the (awaited) replay send
+    lost exactly those chunks: recorded in scrollback, never delivered."""
+    session, _ = make_session()
+    await session.feed("history")
+    gate = asyncio.Event()
+
+    class SlowWS(FakeWS):
+        async def send_text(self, text):
+            await super().send_text(text)
+            if text == "history":
+                await gate.wait()          # the replay send parks here
+
+    ws = SlowWS()
+    attach_task = asyncio.create_task(session.attach(ws))
+    while not ws.sent:                     # replay send submitted, parked
+        await asyncio.sleep(0)
+    await session.feed("live during replay")
+    gate.set()
+    await attach_task
+    assert ws.sent == ["history", "live during replay"]
+
+
 async def test_scrollback_is_bounded():
     session, _ = make_session()
     chunk = "x" * 10_000

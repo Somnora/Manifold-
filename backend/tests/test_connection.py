@@ -43,6 +43,21 @@ def test_backoff_is_exponential_and_capped():
     assert backoff_delay(10, 5, 120) == 120
 
 
+def test_backoff_survives_an_overnight_outage():
+    # ~1000 retries in, base * 2**attempt overflowed float and the
+    # OverflowError - raised inside the supervisor's retry handler -
+    # killed the supervisor, so the connection never retried again.
+    assert backoff_delay(5000, 1.0, 60.0) == 60.0
+
+
+async def test_mock_stream_read_all_does_not_drop_the_last_char():
+    from app.connections import _MockStream
+    stream = _MockStream()
+    stream._feed("abc")
+    assert await stream.read(2) == "ab"      # leaves "c" buffered
+    assert await stream.read() == "c"        # read-all sliced [:-1] before
+
+
 async def test_connect_retries_with_exponential_backoff():
     """First two dials fail; backoff delays follow base * 2^n."""
     dials = 0

@@ -37,13 +37,39 @@ async def diagnose_sidecar(run, *, port: int = SIDECAR_PORT) -> dict:
     Returns {cause, summary, port, checks:[{label, command, output}]}.
     """
     results: dict[str, dict] = {}
-    for key, label, cmd in _checks(port):
+    probe_lost = False
+    checks = _checks(port)
+    for i, (key, label, cmd) in enumerate(checks):
         try:
             _exit, out, err = await run(cmd)
             output = (out or "").strip() or (err or "").strip()
         except Exception as exc:   # a probe failing must not sink the report
-            output = f"probe failed: {exc}"
+            # The SSH channel itself just failed. Don't keep probing over a
+            # dead channel (each attempt would burn its own timeout), and
+            # don't let the partial answers below masquerade as a diagnosis.
+            probe_lost = True
+            results[key] = {"label": label, "command": cmd,
+                            "output": f"probe failed: {exc}"}
+            for skipped_key, skipped_label, skipped_cmd in checks[i + 1:]:
+                results[skipped_key] = {
+                    "label": skipped_label, "command": skipped_cmd,
+                    "output": "probe skipped: connection lost mid-diagnosis",
+                }
+            break
         results[key] = {"label": label, "command": cmd, "output": output}
+
+    if probe_lost:
+        return {
+            "cause": "probe-error",
+            "summary": (
+                "The SSH connection failed while probing the instance, so "
+                "the sidecar state is unknown (not necessarily broken). "
+                "Wait for the connection to recover and retry."
+            ),
+            "port": port,
+            "checks": [results[k] for k in
+                       ("cloud_init", "service", "listening", "logs")],
+        }
 
     cloud = results["cloud_init"]["output"].lower()
     service = results["service"]["output"].strip()

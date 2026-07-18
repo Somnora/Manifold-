@@ -663,21 +663,22 @@ class Dispatcher:
             return
         await asyncio.gather(*(self._readopt_one(t) for t in running))
 
-    async def _readopt_one(self, task: dict) -> None:
+    async def _readopt_one(self, task: dict, *,
+                           reason: str = "backend restarted") -> None:
         task_id = task["id"]
         instance_id = task.get("instance_id") or ""
         launch = self.db.find_launch_by_instance(instance_id)
         filesystem = (launch or {}).get("filesystem")
         if not filesystem:
             self._finish_task(task_id, exit_code=-1, output_paths=[],
-                              error="backend restarted; instance or its "
+                              error=f"{reason}; instance or its "
                                     "filesystem is gone")
             return
         remote_log = f"/lambda/nfs/{filesystem}/task-logs/{task_id}.log"
         exit_file = f"/lambda/nfs/{filesystem}/task-logs/{task_id}.exit"
         self.queue.append_log(
             task_id,
-            f"[manifold] backend restarted; reattached (live lines during "
+            f"[manifold] {reason}; reattached (live lines during "
             f"the gap are in {remote_log})")
         self.db.record_audit("backend", "task_readopt",
                              f"{task_id} on {instance_id}")
@@ -699,7 +700,12 @@ class Dispatcher:
                 await asyncio.sleep(5.0)
                 continue
             try:
+                # -s: the exit file must exist AND be non-empty. The wrapper's
+                # `echo $? > file` creates-then-writes, so a bare `cat` racing
+                # that write succeeds with empty output - which read as "gone"
+                # and failed a task whose container had just finished fine.
                 code, out, _ = await conn.run(
+                    f"[ -s {shlex.quote(exit_file)} ] && "
                     f"cat {shlex.quote(exit_file)} 2>/dev/null || "
                     f"docker inspect -f '{{{{.State.Status}}}}' "
                     f"manifold-task-{task_id} 2>/dev/null || echo gone")
@@ -723,7 +729,7 @@ class Dispatcher:
                 # before the exit file existed (task predates this fix).
                 self._finish_task(
                     task_id, exit_code=-1, output_paths=outputs,
-                    error=f"backend restarted mid-task and the container is "
+                    error=f"{reason} mid-task and the container is "
                           f"gone; result unknown, output log at {remote_log}")
                 return
             if state == "exited":
@@ -836,12 +842,16 @@ class Dispatcher:
                     conn, wrapped, task_id
                 )
             except ConnectionError as exc:
+                # The streaming session died, but the container survives it
+                # by design (nohup + log file + exit file, see
+                # wrap_remote_command). Failing the task here orphaned a
+                # container that was still running - and still billing - so
+                # instead hand off to the same exit-file poller a backend
+                # restart uses: it waits out the reconnect and settles the
+                # task with the container's real result.
                 self.queue.append_log(task_id,
                                       f"[manifold] connection lost: {exc}")
-                self._finish_task(
-                    task_id, exit_code=-1, output_paths=[],
-                    error=f"SSH connection lost during task: {exc}",
-                )
+                await self._readopt_one(task, reason="connection lost")
                 return
             finally:
                 self.touch_activity(instance_id)

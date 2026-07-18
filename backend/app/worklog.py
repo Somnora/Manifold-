@@ -63,14 +63,14 @@ class Worklog:
             text = self._primary.read_text(encoding="utf-8")
         except FileNotFoundError:
             return []
+        # The first split piece may keep its own mark (a file that starts
+        # at "## " with no leading newline, e.g. hand-trimmed); strip it
+        # before re-adding so no entry ever gets a doubled "## ## " header.
         entries = [
-            (ENTRY_MARK + chunk).strip()
+            (ENTRY_MARK + chunk.removeprefix(ENTRY_MARK)).strip()
             for chunk in text.split("\n" + ENTRY_MARK)
             if chunk.strip()
         ]
-        # The first split piece may keep its own mark; normalize.
-        entries = [e if e.startswith(ENTRY_MARK) else ENTRY_MARK + e
-                   for e in entries]
         return entries[-limit:]
 
     @property
