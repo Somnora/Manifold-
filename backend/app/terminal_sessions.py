@@ -212,6 +212,11 @@ class TerminalSession:
 
     # -- input path (called by the WS handler) ---------------------------------
 
+    def tail_text(self, chars: int = 120) -> str:
+        """The last `chars` of recorded output - the closest thing to
+        "what was it doing" when a teardown has to escalate."""
+        return "".join(self._scrollback)[-chars:]
+
     def write_input(self, data: str) -> None:
         self._write_input(data)
 

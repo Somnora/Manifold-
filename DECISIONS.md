@@ -3040,3 +3040,36 @@ asyncio.run inside the measurement window opens its own kqueue +
 socketpair and reads as a phantom 3-fd leak. (The prompt's target file
 "backpressure_pty_wrapper.py" does not exist; the audited subsystem
 lives in main.py local_terminal + terminal_sessions.py.)
+
+## 2026-07-18 — Phase 67: teardown escalation telemetry (and two real bugs it flushed out)
+
+**Telemetry, not Prometheus.** The escalation ladder itself (HUP -> ~5s
+async waitpid verification -> SIGKILL) already existed from phase 65;
+what was missing was knowing which rung ended each shell. Manifold has
+no metrics stack and its observability IS the audit trail plus logs, so:
+TERMINAL_TEARDOWNS counts sighup vs sigkill teardowns, an escalation
+logs a warning and fires an on_escalation hook that writes an audit row
+with the pgid and the session's last output (TerminalSession.tail_text)
+- the best clue to what ignored the hangup. Grace is now a parameter so
+the uncooperative case is testable in 0.5s instead of 5s. SIGHUP kept
+over the requested SIGTERM: it is the idiomatic "your terminal went
+away" signal for a shell group.
+
+**Bug 1, found writing the tests: reap tasks could vanish.** create_task
+keeps only a weak reference; the phase-65/66 reap tasks were unreferenced
+and could be garbage-collected mid-flight - a vanished reap means
+zombies return and escalations never fire. _REAP_TASKS now holds strong
+refs (discarded on completion), and _end_shell_group returns the task so
+tests await it deterministically.
+
+**Bug 2, a fork race with setsid.** pty.fork's child calls setsid
+child-side, so a teardown racing a just-forked shell (a tab opened and
+instantly closed) could killpg BEFORE the group existed:
+ProcessLookupError, swallowed, shell never signalled - it then lived to
+the SIGKILL escalation. signal_group() now falls back to a direct
+kill(pid) when the group is missing but the process is alive. Surfaced
+as ~25% test flakiness whose +5s runtime signature (full grace loop)
+pointed at undelivered SIGHUP; the test spawner also waits for the
+child's pgid to equal its pid before tearing down, and keeps master fds
+open for the child's lifetime like production does (closing them early
+put children in racy orphaned-tty states).

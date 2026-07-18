@@ -30,6 +30,27 @@ def proc_state(pid: int) -> str:
     return out
 
 
+# Master fds stay OPEN for the child's lifetime, like production does
+# (teardown_once closes them last). Closing the master immediately put
+# the child in racy orphaned-tty states - the kernel's own hangup could
+# race ours, and SIGHUP delivery became nondeterministic (observed as
+# `sleep 60` surviving the hangup into the SIGKILL escalation). Closed
+# in bulk when the module ends; within-test fd-delta measurements are
+# unaffected because these are a constant offset.
+_OPEN_MASTERS: list[int] = []
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _close_masters_after_module():
+    yield
+    for fd in _OPEN_MASTERS:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _OPEN_MASTERS.clear()
+
+
 def spawn_pty(argv: list[str]) -> int:
     pid, fd = pty.fork()
     if pid == 0:                        # child: never return into pytest
@@ -38,7 +59,18 @@ def spawn_pty(argv: list[str]) -> int:
         except BaseException:
             pass
         os._exit(127)
-    os.close(fd)
+    _OPEN_MASTERS.append(fd)
+    # Wait for the child's setsid to land (pty.fork does it child-side):
+    # signalling the "group" before it exists is exactly the race the
+    # production fallback covers, but tests want determinism.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            if os.getpgid(pid) == pid:
+                break
+        except ProcessLookupError:
+            break                       # already exited (e.g. `true`)
+        time.sleep(0.01)
     return pid
 
 
@@ -187,3 +219,41 @@ def test_shell_exiting_while_detached_still_closes_the_master_fd(
 
     lowest = _settles_at(base, timeout=10.0)
     assert lowest <= base, "master fd leaked when the shell exited detached"
+
+
+# -- escalation ladder telemetry --------------------------------------------------
+
+
+async def test_cooperative_teardown_counts_as_sighup():
+    # Await the returned reap task: the increment lands inside it, and
+    # the counters are shared diagnostics (assert growth, not equality -
+    # other shells' reaps can land concurrently in a full-suite run).
+    from app.main import TERMINAL_TEARDOWNS
+    pid = spawn_pty(["sleep", "60"])
+    before = dict(TERMINAL_TEARDOWNS)
+    await _end_shell_group(pid)
+    assert await wait_gone(pid)
+    assert TERMINAL_TEARDOWNS["sighup"] >= before["sighup"] + 1
+    assert TERMINAL_TEARDOWNS["sigkill"] == before["sigkill"]
+
+
+async def test_uncooperative_group_is_sigkilled_and_counted():
+    """A group that ignores the hangup must be force-killed once the
+    grace window expires, counted under sigkill, and reported through
+    on_escalation (the audit hook) before the kill lands."""
+    from app.main import TERMINAL_TEARDOWNS
+    pid = spawn_pty([
+        sys.executable, "-c",
+        "import signal, time; "
+        "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(120)",
+    ])
+    await asyncio.sleep(1.0)              # let it install its handlers
+    before = dict(TERMINAL_TEARDOWNS)
+    escalations = []
+    await _end_shell_group(pid, grace_seconds=0.5, label="stubborn",
+                           on_escalation=lambda: escalations.append(pid))
+    assert await wait_gone(pid), "SIGKILL escalation did not clear the group"
+    assert TERMINAL_TEARDOWNS["sigkill"] >= before["sigkill"] + 1
+    assert escalations == [pid]
