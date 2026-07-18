@@ -2880,3 +2880,28 @@ is persistence across runs; the goal field already covers one-off
 context. Note: agents driving Manifold through MCP (Claude, Codex in a
 repo) already have their own project context and do not use this - the
 brief is for the standalone Autopilot case.
+
+## 2026-07-18 — Filesystem deletion in-app + exact model-fit via HF
+
+**Filesystem deletion, behind a type-the-name guard.** The Storage page
+could create filebases but not remove them (orphans bill by GB-month
+forever, console-only cleanup). DELETE /filesystems/{name} follows the
+termination philosophy adapted to storage: refuse while attached (409),
+and refuse (428) until confirm_name repeats the exact name - the
+response states the GiB and region that would be destroyed. Deliberately
+NO force flag and NO MCP tool: an instance has a rescue path, a
+filesystem does not, so the only honest options are "type the name" or
+"keep it", and a whole-volume destroy stays a human action (agents can
+still create). Client delete_filesystem implemented across the
+interface/real/mock/swappable/unconfigured stack; route quirk matches
+create (/filesystems/{id}, not /file-systems).
+
+**Model-fit reads exact sizes from the HF API when it can.** The
+name-parse heuristic misses renamed forks and gated repos. The model-fit
+route now asks the HF model API for the safetensors parameter/dtype map
+(exact bytes per dtype - fp32 shards count as 4, INT4 as 0.5) and falls
+back to the name parse on any failure; HF_TOKEN in .env (new, optional,
+read-only scope) extends coverage to gated repos the account accepted.
+Follows the image-checker injection rule: real lookup only in production
+wiring, so tests never touch the network. estimates.py stays pure - the
+I/O lives in hf_lookup.py and arrives as an optional `exact` argument.

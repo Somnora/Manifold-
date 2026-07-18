@@ -216,6 +216,9 @@ class Settings:
     # Optional: if set, the OpenAI-compatible /v1 proxy requires this as a
     # bearer token. Empty = open (fine for localhost-only single-user use).
     proxy_api_key: str = ""
+    # Optional HuggingFace token: lets the model-fit preflight read exact
+    # sizes for gated repos whose license this account has accepted.
+    hf_token: str = ""
 
     guardrails: Guardrails = field(default_factory=Guardrails)
     launch: LaunchPolicy = field(default_factory=LaunchPolicy)
@@ -346,6 +349,7 @@ def load_settings(
         s3_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY", ""),
         tailscale_authkey=os.environ.get("TAILSCALE_AUTHKEY", ""),
         proxy_api_key=os.environ.get("MANIFOLD_PROXY_KEY", ""),
+        hf_token=os.environ.get("HF_TOKEN", ""),
         guardrails=Guardrails(
             max_concurrent_instances=int(guard.get("max_concurrent_instances", 1)),
             max_hourly_spend_usd=float(guard.get("max_hourly_spend_usd", 4.00)),

@@ -204,6 +204,7 @@ def create_app(
     sidecar_factory=None,          # (ManagedConnection) -> SidecarClient
     model_client_factory=None,     # (ManagedConnection) -> ModelClient
     image_checker=None,            # ImageChecker; mock mode injects MockImageChecker
+    hf_lookup_fn=None,             # async (model_id, token) -> dict|None; model-fit exactness
     lambda_client_factory=None,    # (api_key) -> LambdaClient, for key validation
     notification_sender=None,      # (title, body) -> None; tests record, mock no-ops
     env_path=None,                 # where /settings writes secrets (.env)
@@ -225,6 +226,11 @@ def create_app(
             image_checker = MockImageChecker()
         elif lambda_client is None:
             image_checker = RealImageChecker()
+    # HF exact-size lookup follows the image-checker rule: real only in
+    # production (no injected client, not mock); tests never hit the network.
+    if hf_lookup_fn is None and not mock and lambda_client is None:
+        from .hf_lookup import lookup_weights_gb
+        hf_lookup_fn = lookup_weights_gb
 
     if mock:
         shared_sidecar = None
@@ -2111,7 +2117,9 @@ def create_app(
     @app.get("/estimate/model-fit")
     async def model_fit_route(model: str, instance_type: str):
         """Advisory pre-launch check: will this model's weights plausibly
-        fit in that GPU's VRAM? Estimated from the model name; never blocks."""
+        fit in that GPU's VRAM? Prefers the repo's exact size from the HF
+        API (works for gated repos when HF_TOKEN is in .env); falls back
+        to the model-name estimate. Never blocks."""
         from .estimates import model_fit
         gpu_description = ""
         try:
@@ -2121,7 +2129,9 @@ def create_app(
                 gpu_description = info.gpu_description or info.description
         except Exception:
             pass   # unconfigured/unreachable: verdict comes back "unknown"
-        return model_fit(model, instance_type, gpu_description)
+        exact = await hf_lookup_fn(model, settings.hf_token) \
+            if hf_lookup_fn else None
+        return model_fit(model, instance_type, gpu_description, exact=exact)
 
     @app.get("/launches/{launch_id}/utilization")
     async def launch_utilization(launch_id: str):
@@ -2185,6 +2195,15 @@ def create_app(
         the Lambda console. Creation is free; storage bills by GB-month
         actually used."""
         return await orchestrator.create_filesystem(req.name, req.region)
+
+    @app.delete("/filesystems/{name}")
+    async def delete_filesystem(name: str, confirm_name: str = ""):
+        """Permanently delete a filesystem. Refuses while attached to an
+        instance, and (428) until confirm_name repeats the exact name -
+        the response explains what would be destroyed. No force flag:
+        there is no rescue path for a whole filesystem."""
+        return await orchestrator.delete_filesystem(
+            name, confirm_name=confirm_name)
 
     async def _storage_for(filesystem: str) -> StorageClient:
         filesystems = {fs.name: fs for fs in await lambda_client.list_filesystems()}

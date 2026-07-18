@@ -278,23 +278,36 @@ def parse_vram_gb(instance_type_name: str, gpu_description: str) -> float | None
 
 
 def model_fit(model_id: str, instance_type_name: str,
-              gpu_description: str) -> dict:
+              gpu_description: str, exact: dict | None = None) -> dict:
     """Advisory pre-launch check: will this model's weights plausibly fit in
-    that GPU's VRAM? Never blocks anything; the caller shows the note."""
-    params_b = parse_model_params_b(model_id)
+    that GPU's VRAM? Never blocks anything; the caller shows the note.
+
+    `exact` (from hf_lookup, when the HF API answered) overrides the
+    name-parse with the repo's real parameter count and dtype-accurate
+    weight bytes - which also covers renamed forks and gated repos the
+    name heuristic cannot read."""
     vram_gb = parse_vram_gb(instance_type_name, gpu_description)
+    if exact:
+        params_b: float | None = exact["params_b"]
+        basis = "exact, from the HuggingFace repo metadata"
+    else:
+        params_b = parse_model_params_b(model_id)
+        basis = "estimated from the model name, not from downloaded weights"
     base = {
         "model": model_id,
         "instance_type": instance_type_name,
         "params_b": params_b,
         "vram_gb": vram_gb,
-        "basis": "estimated from the model name, not from downloaded weights",
+        "basis": basis,
     }
     if params_b is None or not vram_gb:
         return {**base, "verdict": "unknown", "est_weights_gb": None,
                 "note": ""}
-    bytes_pp, quant = parse_quant_bytes(model_id)
-    est_weights_gb = round(params_b * bytes_pp, 1)
+    if exact:
+        est_weights_gb, quant = exact["weights_gb"], "stored-dtype"
+    else:
+        bytes_pp, quant = parse_quant_bytes(model_id)
+        est_weights_gb = round(params_b * bytes_pp, 1)
     ratio = est_weights_gb / vram_gb
     if ratio <= FIT_RATIO:
         verdict, note = "fits", ""

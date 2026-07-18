@@ -78,3 +78,64 @@ def test_route_resolves_gpu_description(client):
         "model": "some-model", "instance_type": "gpu_1x_a10",
     }).json()
     assert unknown["verdict"] == "unknown"
+
+
+# -- exact sizes from the HF repo (gated-model coverage) --------------------------
+
+
+def test_exact_override_beats_the_name_parse():
+    from app.estimates import model_fit
+    # The name says nothing ("my-cool-fork"), but the HF metadata does.
+    fit = model_fit("acme/my-cool-fork", "gpu_1x_a10", "A10 (24 GB PCIe)",
+                    exact={"params_b": 70.0, "weights_gb": 140.0,
+                           "gated": True})
+    assert fit["verdict"] == "no"
+    assert fit["params_b"] == 70.0
+    assert fit["est_weights_gb"] == 140.0
+    assert "exact" in fit["basis"]
+
+
+def test_no_exact_falls_back_to_name_parse():
+    from app.estimates import model_fit
+    fit = model_fit("Qwen/Qwen3-4B", "gpu_1x_a10", "A10 (24 GB PCIe)",
+                    exact=None)
+    assert fit["verdict"] == "fits"
+    assert "estimated from the model name" in fit["basis"]
+
+
+def test_hf_dtype_math():
+    """The lookup translates the HF safetensors dtype map into bytes."""
+    import asyncio
+    import httpx
+    from app import hf_lookup
+
+    payload = {
+        "gated": "auto",
+        "safetensors": {
+            "parameters": {"BF16": 8_000_000_000, "F32": 1_000_000_000},
+            "total": 9_000_000_000,
+        },
+    }
+
+    class FakeClient:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, **kw):
+            return httpx.Response(200, json=payload,
+                                  request=httpx.Request("GET", url))
+
+    orig = hf_lookup.httpx.AsyncClient
+    hf_lookup.httpx.AsyncClient = FakeClient
+    try:
+        out = asyncio.run(hf_lookup.lookup_weights_gb("meta/gated-model"))
+    finally:
+        hf_lookup.httpx.AsyncClient = orig
+    assert out == {"params_b": 9.0, "weights_gb": 20.0, "gated": True}
+
+
+def test_hf_lookup_fails_open():
+    import asyncio
+    from app import hf_lookup
+    # No repo slash -> no lookup at all (local paths, bare names).
+    assert asyncio.run(hf_lookup.lookup_weights_gb("/data/models/merged")) is None

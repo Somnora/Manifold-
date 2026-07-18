@@ -466,6 +466,49 @@ class Orchestrator:
             "bytes_used": fs.bytes_used,
         }
 
+    async def delete_filesystem(self, name: str, *,
+                                confirm_name: str = "") -> dict:
+        """Permanently delete a filesystem, with the data-safety dance.
+
+        Deletion destroys every byte on the volume, so it follows the same
+        philosophy as termination: the guard SHOWS what would be lost and
+        refuses until the caller proves intent by typing the filesystem's
+        name back (confirm_name). No force flag: unlike an instance, there
+        is no rescue path for a whole filesystem - the only honest options
+        are "type the name" or "keep it".
+        """
+        filesystems = {fs.name: fs for fs in
+                       await self.client.list_filesystems()}
+        fs = filesystems.get(name)
+        if fs is None:
+            raise LaunchRejected(
+                404,
+                f"No filesystem named '{name}'. "
+                f"Have: {', '.join(sorted(filesystems)) or '(none)'}",
+            )
+        if fs.is_in_use:
+            raise LaunchRejected(
+                409,
+                f"Filesystem '{name}' is attached to a running instance. "
+                f"Terminate that instance first; Lambda cannot delete an "
+                f"attached filesystem.",
+            )
+        if confirm_name != name:
+            gib = fs.bytes_used / (1024 ** 3)
+            raise LaunchRejected(
+                428,
+                f"Deleting '{name}' permanently destroys {gib:.1f} GiB in "
+                f"{fs.region}. There is no undo and no rescue. To proceed, "
+                f"repeat the exact filesystem name in confirm_name.",
+            )
+        await self.client.delete_filesystem(fs.id)
+        self.db.record_audit(
+            "dashboard", "filesystem_deleted",
+            f"{name} in {fs.region} ({fs.bytes_used} bytes destroyed)",
+        )
+        return {"deleted": name, "region": fs.region,
+                "bytes_destroyed": fs.bytes_used}
+
     def sidecar_for(self, instance_id: str) -> SidecarClient | None:
         conn = self.connections.get(instance_id)
         if conn is None:
