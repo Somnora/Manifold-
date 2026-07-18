@@ -72,6 +72,47 @@ from .terminal_sessions import TerminalSession, TerminalSessionManager
 logger = logging.getLogger("manifold.main")
 
 
+def _end_shell_group(pid: int) -> None:
+    """End a local terminal shell and everything it spawned, then reap it.
+
+    pty.fork made the child a session leader, so its pid doubles as a
+    process-group id: killpg catches children the shell left running (a
+    backgrounded watcher, a hung CLI), where a bare kill(pid) let them
+    linger. The reap task waitpid()s the child - without it EVERY exited
+    local shell stayed a zombie until the backend itself exited - and
+    escalates to SIGKILL if the group ignores the hangup.
+
+    Safe to call on an already-dead shell: signalling errors are ignored
+    and the reap still collects the zombie. POSIX only (the local
+    terminal endpoint already refuses Windows)."""
+    import signal
+
+    try:
+        os.killpg(pid, signal.SIGHUP)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    async def _reap() -> None:
+        for _ in range(50):                       # ~5s of grace to die
+            try:
+                done, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return                            # already collected
+            if done:
+                return
+            await asyncio.sleep(0.1)
+        try:
+            os.killpg(pid, signal.SIGKILL)        # it ignored the hangup
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    asyncio.get_running_loop().create_task(_reap())
+
+
 class LaunchRequest(BaseModel):
     instance_type: str
     region: str
@@ -957,7 +998,6 @@ def create_app(
         import fcntl
         import pty
         import shutil
-        import signal
         import struct
         import termios
 
@@ -1024,10 +1064,12 @@ def create_app(
             except Exception:
                 pass
             try:
-                os.kill(pid, signal.SIGHUP)   # end the shell with its window
                 os.close(fd)
             except OSError:
                 pass
+            # Hangup + reap the whole process group (see _end_shell_group):
+            # a closed tab must never leave zombies or orphaned children.
+            _end_shell_group(pid)
 
         session = TerminalSession(
             key or f"local:ephemeral-{pid}",
@@ -1061,6 +1103,9 @@ def create_app(
             tail = decoder.decode(b"", final=True)
             if tail:
                 await session.feed(tail)
+            # The shell exited on its own: reap it. Nothing else waits on
+            # this pid, so without the reap it sat as a zombie forever.
+            _end_shell_group(pid)
             await session.mark_exited()
 
         session.pump_task = asyncio.create_task(pump_output())
