@@ -83,6 +83,28 @@ def test_settled_job_lands_in_worklog_and_route(client):
     assert Path(body["path"]).exists()
 
 
+def test_failed_job_entry_carries_exit_code_and_crash_signature(client):
+    """The schema promise for failures: the next agent can judge the crash
+    from the entry alone - explicit exit code plus the last output lines -
+    because the full log may be gone with the instance."""
+    resp = client.post("/tasks", json={"template": "gpu-smoke",
+                                       "parameters": {}})
+    task_id = resp.json()["task"]["id"]
+    queue = client.app.state.queue
+    queue.mark_running(task_id, "i-x")
+    queue.append_log(task_id, "Traceback (most recent call last):")
+    queue.append_log(task_id, "torch.cuda.OutOfMemoryError: CUDA out of memory")
+    dispatcher = client.app.state.dispatcher
+    dispatcher._finish_task(task_id, exit_code=1, output_paths=[],
+                            error="container exited 1")
+
+    entry = client.get("/worklog").json()["entries"][-1]
+    assert "job gpu-smoke failed" in entry
+    assert "exit code 1" in entry
+    assert "last output:" in entry
+    assert "CUDA out of memory" in entry
+
+
 def test_autopilot_finish_lands_in_worklog(client, db):
     run_id = db.create_agent_run(
         goal="survey the account", brain_instance_id="local:test",

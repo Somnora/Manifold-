@@ -2960,3 +2960,29 @@ one millisecond minted colliding React keys); setOpen/setSessions updaters
 are pure again (StrictMode runs them twice); uploadFile surfaces a dead
 backend as a typed ApiError with a 120s stall budget instead of a raw
 TypeError.
+
+## 2026-07-18 — Phase 64: foundation hardening (worklog schema, safety interlock lock)
+
+**The worklog entry schema is now a written contract.** worklog.py's
+docstring formalizes the exact block layout consumers parse (split on
+"\n## "), and failed jobs now carry the two fields the next agent needs
+to judge a crash with the instance gone: an explicit `exit code N` line
+and `last output:` - the final three log lines as a crash signature
+(OOM traceback, CUDA error, etc.). Fields stay best-effort: absence
+means unknown, never success.
+
+**The no-filesystem-delete-over-MCP interlock is test-locked.** The
+phase-62 decision (whole-volume destroys have no rescue path, so they
+stay a human type-the-name action) lived only in prose; a new test
+enumerates the bridge's registered tools and fails the build if anyone
+adds a filesystem-delete tool. terminate_instance's force flag stays
+exposed deliberately - instances have a rescue path and force is the
+documented single explicit burn.
+
+**Live validation, zero spend.** Phase-63's fixes were validated against
+the RUNNING real-mode backend: live Lambda volume telemetry (6
+filesystems, real bytes_used, none in use, 0 instances) and a 20,000
+multi-byte-glyph flood through /local/terminal's pty - 20,000/20,000
+received, zero U+FFFD - proving the incremental decoder on the wire, not
+just in unit tests. No GPU was launched: live-instance validation waits
+for an instance that exists for real work, per the no-spend rule.
