@@ -94,3 +94,96 @@ async def test_children_of_the_shell_die_with_the_group():
         return False
 
     assert await group_empty(), "background child survived the group hangup"
+
+
+# -- fd lifecycle: churn must not leak master descriptors -------------------------
+
+ORIGIN = {"origin": "http://localhost:3000"}
+
+
+def _fd_count() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def _settles_at(base: int, timeout: float = 8.0) -> int:
+    """The lowest fd count observed while waiting to return to `base`
+    (teardown is async: reap tasks and socket closes need a beat).
+    Synchronous on purpose: an asyncio.run here would open its own
+    kqueue+socketpair fds mid-measurement and read as a 3-fd leak."""
+    deadline = time.monotonic() + timeout
+    lowest = _fd_count()
+    while time.monotonic() < deadline:
+        lowest = min(lowest, _fd_count())
+        if lowest <= base:
+            return lowest
+        time.sleep(0.1)
+    return lowest
+
+
+def test_abrupt_teardown_churn_leaks_no_descriptors(client, monkeypatch):
+    """Chaos check: open shells and drop their sockets abruptly, repeatedly.
+    Ephemeral sessions (no ?session=) are killed on drop; the process
+    fd table must return to its baseline - a rise of even one descriptor
+    is a leak in the master-fd lifecycle."""
+    monkeypatch.setenv("SHELL", "/bin/sh")     # fast, hermetic shell
+    # Warm-up: first session pays one-time import/allocation costs.
+    with client.websocket_connect("/local/terminal", headers=ORIGIN) as ws:
+        ws.receive_text()
+    time.sleep(0.5)
+    base = _fd_count()
+
+    for _ in range(10):
+        with client.websocket_connect("/local/terminal",
+                                      headers=ORIGIN) as ws:
+            ws.receive_text()                  # shell is up
+        # context exit = abrupt socket drop, no clean close message
+
+    lowest = _settles_at(base)
+    assert lowest <= base, f"leaked {lowest - base} fd(s) over 10 sessions"
+
+
+def test_natural_shell_exit_closes_the_master_fd(client, monkeypatch):
+    """The pre-fix leak: a shell that exits on its own left its master fd
+    open (and unregistered from nothing but the selector) until the
+    backend itself exited - one descriptor per exited shell."""
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    with client.websocket_connect("/local/terminal", headers=ORIGIN) as ws:
+        ws.receive_text()
+    time.sleep(0.5)
+    base = _fd_count()
+
+    with client.websocket_connect("/local/terminal", headers=ORIGIN) as ws:
+        ws.receive_text()
+        ws.send_json({"type": "input", "data": "exit\n"})
+        try:
+            while True:
+                ws.receive_text()              # drain until server closes
+        except Exception:
+            pass
+
+    lowest = _settles_at(base)
+    assert lowest <= base, "master fd survived a natural shell exit"
+
+
+def test_shell_exiting_while_detached_still_closes_the_master_fd(
+        client, monkeypatch):
+    """THE pre-fix leak. With a socket attached, teardown funnels through
+    kill() -> close_pty either way. But a shell that exited while DETACHED
+    (refresh, never reattached) was only reaped: the registry dropped the
+    exited session without ever closing its master fd, one leaked
+    descriptor per such shell for the life of the backend."""
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    with client.websocket_connect("/local/terminal", headers=ORIGIN) as ws:
+        ws.receive_text()
+    time.sleep(0.5)
+    base = _fd_count()
+
+    with client.websocket_connect("/local/terminal?session=fd-detach",
+                                  headers=ORIGIN) as ws:
+        ws.receive_text()
+        ws.send_json({"type": "input", "data": "sleep 1; exit\n"})
+        # Context exit drops the socket NOW; with a session id that
+        # DETACHES the shell, which then exits ~1s later on its own.
+
+    lowest = _settles_at(base, timeout=10.0)
+    assert lowest <= base, "master fd leaked when the shell exited detached"

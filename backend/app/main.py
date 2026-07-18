@@ -1058,7 +1058,21 @@ def create_app(
             size = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
 
-        def close_pty() -> None:
+        # Idempotent teardown. Two paths end a shell - explicit kill
+        # (close_pty) and the shell exiting on its own (pump EOF) - and
+        # both run for one session (exit, then the WS funnel's kill). The
+        # guard makes the second call a no-op, because BOTH halves are
+        # unsafe to repeat once the kernel recycles the identifier: a
+        # closed fd NUMBER may now be an unrelated descriptor, and a
+        # reaped PID may now lead an unrelated process group that a
+        # second killpg would hang up.
+        torn_down = False
+
+        def teardown_once() -> None:
+            nonlocal torn_down
+            if torn_down:
+                return
+            torn_down = True
             try:
                 loop.remove_reader(fd)
             except Exception:
@@ -1070,6 +1084,9 @@ def create_app(
             # Hangup + reap the whole process group (see _end_shell_group):
             # a closed tab must never leave zombies or orphaned children.
             _end_shell_group(pid)
+
+        def close_pty() -> None:
+            teardown_once()
 
         session = TerminalSession(
             key or f"local:ephemeral-{pid}",
@@ -1103,9 +1120,11 @@ def create_app(
             tail = decoder.decode(b"", final=True)
             if tail:
                 await session.feed(tail)
-            # The shell exited on its own: reap it. Nothing else waits on
-            # this pid, so without the reap it sat as a zombie forever.
-            _end_shell_group(pid)
+            # The shell exited on its own: close the master fd and reap.
+            # Neither happened here before - a shell that exited while
+            # DETACHED leaked its master fd (and sat as a zombie, pre-65)
+            # until the backend itself exited.
+            teardown_once()
             await session.mark_exited()
 
         session.pump_task = asyncio.create_task(pump_output())
