@@ -114,4 +114,9 @@ uv run pytest          # 430+ tests, all against mocks; no live spend
 ```
 
 Hard rules: no live spend in tests, all guards live in the backend, clients
-never get a path around them. The full list is in `CLAUDE.md`.
+never get a path around them. The full list is in `CLAUDE.md`, and
+`CONTRIBUTING.md` explains how to work with them.
+
+## License
+
+MIT — see `LICENSE`.
